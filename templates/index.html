@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>化学实验纠错助手</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <p class="eyebrow">Chemistry Vision Workflow</p>
+      <h1>化学实验纠错助手</h1>
+      <p class="intro">
+        第一步上传正确图和错误图，让 AI 找出关键差异；第二步补充实验要求文字，让 AI 给出主要错误和纠正建议。
+      </p>
+      <div class="meta">当前模型：{{ model_name }}</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <span class="step">Step 1</span>
+        <h2>上传图片做差异分析</h2>
+      </div>
+      <form id="compare-form" class="form-grid">
+        <label class="upload-card">
+          <span>正确图片</span>
+          <input type="file" name="correct_image" accept="image/*" required>
+          <img id="correct-preview" alt="正确图片预览">
+        </label>
+        <label class="upload-card">
+          <span>错误图片</span>
+          <input type="file" name="wrong_image" accept="image/*" required>
+          <img id="wrong-preview" alt="错误图片预览">
+        </label>
+        <button class="primary-button" type="submit">开始分析图片差异</button>
+      </form>
+      <div id="compare-status" class="status"></div>
+      <article class="result-card">
+        <h3>差异分析结果</h3>
+        <pre id="difference-result">等待上传图片。</pre>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <span class="step">Step 2</span>
+        <h2>结合实验要求判断主要错误</h2>
+      </div>
+      <form id="analyze-form" class="text-form">
+        <textarea
+          id="experiment-requirements"
+          name="experiment_requirements"
+          rows="8"
+          placeholder="在这里粘贴实验要求、评分标准或关键步骤。"
+          required
+        ></textarea>
+        <button id="analyze-button" class="primary-button" type="submit" disabled>
+          根据实验要求生成主要错误
+        </button>
+      </form>
+      <div id="analyze-status" class="status"></div>
+      <article class="result-card final">
+        <h3>最终判断</h3>
+        <pre id="final-result">完成 Step 1 后可继续。</pre>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const compareForm = document.getElementById("compare-form");
+    const analyzeForm = document.getElementById("analyze-form");
+    const compareStatus = document.getElementById("compare-status");
+    const analyzeStatus = document.getElementById("analyze-status");
+    const differenceResult = document.getElementById("difference-result");
+    const finalResult = document.getElementById("final-result");
+    const analyzeButton = document.getElementById("analyze-button");
+    const correctPreview = document.getElementById("correct-preview");
+    const wrongPreview = document.getElementById("wrong-preview");
+
+    let currentSessionId = "";
+
+    function bindPreview(inputSelector, imageElement) {
+      const input = document.querySelector(inputSelector);
+      input.addEventListener("change", () => {
+        const [file] = input.files;
+        if (!file) {
+          imageElement.removeAttribute("src");
+          imageElement.style.display = "none";
+          return;
+        }
+        imageElement.src = URL.createObjectURL(file);
+        imageElement.style.display = "block";
+      });
+    }
+
+    bindPreview('input[name="correct_image"]', correctPreview);
+    bindPreview('input[name="wrong_image"]', wrongPreview);
+
+    compareForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      compareStatus.textContent = "正在上传图片并分析差异...";
+      differenceResult.textContent = "";
+      finalResult.textContent = "等待 Step 2。";
+      analyzeButton.disabled = true;
+
+      const formData = new FormData(compareForm);
+      const response = await fetch("/api/compare-images", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        compareStatus.textContent = data.error || "图片分析失败。";
+        return;
+      }
+
+      currentSessionId = data.session_id;
+      differenceResult.textContent = data.difference_summary;
+      compareStatus.textContent = "图片差异分析完成。";
+      analyzeButton.disabled = false;
+    });
+
+    analyzeForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!currentSessionId) {
+        analyzeStatus.textContent = "请先完成 Step 1。";
+        return;
+      }
+
+      analyzeStatus.textContent = "正在结合实验要求生成最终判断...";
+      finalResult.textContent = "";
+
+      const response = await fetch("/api/analyze-error", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: currentSessionId,
+          experiment_requirements: document.getElementById("experiment-requirements").value,
+        }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        analyzeStatus.textContent = data.error || "最终分析失败。";
+        return;
+      }
+
+      finalResult.textContent = data.final_result;
+      analyzeStatus.textContent = "最终判断已生成。";
+    });
+  </script>
+</body>
+</html>
