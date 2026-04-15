@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,32 @@ class OpenRouterError(RuntimeError):
 
 
 @dataclass(slots=True)
+class ImagePrepMetrics:
+    original_width: int
+    original_height: int
+    optimized_width: int
+    optimized_height: int
+    original_bytes: int
+    optimized_bytes: int
+    preprocess_ms: float
+
+    def as_dict(self) -> dict[str, float | int]:
+        compression_ratio = (
+            self.optimized_bytes / self.original_bytes if self.original_bytes else 0.0
+        )
+        return {
+            "original_width": self.original_width,
+            "original_height": self.original_height,
+            "optimized_width": self.optimized_width,
+            "optimized_height": self.optimized_height,
+            "original_bytes": self.original_bytes,
+            "optimized_bytes": self.optimized_bytes,
+            "preprocess_ms": round(self.preprocess_ms, 1),
+            "compression_ratio": round(compression_ratio, 3),
+        }
+
+
+@dataclass(slots=True)
 class OpenRouterConfig:
     api_key: str
     model: str
@@ -27,6 +54,7 @@ class OpenRouterConfig:
     timeout_seconds: int
     max_image_side: int
     jpeg_quality: int
+    jpeg_optimize: bool
 
 
 def load_openrouter_config(require_api_key: bool = True) -> OpenRouterConfig:
@@ -45,8 +73,10 @@ def load_openrouter_config(require_api_key: bool = True) -> OpenRouterConfig:
         site_url=os.getenv("OPENROUTER_SITE_URL", "").strip() or None,
         app_name=os.getenv("OPENROUTER_APP_NAME", "Chemistry Experiment Checker").strip(),
         timeout_seconds=int(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "180")),
-        max_image_side=int(os.getenv("OPENROUTER_MAX_IMAGE_SIDE", "1600")),
-        jpeg_quality=int(os.getenv("OPENROUTER_JPEG_QUALITY", "85")),
+        max_image_side=int(os.getenv("OPENROUTER_MAX_IMAGE_SIDE", "1280")),
+        jpeg_quality=int(os.getenv("OPENROUTER_JPEG_QUALITY", "75")),
+        jpeg_optimize=os.getenv("OPENROUTER_JPEG_OPTIMIZE", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
     )
 
 
@@ -125,17 +155,50 @@ def build_text_part(text: str) -> dict[str, Any]:
     return {"type": "text", "text": text}
 
 
-def build_image_part(image_bytes: bytes, *, config: OpenRouterConfig | None = None) -> dict[str, Any]:
+def build_image_part(image_bytes: bytes, *, config: Any | None = None) -> dict[str, Any]:
+    part, _ = prepare_image_part(image_bytes, config=config)
+    return part
+
+
+def prepare_image_part(
+    image_bytes: bytes, *, config: Any | None = None
+) -> tuple[dict[str, Any], ImagePrepMetrics]:
     cfg = config or load_openrouter_config(require_api_key=False)
-    optimized_bytes = optimize_image(image_bytes, cfg.max_image_side, cfg.jpeg_quality)
+    started_at = time.perf_counter()
+    (
+        optimized_bytes,
+        original_width,
+        original_height,
+        optimized_width,
+        optimized_height,
+    ) = optimize_image(
+        image_bytes,
+        cfg.max_image_side,
+        cfg.jpeg_quality,
+        getattr(cfg, "jpeg_optimize", False),
+    )
+    preprocess_ms = (time.perf_counter() - started_at) * 1000
     encoded = base64.b64encode(optimized_bytes).decode("ascii")
     return {
         "type": "image_url",
         "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-    }
+    }, ImagePrepMetrics(
+        original_width=original_width,
+        original_height=original_height,
+        optimized_width=optimized_width,
+        optimized_height=optimized_height,
+        original_bytes=len(image_bytes),
+        optimized_bytes=len(optimized_bytes),
+        preprocess_ms=preprocess_ms,
+    )
 
 
-def optimize_image(image_bytes: bytes, max_image_side: int, jpeg_quality: int) -> bytes:
+def optimize_image(
+    image_bytes: bytes,
+    max_image_side: int,
+    jpeg_quality: int,
+    jpeg_optimize: bool,
+) -> tuple[bytes, int, int, int, int]:
     with Image.open(io.BytesIO(image_bytes)) as image:
         image = ImageOps.exif_transpose(image)
         if image.mode not in ("RGB", "L"):
@@ -143,8 +206,26 @@ def optimize_image(image_bytes: bytes, max_image_side: int, jpeg_quality: int) -
         elif image.mode == "L":
             image = image.convert("RGB")
 
-        image.thumbnail((max_image_side, max_image_side))
+        original_width, original_height = image.size
+        image.thumbnail(
+            (max_image_side, max_image_side),
+            Image.Resampling.BILINEAR,
+            reducing_gap=3.0,
+        )
+        optimized_width, optimized_height = image.size
 
         output = io.BytesIO()
-        image.save(output, format="JPEG", quality=jpeg_quality, optimize=True)
-        return output.getvalue()
+        image.save(
+            output,
+            format="JPEG",
+            quality=jpeg_quality,
+            optimize=jpeg_optimize,
+            progressive=False,
+        )
+        return (
+            output.getvalue(),
+            original_width,
+            original_height,
+            optimized_width,
+            optimized_height,
+        )

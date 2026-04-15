@@ -95,7 +95,13 @@ python try.py --correct "化小北-普化部分\电解\正确\整体1.jpg" --wro
 ## 启动 Web
 
 ```powershell
-python app.py
+python app.py --provider openrouter
+```
+
+或：
+
+```powershell
+python app.py --provider ali
 ```
 
 浏览器打开：
@@ -162,6 +168,12 @@ http://127.0.0.1:5000
 - `OPENROUTER_TIMEOUT_SECONDS`：请求超时秒数，默认 `180`。
 - `OPENROUTER_MAX_IMAGE_SIDE`：图片最长边压缩值，默认 `1600`。
 - `OPENROUTER_JPEG_QUALITY`：JPEG 压缩质量，默认 `85`。
+- `DASHSCOPE_API_KEY`：阿里云百炼 API Key。
+- `ALI_MODEL`：阿里云模型名，默认 `qwen3.6-plus`。
+- `ALI_BASE_URL`：默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
+- `ALI_TIMEOUT_SECONDS`：请求超时秒数，默认 `180`。
+- `ALI_MAX_IMAGE_SIDE`：图片最长边压缩值，默认 `1600`。
+- `ALI_JPEG_QUALITY`：JPEG 压缩质量，默认 `85`。
 
 ## 后续可以继续扩展
 

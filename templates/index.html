@@ -14,7 +14,7 @@
       <p class="intro">
         第一步上传正确图和错误图，让 AI 找出关键差异；第二步补充实验要求文字，让 AI 给出主要错误和纠正建议。
       </p>
-      <div class="meta">当前模型：{{ model_name }}</div>
+      <div class="meta">当前 Provider：{{ provider_name }} ｜ 当前模型：{{ model_name }}</div>
     </section>
 
     <section class="panel">
@@ -36,6 +36,10 @@
         <button class="primary-button" type="submit">开始分析图片差异</button>
       </form>
       <div id="compare-status" class="status"></div>
+      <article class="result-card metrics-card">
+        <h3>性能信息</h3>
+        <pre id="compare-metrics">等待分析。</pre>
+      </article>
       <article class="result-card">
         <h3>差异分析结果</h3>
         <pre id="difference-result">等待上传图片。</pre>
@@ -60,6 +64,10 @@
         </button>
       </form>
       <div id="analyze-status" class="status"></div>
+      <article class="result-card metrics-card">
+        <h3>第二步性能信息</h3>
+        <pre id="analyze-metrics">等待分析。</pre>
+      </article>
       <article class="result-card final">
         <h3>最终判断</h3>
         <pre id="final-result">完成 Step 1 后可继续。</pre>
@@ -73,6 +81,8 @@
     const compareStatus = document.getElementById("compare-status");
     const analyzeStatus = document.getElementById("analyze-status");
     const differenceResult = document.getElementById("difference-result");
+    const compareMetrics = document.getElementById("compare-metrics");
+    const analyzeMetrics = document.getElementById("analyze-metrics");
     const finalResult = document.getElementById("final-result");
     const analyzeButton = document.getElementById("analyze-button");
     const correctPreview = document.getElementById("correct-preview");
@@ -97,10 +107,53 @@
     bindPreview('input[name="correct_image"]', correctPreview);
     bindPreview('input[name="wrong_image"]', wrongPreview);
 
+    function formatBytes(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    function formatMetrics(metrics) {
+      if (!metrics) {
+        return "等待分析。";
+      }
+
+      const imageA = metrics.image_a;
+      const imageB = metrics.image_b;
+      return [
+        `图A: ${imageA.original_width}x${imageA.original_height} -> ${imageA.optimized_width}x${imageA.optimized_height}`,
+        `图A大小: ${formatBytes(imageA.original_bytes)} -> ${formatBytes(imageA.optimized_bytes)} (${(imageA.compression_ratio * 100).toFixed(1)}%)`,
+        `图A预处理耗时: ${imageA.preprocess_ms} ms`,
+        "",
+        `图B: ${imageB.original_width}x${imageB.original_height} -> ${imageB.optimized_width}x${imageB.optimized_height}`,
+        `图B大小: ${formatBytes(imageB.original_bytes)} -> ${formatBytes(imageB.optimized_bytes)} (${(imageB.compression_ratio * 100).toFixed(1)}%)`,
+        `图B预处理耗时: ${imageB.preprocess_ms} ms`,
+        "",
+        `预处理总耗时: ${metrics.preprocess_total_ms} ms`,
+        `模型请求耗时: ${metrics.model_request_ms} ms`,
+        `接口总耗时: ${metrics.total_ms} ms`
+      ].join("\n");
+    }
+
+    function formatAnalyzeMetrics(metrics) {
+      if (!metrics) {
+        return "等待分析。";
+      }
+
+      return [
+        `实验要求字符数: ${metrics.input_chars}`,
+        `第一步差异文本字符数: ${metrics.difference_chars}`,
+        `模型请求耗时: ${metrics.model_request_ms} ms`,
+        `接口总耗时: ${metrics.total_ms} ms`
+      ].join("\n");
+    }
+
     compareForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       compareStatus.textContent = "正在上传图片并分析差异...";
       differenceResult.textContent = "";
+      compareMetrics.textContent = "正在计算...";
+      analyzeMetrics.textContent = "等待分析。";
       finalResult.textContent = "等待 Step 2。";
       analyzeButton.disabled = true;
 
@@ -118,6 +171,7 @@
 
       currentSessionId = data.session_id;
       differenceResult.textContent = data.difference_summary;
+      compareMetrics.textContent = formatMetrics(data.timings);
       compareStatus.textContent = "图片差异分析完成。";
       analyzeButton.disabled = false;
     });
@@ -130,6 +184,7 @@
       }
 
       analyzeStatus.textContent = "正在结合实验要求生成最终判断...";
+      analyzeMetrics.textContent = "正在计算...";
       finalResult.textContent = "";
 
       const response = await fetch("/api/analyze-error", {
@@ -148,6 +203,7 @@
       }
 
       finalResult.textContent = data.final_result;
+      analyzeMetrics.textContent = formatAnalyzeMetrics(data.timings);
       analyzeStatus.textContent = "最终判断已生成。";
     });
   </script>

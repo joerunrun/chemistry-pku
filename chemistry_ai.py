@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import time
+from typing import Any
+
 from openrouter_client import (
-    OpenRouterGeminiClient,
     build_image_part,
     build_text_part,
+    prepare_image_part,
 )
 
 
@@ -14,8 +17,8 @@ SYSTEM_PROMPT = """你是化学实验图像分析与纠错助手。
 
 
 class ChemistryExperimentAI:
-    def __init__(self, client: OpenRouterGeminiClient | None = None) -> None:
-        self.client = client or OpenRouterGeminiClient()
+    def __init__(self, client: Any) -> None:
+        self.client = client
 
     def describe_image(self, image_bytes: bytes, prompt: str | None = None) -> str:
         user_prompt = prompt or (
@@ -35,6 +38,11 @@ class ChemistryExperimentAI:
         return self.client.chat(messages)
 
     def compare_images(self, correct_image_bytes: bytes, wrong_image_bytes: bytes) -> str:
+        return self.compare_images_with_metrics(correct_image_bytes, wrong_image_bytes)[0]
+
+    def compare_images_with_metrics(
+        self, correct_image_bytes: bytes, wrong_image_bytes: bytes
+    ) -> tuple[str, dict[str, Any]]:
         prompt = """请比较两张化学实验图片，找出图A和图B之间真正存在的装置或操作差异。
 
 注意：
@@ -48,11 +56,16 @@ class ChemistryExperimentAI:
 - ...
 - ...
 
-可疑但不能确定的差异：
-- ...
 
 总结：
 用一句话概括两张图最核心的真实差别；如果没有足够可靠的差别，就写“未发现可靠的关键差异”。"""
+
+        correct_part, correct_metrics = prepare_image_part(
+            correct_image_bytes, config=self.client.config
+        )
+        wrong_part, wrong_metrics = prepare_image_part(
+            wrong_image_bytes, config=self.client.config
+        )
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -61,15 +74,34 @@ class ChemistryExperimentAI:
                 "content": [
                     build_text_part(prompt),
                     build_text_part("图A"),
-                    build_image_part(correct_image_bytes, config=self.client.config),
+                    correct_part,
                     build_text_part("图B"),
-                    build_image_part(wrong_image_bytes, config=self.client.config),
+                    wrong_part,
                 ],
             },
         ]
-        return self.client.chat(messages)
+        model_started_at = time.perf_counter()
+        result = self.client.chat(messages)
+        model_request_ms = (time.perf_counter() - model_started_at) * 1000
+        metrics = {
+            "image_a": correct_metrics.as_dict(),
+            "image_b": wrong_metrics.as_dict(),
+            "preprocess_total_ms": round(
+                correct_metrics.preprocess_ms + wrong_metrics.preprocess_ms, 1
+            ),
+            "model_request_ms": round(model_request_ms, 1),
+        }
+        return result, metrics
 
     def analyze_main_error(self, experiment_requirements: str, difference_summary: str) -> str:
+        return self.analyze_main_error_with_metrics(
+            experiment_requirements,
+            difference_summary,
+        )[0]
+
+    def analyze_main_error_with_metrics(
+        self, experiment_requirements: str, difference_summary: str
+    ) -> tuple[str, dict[str, Any]]:
         prompt = f"""现在你已经拿到了图片差异分析，请结合实验要求给出最终判断。
 
 已知：
@@ -86,18 +118,19 @@ class ChemistryExperimentAI:
 请按下面格式输出：
 主要错误：...
 
-原因：...
 
-纠正建议：...
 
 要求：
 1. 只输出中文。
 2. 重点回答“最主要的错误是什么”，不要把很多次要问题混在一起。
 3. 若实验要求与图像差异存在冲突，以实验要求为准重新判断。
-4. 如果第一步只发现视角差异、没有发现可靠的真实差异，就明确说明“仅凭当前图片无法确认主要错误”。"""
+"""
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        return self.client.chat(messages)
+        model_started_at = time.perf_counter()
+        result = self.client.chat(messages)
+        model_request_ms = (time.perf_counter() - model_started_at) * 1000
+        return result, {"model_request_ms": round(model_request_ms, 1)}

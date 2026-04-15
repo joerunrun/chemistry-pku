@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from chemistry_ai import ChemistryExperimentAI
+from openrouter_client import OpenRouterGeminiClient
 from openrouter_client import (
     OpenRouterError,
     build_image_part,
@@ -36,7 +37,7 @@ def read_bytes(image_path: str) -> bytes:
 def main() -> int:
     args = parse_args()
     config = load_openrouter_config()
-    ai = ChemistryExperimentAI()
+    ai = ChemistryExperimentAI(OpenRouterGeminiClient(config))
 
     try:
         if args.correct and args.wrong:
