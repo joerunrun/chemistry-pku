@@ -104,11 +104,42 @@ python app.py --provider openrouter
 python app.py --provider ali
 ```
 
+或：
+
+```powershell
+python app.py --provider omni
+```
+
 浏览器打开：
 
 ```text
 http://127.0.0.1:5000
 ```
+
+说明：
+
+- `openrouter` / `ali` / `omni` 现在都沿用同一套两步流程。
+- `omni` 仍然使用 `Qwen Omni Realtime`，但第一步做图片差异分析，第二步再结合实验规范输出主要错误。
+
+## Qwen Omni Realtime 单次图片流程
+
+如果你想直接用阿里云 `Qwen-Omni-Realtime` 做“一次输入两张图 + 实验规范，直接返回最终结论”，可以运行：
+
+```powershell
+python omni_once.py --correct "参考图.jpg" --wrong "错误图.jpg" --requirements "实验规范文本"
+```
+
+也可以把实验规范放进文本文件：
+
+```powershell
+python omni_once.py --correct "参考图.jpg" --wrong "错误图.jpg" --requirements "requirements.txt"
+```
+
+说明：
+
+- 脚本默认使用 `qwen3.5-omni-flash-realtime`。
+- Realtime 协议支持图片输入，但官方要求在发送图片前，至少先向缓冲区 append 一次音频。
+- `omni_once.py` 里已经自动发送了一小段静音 PCM 音频作为占位，因此不需要麦克风。
 
 ## Web 工作流
 

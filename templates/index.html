@@ -113,13 +113,16 @@
       return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
     }
 
-    function formatMetrics(metrics) {
-      if (!metrics) {
-        return "等待分析。";
-      }
+      function formatMetrics(metrics) {
+        if (!metrics) {
+          return "等待分析。";
+        }
+        if (!metrics.image_a || !metrics.image_b) {
+          return `接口总耗时: ${metrics.total_ms} ms`;
+        }
 
-      const imageA = metrics.image_a;
-      const imageB = metrics.image_b;
+        const imageA = metrics.image_a;
+        const imageB = metrics.image_b;
       return [
         `图A: ${imageA.original_width}x${imageA.original_height} -> ${imageA.optimized_width}x${imageA.optimized_height}`,
         `图A大小: ${formatBytes(imageA.original_bytes)} -> ${formatBytes(imageA.optimized_bytes)} (${(imageA.compression_ratio * 100).toFixed(1)}%)`,

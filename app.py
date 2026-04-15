@@ -9,6 +9,7 @@ from flask import Flask, jsonify, render_template, request
 
 from chemistry_ai import ChemistryExperimentAI
 from client_factory import create_chat_client, get_provider_model_name
+from omni_client import OmniChemistryClient
 from openrouter_client import OpenRouterError
 
 app = Flask(__name__)
@@ -23,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="化学实验纠错 Web")
     parser.add_argument(
         "--provider",
-        choices=["openrouter", "ali"],
+        choices=["openrouter", "ali", "omni"],
         default="openrouter",
         help="选择底层模型提供方。",
     )
@@ -33,9 +34,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def get_ai(provider: str) -> ChemistryExperimentAI:
     return ChemistryExperimentAI(create_chat_client(provider))
+
+
+@lru_cache(maxsize=1)
+def get_omni_client() -> OmniChemistryClient:
+    return OmniChemistryClient()
 
 
 def cleanup_store() -> None:
@@ -83,9 +89,14 @@ def compare_images():
         correct_image = read_uploaded_image("correct_image")
         wrong_image = read_uploaded_image("wrong_image")
 
-        difference_summary, timings = get_ai(ACTIVE_PROVIDER).compare_images_with_metrics(
-            correct_image, wrong_image
-        )
+        if ACTIVE_PROVIDER == "omni":
+            difference_summary, timings = get_omni_client().compare_images_with_metrics(
+                correct_image, wrong_image
+            )
+        else:
+            difference_summary, timings = get_ai(ACTIVE_PROVIDER).compare_images_with_metrics(
+                correct_image, wrong_image
+            )
         timings["total_ms"] = round((time.perf_counter() - request_started_at) * 1000, 1)
         session_id = uuid.uuid4().hex
         analysis_store[session_id] = {
@@ -130,6 +141,20 @@ def analyze_error():
         return jsonify({"error": "当前会话已失效，请重新上传图片。"}), 400
 
     try:
+        if ACTIVE_PROVIDER == "omni":
+            final_result, timings = get_omni_client().analyze_main_error_with_metrics(
+                experiment_requirements,
+                str(stored["difference_summary"]),
+            )
+            print(
+                f"[analyze-error] provider=omni "
+                f"model={timings['model_request_ms']}ms "
+                f"total={timings['total_ms']}ms "
+                f"input_chars={timings['input_chars']} "
+                f"difference_chars={timings['difference_chars']}"
+            )
+            return jsonify({"final_result": final_result, "timings": timings})
+
         final_result, timings = get_ai(ACTIVE_PROVIDER).analyze_main_error_with_metrics(
             experiment_requirements,
             str(stored["difference_summary"]),
