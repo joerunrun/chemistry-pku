@@ -59,6 +59,7 @@ class OpenRouterConfig:
 
 def load_openrouter_config(require_api_key: bool = True) -> OpenRouterConfig:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    #print(f"Loaded OpenRouter API Key:",api_key)
     if require_api_key and not api_key:
         raise OpenRouterError(
             "未读取到 OPENROUTER_API_KEY。请先在环境变量或 .env 文件中配置。"
@@ -66,7 +67,7 @@ def load_openrouter_config(require_api_key: bool = True) -> OpenRouterConfig:
 
     return OpenRouterConfig(
         api_key=api_key,
-        model=os.getenv("OPENROUTER_MODEL", "qwen/qwen3.6-plus").strip(),
+        model=os.getenv("OPENROUTER_MODEL", "z-ai/glm-5v-turbo").strip(),
         base_url=os.getenv(
             "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
         ).strip(),

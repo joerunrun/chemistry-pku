@@ -141,6 +141,115 @@ python omni_once.py --correct "参考图.jpg" --wrong "错误图.jpg" --requirem
 - Realtime 协议支持图片输入，但官方要求在发送图片前，至少先向缓冲区 append 一次音频。
 - `omni_once.py` 里已经自动发送了一小段静音 PCM 音频作为占位，因此不需要麦克风。
 
+## PDF Cache 模式
+
+这是另一条独立调用链，不走当前 Web 两步模式。
+
+目标：
+
+1. 先离线慢速处理一份 PDF 指导材料。
+2. 在本地落一个 cache artifact。
+3. 可选地预热一次阿里云显式 context cache。
+4. 后续只上传一张错误图片，快速做纠错。
+
+### 1. 创建本地 cache artifact
+
+```powershell
+python build_pdf_cache.py --pdf "实验指导.pdf"
+```
+
+如果不想立刻预热远端显式 cache：
+
+```powershell
+python build_pdf_cache.py --pdf "实验指导.pdf" --no-warm-remote
+```
+
+输出里会包含：
+
+- `cache_id`
+- `artifact_path`
+- `extracted_text_path`
+
+### 2. 用 cache artifact 做单图纠错
+
+```powershell
+python correct_from_pdf_cache.py --cache-id "你的_cache_id" --image "错误图片.jpg"
+```
+
+如果远端显式 cache 可能已经过期，可自动重建：
+
+```powershell
+python correct_from_pdf_cache.py --cache-id "你的_cache_id" --image "错误图片.jpg" --refresh-if-expired
+```
+
+### 这条链路的实现思路
+
+- `pdf_cache_mode.py` 先用 `pypdf` 离线提取 PDF 文本。
+- 提取后的指导内容保存在 `.pdf_cache_mode/`。
+- 默认视觉模型现在是 `qwen3-vl-flash`，优先走更快的 flash 路线。
+- 如果模型支持 explicit cache，就会把指导材料放进 `system` 消息，并加上 `cache_control: {"type":"ephemeral"}`，再先发一个很短的预热请求。
+- 如果模型只支持 implicit cache，就不做显式预热，直接依赖系统自动命中。
+- 真正纠错时，只发：
+  - 同一段 cacheable 指导材料前缀
+  - 一张错误图片
+  - 一条“请输出主要错误/原因/纠正建议”的任务指令
+
+### 限制
+
+- `qwen3-vl-flash` 支持 implicit cache，但不支持 explicit cache。
+- `qwen3-vl-plus` 支持 explicit cache（中国内地）。
+- 阿里云显式 context cache 不是永久的，官方文档说明是短时缓存，命中会续期。
+- 因此：
+  - 本地 artifact 可以长期保存复用
+  - 远端显式 cache 需要视过期情况重建
+  - 如果使用 flash，远端缓存命中率由系统决定，不保证每次都命中
+
+## Qwen3.6-Flash Guide Cache 模式
+
+这是按“全程只用 `qwen3.6-flash`”写的一条新链路。
+
+目标：
+
+1. 先把包含文字和图片的实验 PDF 离线慢速处理。
+2. 用 `qwen3.6-flash` 自己把 PDF 页图和页文本提炼成稳定的指导摘要。
+3. 再把这段指导摘要作为显式 cache 前缀预热一次。
+4. 后续只上传错误图片，复用同一段指导摘要做快速纠错。
+
+### 1. 创建 guide cache
+
+```powershell
+python build_qwen36_cache.py --pdf "实验指导.pdf"
+```
+
+### 2. 复用 guide cache 做单图纠错
+
+```powershell
+python correct_with_qwen36_cache.py --cache-id "你的_cache_id" --image "错误图片.jpg"
+```
+
+如果远端显式 cache 可能过期：
+
+```powershell
+python correct_with_qwen36_cache.py --cache-id "你的_cache_id" --image "错误图片.jpg" --refresh-if-expired
+```
+
+### 这条链路怎么工作
+
+- `qwen36_cache_mode.py` 用 `pypdf` 抽取每页文字，用 `PyMuPDF` 把每页渲染成页图。
+- 离线阶段按页批次把“页图 + 页文本”送给 `qwen3.6-flash`，先生成分页摘要。
+- 再让 `qwen3.6-flash` 把所有分页摘要整理成一段固定的指导摘要。
+- 之后把这段指导摘要放进 `system` 前缀，并加 `cache_control: {"type":"ephemeral"}`。
+- 真正纠错时，只需：
+  - 复用同一段指导摘要前缀
+  - 发一张错误图片
+  - 让 `qwen3.6-flash` 输出“主要错误 / 原因 / 纠正建议”
+
+### 注意
+
+- 这里保存的 `cache_id` 是应用层逻辑 id，用来定位那段固定指导摘要。
+- 阿里云接口本身不是返回一个可长期复用的官方 KV cache id。
+- 真正远端命中依赖的是：后续请求里重复出现完全一致的 cacheable 前缀。
+
 ## Web 工作流
 
 ### Step 1：图片差异分析

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Generator
 from typing import Any
 
 from dotenv import load_dotenv
@@ -35,7 +36,7 @@ def load_aliyun_config(require_api_key: bool = True) -> AliyunConfig:
 
     return AliyunConfig(
         api_key=api_key,
-        model=os.getenv("ALI_MODEL", "qwen3.5-flash").strip(),
+        model=os.getenv("ALI_MODEL", "qwen3.6-flash").strip(),
         base_url=os.getenv(
             "ALI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ).strip(),
@@ -88,6 +89,37 @@ class AliyunQwenClient:
 
         return self._normalize_content(content)
 
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.2,
+        reasoning_enabled: bool = False,
+        max_tokens: int | None = None,
+    ) -> Generator[str, None, None]:
+        request_kwargs: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            request_kwargs["max_tokens"] = max_tokens
+        if reasoning_enabled or self.config.enable_thinking:
+            request_kwargs["extra_body"] = {"enable_thinking": True}
+
+        try:
+            stream = self._client.chat.completions.create(**request_kwargs)
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+                text = self._extract_delta_text(delta)
+                if text:
+                    yield text
+        except Exception as exc:
+            raise AliyunError(f"阿里云流式请求失败: {exc}") from exc
+
     @staticmethod
     def _normalize_content(content: Any) -> str:
         if isinstance(content, str):
@@ -103,3 +135,14 @@ class AliyunQwenClient:
             return "\n".join(part for part in parts if part).strip()
 
         return str(content).strip()
+
+    @classmethod
+    def _extract_delta_text(cls, delta: Any) -> str:
+        content = getattr(delta, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return cls._normalize_content(content)
+        if content:
+            return str(content)
+        return ""

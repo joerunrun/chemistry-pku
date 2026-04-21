@@ -37,19 +37,18 @@ class ChemistryExperimentAI:
         ]
         return self.client.chat(messages)
 
-    def compare_images(self, correct_image_bytes: bytes, wrong_image_bytes: bytes) -> str:
-        return self.compare_images_with_metrics(correct_image_bytes, wrong_image_bytes)[0]
-
-    def compare_images_with_metrics(
-        self, correct_image_bytes: bytes, wrong_image_bytes: bytes
-    ) -> tuple[str, dict[str, Any]]:
+    def build_compare_messages(
+        self,
+        correct_image_bytes: bytes,
+        wrong_image_bytes: bytes,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         prompt = """请比较两张化学实验图片，找出图A和图B之间真正存在的装置或操作差异。
 
 注意：
-1. 此步骤不要判断哪一张正确、哪一张错误。
+1. 图A是正确的参考图，图B是待纠错图片。
 2. 只描述“真实不同”，不要把拍摄角度变化、镜头远近、构图偏移、裁剪范围不同、遮挡轻微变化、光照差异当成不同点。
 3. 如果两张图本质上是同一装置、只是视角不同，要明确说明“未发现可靠的关键差异”。
-4. 优先关注实验装置连接、部件位置、导线或玻璃仪器连接方式、液面/电极/接口位置、开关阀门状态、样品或光路位置等关键结构差异。
+4. 重点对比两图是否有增减某些装置或管线，优先关注实验装置连接、部件位置、导线或玻璃仪器连接方式、液面/电极/接口位置、开关阀门状态、样品或光路位置等关键结构差异。
 
 请按下面格式输出：
 真实不同点：
@@ -80,28 +79,20 @@ class ChemistryExperimentAI:
                 ],
             },
         ]
-        model_started_at = time.perf_counter()
-        result = self.client.chat(messages)
-        model_request_ms = (time.perf_counter() - model_started_at) * 1000
         metrics = {
             "image_a": correct_metrics.as_dict(),
             "image_b": wrong_metrics.as_dict(),
             "preprocess_total_ms": round(
                 correct_metrics.preprocess_ms + wrong_metrics.preprocess_ms, 1
             ),
-            "model_request_ms": round(model_request_ms, 1),
         }
-        return result, metrics
+        return messages, metrics
 
-    def analyze_main_error(self, experiment_requirements: str, difference_summary: str) -> str:
-        return self.analyze_main_error_with_metrics(
-            experiment_requirements,
-            difference_summary,
-        )[0]
-
-    def analyze_main_error_with_metrics(
-        self, experiment_requirements: str, difference_summary: str
-    ) -> tuple[str, dict[str, Any]]:
+    def build_analyze_messages(
+        self,
+        experiment_requirements: str,
+        difference_summary: str,
+    ) -> list[dict[str, Any]]:
         prompt = f"""现在你已经拿到了图片差异分析，请结合实验要求给出最终判断。
 
 已知：
@@ -126,10 +117,34 @@ class ChemistryExperimentAI:
 3. 若实验要求与图像差异存在冲突，以实验要求为准重新判断。
 """
 
-        messages = [
+        return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
+
+    def compare_images(self, correct_image_bytes: bytes, wrong_image_bytes: bytes) -> str:
+        return self.compare_images_with_metrics(correct_image_bytes, wrong_image_bytes)[0]
+
+    def compare_images_with_metrics(
+        self, correct_image_bytes: bytes, wrong_image_bytes: bytes
+    ) -> tuple[str, dict[str, Any]]:
+        messages, metrics = self.build_compare_messages(correct_image_bytes, wrong_image_bytes)
+        model_started_at = time.perf_counter()
+        result = self.client.chat(messages)
+        model_request_ms = (time.perf_counter() - model_started_at) * 1000
+        metrics["model_request_ms"] = round(model_request_ms, 1)
+        return result, metrics
+
+    def analyze_main_error(self, experiment_requirements: str, difference_summary: str) -> str:
+        return self.analyze_main_error_with_metrics(
+            experiment_requirements,
+            difference_summary,
+        )[0]
+
+    def analyze_main_error_with_metrics(
+        self, experiment_requirements: str, difference_summary: str
+    ) -> tuple[str, dict[str, Any]]:
+        messages = self.build_analyze_messages(experiment_requirements, difference_summary)
         model_started_at = time.perf_counter()
         result = self.client.chat(messages)
         model_request_ms = (time.perf_counter() - model_started_at) * 1000

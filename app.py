@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import uuid
 from functools import lru_cache
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from chemistry_ai import ChemistryExperimentAI
 from client_factory import create_chat_client, get_provider_model_name
@@ -72,6 +73,10 @@ def current_model_name() -> str:
     return get_provider_model_name(ACTIVE_PROVIDER)
 
 
+def sse_event(event: str, payload: dict[str, object]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @app.get("/")
 def index():
     return render_template(
@@ -88,6 +93,53 @@ def compare_images():
     try:
         correct_image = read_uploaded_image("correct_image")
         wrong_image = read_uploaded_image("wrong_image")
+
+        if ACTIVE_PROVIDER == "ali":
+            ai = get_ai(ACTIVE_PROVIDER)
+            messages, timings = ai.build_compare_messages(correct_image, wrong_image)
+
+            def generate():
+                chunks: list[str] = []
+                model_started_at = time.perf_counter()
+                yield sse_event("start", {"message": "正在流式分析图片差异..."})
+                try:
+                    for text in ai.client.stream_chat(messages):
+                        chunks.append(text)
+                        yield sse_event("delta", {"text": text})
+                    difference_summary = "".join(chunks).strip()
+                    timings["model_request_ms"] = round(
+                        (time.perf_counter() - model_started_at) * 1000, 1
+                    )
+                    timings["total_ms"] = round(
+                        (time.perf_counter() - request_started_at) * 1000, 1
+                    )
+                    session_id = uuid.uuid4().hex
+                    analysis_store[session_id] = {
+                        "difference_summary": difference_summary,
+                        "created_at": time.time(),
+                    }
+                    print(
+                        f"[compare-images] provider=ali "
+                        f"preprocess={timings['preprocess_total_ms']}ms "
+                        f"model={timings['model_request_ms']}ms "
+                        f"total={timings['total_ms']}ms"
+                    )
+                    yield sse_event(
+                        "done",
+                        {
+                            "session_id": session_id,
+                            "difference_summary": difference_summary,
+                            "timings": timings,
+                        },
+                    )
+                except OpenRouterError as exc:
+                    yield sse_event("error", {"error": str(exc)})
+
+            return Response(
+                stream_with_context(generate()),
+                mimetype="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
         if ACTIVE_PROVIDER == "omni":
             difference_summary, timings = get_omni_client().compare_images_with_metrics(
@@ -141,6 +193,52 @@ def analyze_error():
         return jsonify({"error": "当前会话已失效，请重新上传图片。"}), 400
 
     try:
+        if ACTIVE_PROVIDER == "ali":
+            ai = get_ai(ACTIVE_PROVIDER)
+            messages = ai.build_analyze_messages(
+                experiment_requirements,
+                str(stored["difference_summary"]),
+            )
+
+            def generate():
+                chunks: list[str] = []
+                model_started_at = time.perf_counter()
+                yield sse_event("start", {"message": "正在流式生成主要错误..."})
+                try:
+                    for text in ai.client.stream_chat(messages):
+                        chunks.append(text)
+                        yield sse_event("delta", {"text": text})
+                    final_result = "".join(chunks).strip()
+                    timings = {
+                        "input_chars": len(experiment_requirements),
+                        "difference_chars": len(str(stored["difference_summary"])),
+                        "model_request_ms": round(
+                            (time.perf_counter() - model_started_at) * 1000, 1
+                        ),
+                        "total_ms": round(
+                            (time.perf_counter() - request_started_at) * 1000, 1
+                        ),
+                    }
+                    print(
+                        f"[analyze-error] provider=ali "
+                        f"model={timings['model_request_ms']}ms "
+                        f"total={timings['total_ms']}ms "
+                        f"input_chars={timings['input_chars']} "
+                        f"difference_chars={timings['difference_chars']}"
+                    )
+                    yield sse_event(
+                        "done",
+                        {"final_result": final_result, "timings": timings},
+                    )
+                except OpenRouterError as exc:
+                    yield sse_event("error", {"error": str(exc)})
+
+            return Response(
+                stream_with_context(generate()),
+                mimetype="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
         if ACTIVE_PROVIDER == "omni":
             final_result, timings = get_omni_client().analyze_main_error_with_metrics(
                 experiment_requirements,

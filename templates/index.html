@@ -151,6 +151,44 @@
       ].join("\n");
     }
 
+    async function consumeEventStream(response, handlers) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() || "";
+
+        for (const block of blocks) {
+          if (!block.trim()) {
+            continue;
+          }
+
+          let eventName = "message";
+          const dataLines = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              dataLines.push(line.slice(5).trim());
+            }
+          }
+
+          const payload = dataLines.length ? JSON.parse(dataLines.join("\n")) : {};
+          if (handlers[eventName]) {
+            handlers[eventName](payload);
+          }
+        }
+      }
+    }
+
     compareForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       compareStatus.textContent = "正在上传图片并分析差异...";
@@ -165,8 +203,32 @@
         method: "POST",
         body: formData,
       });
-      const data = await response.json();
+      const contentType = response.headers.get("content-type") || "";
 
+      if (contentType.includes("text/event-stream")) {
+        differenceResult.textContent = "";
+        await consumeEventStream(response, {
+          start: (payload) => {
+            compareStatus.textContent = payload.message || "正在流式分析...";
+          },
+          delta: (payload) => {
+            differenceResult.textContent += payload.text || "";
+          },
+          done: (payload) => {
+            currentSessionId = payload.session_id;
+            differenceResult.textContent = payload.difference_summary;
+            compareMetrics.textContent = formatMetrics(payload.timings);
+            compareStatus.textContent = "图片差异分析完成。";
+            analyzeButton.disabled = false;
+          },
+          error: (payload) => {
+            compareStatus.textContent = payload.error || "图片分析失败。";
+          }
+        });
+        return;
+      }
+
+      const data = await response.json();
       if (!response.ok) {
         compareStatus.textContent = data.error || "图片分析失败。";
         return;
@@ -198,8 +260,30 @@
           experiment_requirements: document.getElementById("experiment-requirements").value,
         }),
       });
-      const data = await response.json();
+      const contentType = response.headers.get("content-type") || "";
 
+      if (contentType.includes("text/event-stream")) {
+        finalResult.textContent = "";
+        await consumeEventStream(response, {
+          start: (payload) => {
+            analyzeStatus.textContent = payload.message || "正在流式生成...";
+          },
+          delta: (payload) => {
+            finalResult.textContent += payload.text || "";
+          },
+          done: (payload) => {
+            finalResult.textContent = payload.final_result;
+            analyzeMetrics.textContent = formatAnalyzeMetrics(payload.timings);
+            analyzeStatus.textContent = "最终判断已生成。";
+          },
+          error: (payload) => {
+            analyzeStatus.textContent = payload.error || "最终分析失败。";
+          }
+        });
+        return;
+      }
+
+      const data = await response.json();
       if (!response.ok) {
         analyzeStatus.textContent = data.error || "最终分析失败。";
         return;

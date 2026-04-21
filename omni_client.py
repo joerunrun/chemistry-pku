@@ -84,19 +84,7 @@ class OmniChemistryClient:
         correct_image_bytes: bytes,
         wrong_image_bytes: bytes,
     ) -> tuple[str, dict[str, Any]]:
-        prompt = """请比较两张化学实验图片，找出图A和图B之间真正存在的装置或操作差异。
-
-注意：
-1. 此步骤不要判断哪一张正确、哪一张错误。
-2. 优先关注两张图中增加，减少，替换的部分，关注主要的差异，不要被次要的、细节的差异干扰判断。
-
-请按下面格式输出：
-真实不同点：
-- ...
-- ...
-
-总结：
-用一句话概括两张图最核心的真实差别；如果没有足够可靠的差别，就写“未发现可靠的关键差异”。"""
+        prompt = """两张图片的内容有什么不同"""
         return self._run_realtime_request(
             instructions=prompt,
             correct_image_bytes=correct_image_bytes,
