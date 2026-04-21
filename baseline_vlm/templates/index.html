@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Baseline VLM Cache Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <p class="eyebrow">BASELINE VLM / {{ active_provider|upper }} CACHE</p>
+        <h1>公共实验指导预热 + 单图纠错</h1>
+        <p class="intro">
+          先把一段固定实验指导写入 cache，再在后续请求里上传一张图片和具体问题。
+          页面会流式显示模型回复，并展示首 token 时间、总耗时和 cache 命中情况。
+        </p>
+        <p class="intro">当前 Provider: {{ active_provider }}</p>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <span class="step">Step 1</span>
+          <h2>预热文字 Cache</h2>
+        </div>
+
+        <form id="warm-form" class="stack">
+          <label class="field">
+            <span>模型</span>
+            <input id="model" name="model" list="model-options" value="{{ default_model }}" required>
+            <datalist id="model-options">
+              <option value="z-ai/glm-5v-turbo"></option>
+              <option value="moonshotai/kimi-k2.6"></option>
+              <option value="google/gemini-2.5-flash"></option>
+              <option value="google/gemini-2.5-pro"></option>
+              <option value="qwen3.6-flash"></option>
+              <option value="qwen3-coder-plus"></option>
+            </datalist>
+          </label>
+
+          <label class="field">
+            <span>公共实验指导</span>
+            <textarea id="guide-text" name="guide_text" rows="10" placeholder="在这里粘贴公共实验指导。为了提高 cache 命中率，后续请求不要修改这段文本。" required></textarea>
+          </label>
+
+          <div class="actions">
+            <button type="submit">预热 Cache</button>
+            <p class="hint">不同 provider 对 cache 的支持和统计字段并不完全一致。</p>
+          </div>
+        </form>
+
+        <div id="warm-status" class="status"></div>
+        <div id="warm-metrics" class="metrics hidden"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <span class="step">Step 2</span>
+          <h2>上传图片并流式提问</h2>
+        </div>
+
+        <form id="ask-form" class="stack">
+          <input id="session-id" name="session_id" type="hidden">
+
+          <label class="field">
+            <span>错误图片</span>
+            <input id="image" name="image" type="file" accept="image/*" required>
+          </label>
+
+          <label class="field">
+            <span>本次具体问题</span>
+            <textarea id="prompt" name="prompt" rows="5" placeholder="例如：请指出这张图中最主要的实验错误，并给出原因和改正建议。" required></textarea>
+          </label>
+
+          <div class="actions">
+            <button type="submit">开始流式提问</button>
+            <p class="hint">这一步会复用上一步的 session 和指导文本。</p>
+          </div>
+        </form>
+
+        <div id="ask-status" class="status"></div>
+        <div id="ask-metrics" class="metrics hidden"></div>
+        <pre id="answer" class="answer"></pre>
+      </section>
+    </main>
+
+    <script>
+      const warmForm = document.getElementById("warm-form");
+      const askForm = document.getElementById("ask-form");
+      const sessionIdInput = document.getElementById("session-id");
+      const warmStatus = document.getElementById("warm-status");
+      const warmMetrics = document.getElementById("warm-metrics");
+      const askStatus = document.getElementById("ask-status");
+      const askMetrics = document.getElementById("ask-metrics");
+      const answerBox = document.getElementById("answer");
+
+      function setText(el, text, isError = false) {
+        el.textContent = text;
+        el.classList.toggle("error", Boolean(isError));
+      }
+
+      function showMetrics(el, lines) {
+        el.innerHTML = lines.map((line) => `<div>${line}</div>`).join("");
+        el.classList.remove("hidden");
+      }
+
+      function parseSseBlock(block) {
+        const lines = block.split("\n");
+        let event = "message";
+        let data = "";
+        for (const line of lines) {
+          if (line.startsWith("event:")) {
+            event = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            data += line.slice(5).trim();
+          }
+        }
+        return { event, data: data ? JSON.parse(data) : {} };
+      }
+
+      warmForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        setText(warmStatus, "正在预热 cache...");
+        warmMetrics.classList.add("hidden");
+        sessionIdInput.value = "";
+
+        const payload = {
+          model: document.getElementById("model").value.trim(),
+          guide_text: document.getElementById("guide-text").value.trim(),
+        };
+
+        try {
+          const response = await fetch("/api/warm-cache", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || "预热失败");
+          }
+
+          sessionIdInput.value = data.session_id;
+          setText(warmStatus, `预热完成，session_id=${data.session_id}`);
+          showMetrics(warmMetrics, [
+            `Provider: ${data.provider}`,
+            `模型: ${data.model}`,
+            `预热响应: ${data.message || "(空)"}`,
+            `预热耗时: ${data.elapsed_ms} ms`,
+            `cached_tokens: ${data.usage.cached_tokens}`,
+            `cache_write_tokens: ${data.usage.cache_write_tokens}`,
+            `cache_creation_input_tokens: ${data.usage.cache_creation_input_tokens ?? 0}`,
+            `prompt_tokens: ${data.usage.prompt_tokens}`,
+            `total_tokens: ${data.usage.total_tokens}`,
+          ]);
+        } catch (error) {
+          setText(warmStatus, error.message || "预热失败", true);
+        }
+      });
+
+      askForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!sessionIdInput.value) {
+          setText(askStatus, "请先完成 cache 预热。", true);
+          return;
+        }
+
+        askMetrics.classList.add("hidden");
+        answerBox.textContent = "";
+        setText(askStatus, "正在请求模型...");
+
+        const formData = new FormData(askForm);
+
+        try {
+          const response = await fetch("/api/ask-stream", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!response.ok || !response.body) {
+            throw new Error("流式请求失败");
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) {
+              break;
+            }
+            buffer += decoder.decode(value, { stream: true });
+
+            while (buffer.includes("\n\n")) {
+              const index = buffer.indexOf("\n\n");
+              const block = buffer.slice(0, index).trim();
+              buffer = buffer.slice(index + 2);
+              if (!block) continue;
+
+              const { event: eventName, data } = parseSseBlock(block);
+              if (eventName === "meta") {
+                setText(askStatus, `已连接流式响应，provider=${data.provider}，模型=${data.model}`);
+              } else if (eventName === "start") {
+                setText(askStatus, `模型开始生成，模型=${data.model}`);
+              } else if (eventName === "delta") {
+                answerBox.textContent += data.text || "";
+              } else if (eventName === "done") {
+                setText(
+                  askStatus,
+                  data.cache_hit
+                    ? "生成完成，检测到 cache 命中。"
+                    : "生成完成，未检测到 cache 命中。"
+                );
+                showMetrics(askMetrics, [
+                  `首 token 时间: ${data.first_token_ms ?? "无"} ms`,
+                  `总耗时: ${data.total_ms} ms`,
+                  `cache_hit: ${String(Boolean(data.cache_hit))}`,
+                  `cached_tokens: ${data.usage.cached_tokens}`,
+                  `cache_write_tokens: ${data.usage.cache_write_tokens}`,
+                  `cache_creation_input_tokens: ${data.usage.cache_creation_input_tokens ?? 0}`,
+                  `prompt_tokens: ${data.usage.prompt_tokens}`,
+                  `completion_tokens: ${data.usage.completion_tokens}`,
+                  `total_tokens: ${data.usage.total_tokens}`,
+                ]);
+              } else if (eventName === "error") {
+                throw new Error(data.message || "流式请求失败");
+              }
+            }
+          }
+        } catch (error) {
+          setText(askStatus, error.message || "流式请求失败", true);
+        }
+      });
+    </script>
+  </body>
+</html>
