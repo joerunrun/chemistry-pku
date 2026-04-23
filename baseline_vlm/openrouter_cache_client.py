@@ -161,7 +161,7 @@ class OpenRouterCacheClient:
         data_url = image_bytes_to_data_url(image_bytes, config=self.config)
         payload = {
             "model": model,
-            "temperature": 0.2,
+            "temperature": 0.0,
             "stream": True,
             "stream_options": {"include_usage": True},
             "messages": self._build_prefix_messages(
