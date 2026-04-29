@@ -16,7 +16,7 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 
 ACTIVE_PROVIDER = "openrouter"
 DEFAULT_MODELS = {
-    "openrouter": "moonshotai/kimi-k2.6",
+    "openrouter": "qwen/qwen3-vl-8b-instruct",
     "ali": "qwen3.6-flash",
 }
 client: OpenRouterCacheClient | AliCacheClient | None = None

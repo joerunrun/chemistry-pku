@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="化学实验纠错 Web")
     parser.add_argument(
         "--provider",
-        choices=["openrouter", "ali", "omni"],
+        choices=["openrouter", "ali", "gemini", "omni"],
         default="openrouter",
         help="选择底层模型提供方。",
     )
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-@lru_cache(maxsize=3)
+@lru_cache(maxsize=4)
 def get_ai(provider: str) -> ChemistryExperimentAI:
     return ChemistryExperimentAI(create_chat_client(provider))
 

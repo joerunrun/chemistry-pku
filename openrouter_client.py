@@ -67,7 +67,7 @@ def load_openrouter_config(require_api_key: bool = True) -> OpenRouterConfig:
 
     return OpenRouterConfig(
         api_key=api_key,
-        model=os.getenv("OPENROUTER_MODEL", "z-ai/glm-5v-turbo").strip(),
+        model=os.getenv("OPENROUTER_MODEL", "qwen/qwen3-vl-8b-instruct").strip(),
         base_url=os.getenv(
             "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
         ).strip(),

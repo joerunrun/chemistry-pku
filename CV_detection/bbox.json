@@ -1,0 +1,36 @@
+{
+  "image": "正确图片1 (2).jpg",
+  "image_size": {
+    "width": 3024,
+    "height": 4032
+  },
+  "boxes": {
+    "voltage_regulator": [],
+    "heating_unit": [
+      2535,
+      315,
+      3788,
+      1610
+    ],
+    "distillation_core": [
+      1201,
+      814,
+      2515,
+      1421
+    ],
+    "condenser_unit": [
+      1722,
+      1367,
+      2672,
+      2303
+    ],
+    "receiving_assembly": [
+      2084,
+      2201,
+      2902,
+      2687
+    ],
+    "vacuum_gauge": []
+  },
+  "voltage_regulator_surface": "uncertain"
+}

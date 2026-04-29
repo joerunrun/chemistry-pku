@@ -162,6 +162,9 @@ class OpenRouterCacheClient:
         payload = {
             "model": model,
             "temperature": 0.0,
+            "provider": {
+            "sort": "latency"
+            },
             "stream": True,
             "stream_options": {"include_usage": True},
             "messages": self._build_prefix_messages(
