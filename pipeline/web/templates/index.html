@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>化学实验 Pipeline: CV检测 + VLM纠错</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>化学实验 Pipeline</h1>
+        <p class="subtle">CV检测画框 → VLM逐装置分析差异 → 判断主要错误</p>
+      </div>
+    </header>
+
+    <form id="mainForm">
+      <section class="upload-grid">
+        <div class="upload-card panel">
+          <label>待纠错图片（学生图）</label>
+          <input type="file" name="wrong_image" accept="image/*" required id="wrongInput">
+          <img id="wrongPreview" class="upload-preview" hidden alt="学生图预览">
+        </div>
+        <div class="upload-card panel">
+          <label>正确参考图来源</label>
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <label style="display:flex;align-items:center;gap:4px;font-weight:400;cursor:pointer;">
+              <input type="radio" name="correct_source" value="database" checked id="srcDb"> 数据库选取
+            </label>
+            <label style="display:flex;align-items:center;gap:4px;font-weight:400;cursor:pointer;">
+              <input type="radio" name="correct_source" value="upload" id="srcUpload"> 上传已标注图
+            </label>
+          </div>
+          <div id="correctDbArea">
+            <select name="reference_id" id="referenceSelect">
+              <option value="">加载中...</option>
+            </select>
+          </div>
+          <div id="correctUploadArea" hidden>
+            <input type="file" name="correct_image" accept="image/*" id="correctImageInput">
+            <img id="correctPreview" class="upload-preview" hidden alt="正确图预览">
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" style="padding:14px; margin-bottom:14px;">
+        <label style="display:block;font-weight:700;margin-bottom:6px;">实验要求</label>
+        <textarea name="experiment_requirements" rows="3" placeholder="请输入实验要求，例如：使用蒸馏法提纯液体混合物..." required></textarea>
+      </section>
+
+      <details class="config-panel panel" style="margin-bottom:14px;">
+        <summary style="cursor:pointer;font-weight:700;color:var(--accent-dark);">CV / VLM 参数</summary>
+        <div class="config-grid" style="margin-top:10px;">
+          <label>特征算法
+            <select name="feature">
+              <option value="akaze" selected>AKAZE</option>
+              <option value="sift">SIFT</option>
+            </select>
+          </label>
+          <label>VLM Provider
+            <select name="provider" id="providerSelect">
+              <option value="openrouter" selected>OpenRouter</option>
+              <option value="ali">阿里云通义</option>
+              <option value="gemini">Gemini</option>
+            </select>
+          </label>
+          <label>模型
+            <select name="model" id="modelSelect">
+              <option value="">默认</option>
+            </select>
+          </label>
+          <label>方案
+            <select name="approach">
+              <option value="both" selected>两种都跑</option>
+              <option value="a">方案A（一步到位）</option>
+              <option value="b">方案B（两步式）</option>
+            </select>
+          </label>
+          <label>max_side
+            <input type="number" name="max_side" min="600" max="2600" step="100" value="1600">
+          </label>
+          <label>lowe_ratio
+            <input type="number" name="lowe_ratio" min="0.5" max="0.95" step="0.05" value="0.75">
+          </label>
+          <label>min_good_matches
+            <input type="number" name="min_good_matches" min="1" max="20" step="1" value="3">
+          </label>
+          <label>min_inliers
+            <input type="number" name="min_inliers" min="1" max="20" step="1" value="2">
+          </label>
+          <label>min_inlier_ratio
+            <input type="number" name="min_inlier_ratio" min="0.01" max="0.5" step="0.01" value="0.08">
+          </label>
+          <label>top_k_per_label
+            <input type="number" name="top_k_per_label" min="1" max="20" step="1" value="6">
+          </label>
+          <label>overlap_weight
+            <input type="number" name="overlap_weight" min="0" max="2" step="0.05" value="0.75">
+          </label>
+        </div>
+      </details>
+
+      <div class="action-bar">
+        <button type="submit" id="runButton">开始检测分析</button>
+        <span id="status" class="status"></span>
+      </div>
+    </form>
+
+    <section class="results-grid" id="resultsArea" hidden>
+      <section class="images-panel panel">
+        <h2>标注结果</h2>
+        <div class="image-pair">
+          <figure>
+            <figcaption>参考图（正确）</figcaption>
+            <img id="correctImage" alt="参考图标注">
+          </figure>
+          <figure>
+            <figcaption>待纠错图</figcaption>
+            <img id="wrongImage" alt="待纠错图标注">
+          </figure>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="card panel">
+          <h2>耗时统计</h2>
+          <table class="timing-table" id="timingTable">
+            <thead><tr><th>步骤</th><th>耗时</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section class="card panel">
+          <h2>检测结果</h2>
+          <table class="timing-table" id="detectionTable">
+            <thead><tr><th>装置</th><th>参考图</th><th>学生图</th><th>备注</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+      </aside>
+    </section>
+
+    <section id="analysisArea" hidden style="margin-top:14px;">
+      <div class="approach-tabs">
+        <button type="button" class="approach-tab active" data-tab="tabA">方案A 一步到位</button>
+        <button type="button" class="approach-tab" data-tab="tabB">方案B 两步式</button>
+      </div>
+
+      <div id="tabA" class="approach-content active panel" style="padding:14px;">
+        <h2>方案A 分析结果</h2>
+        <div class="result-text" id="resultA">等待运行...</div>
+      </div>
+
+      <div id="tabB" class="approach-content panel" style="padding:14px;">
+        <h2>方案B 分析结果</h2>
+        <div class="diff-section">
+          <h3>Step 1: 逐色框找不同</h3>
+          <div class="result-text" id="resultBDiff">等待运行...</div>
+        </div>
+        <div class="diff-section">
+          <h3>Step 2: 结合实验要求分析</h3>
+          <div class="result-text" id="resultBAnalysis">等待运行...</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const wrongInput = document.getElementById("wrongInput");
+    const wrongPreview = document.getElementById("wrongPreview");
+    const refSelect = document.getElementById("referenceSelect");
+    const mainForm = document.getElementById("mainForm");
+    const runButton = document.getElementById("runButton");
+    const statusEl = document.getElementById("status");
+    const resultsArea = document.getElementById("resultsArea");
+    const analysisArea = document.getElementById("analysisArea");
+
+    /* Preview */
+    wrongInput.addEventListener("change", () => {
+      if (wrongInput.files[0]) {
+        wrongPreview.src = URL.createObjectURL(wrongInput.files[0]);
+        wrongPreview.hidden = false;
+      }
+    });
+
+    const correctImageInput = document.getElementById("correctImageInput");
+    const correctPreview = document.getElementById("correctPreview");
+    correctImageInput.addEventListener("change", () => {
+      if (correctImageInput.files[0]) {
+        correctPreview.src = URL.createObjectURL(correctImageInput.files[0]);
+        correctPreview.hidden = false;
+      }
+    });
+
+    /* Correct source toggle */
+    const srcDb = document.getElementById("srcDb");
+    const srcUpload = document.getElementById("srcUpload");
+    const correctDbArea = document.getElementById("correctDbArea");
+    const correctUploadArea = document.getElementById("correctUploadArea");
+
+    srcDb.addEventListener("change", () => {
+      correctDbArea.hidden = false;
+      correctUploadArea.hidden = true;
+    });
+    srcUpload.addEventListener("change", () => {
+      correctDbArea.hidden = true;
+      correctUploadArea.hidden = false;
+    });
+
+    /* Load references */
+    async function loadReferences() {
+      try {
+        const resp = await fetch("/api/references");
+        const data = await resp.json();
+        refSelect.innerHTML = "";
+        if (data.references && data.references.length) {
+          data.references.forEach(ref => {
+            const opt = document.createElement("option");
+            opt.value = ref.id;
+            const labels = (ref.annotated_labels || []).join(", ") || "无标注";
+            opt.textContent = `${ref.original_filename} (${labels})`;
+            refSelect.appendChild(opt);
+          });
+        } else {
+          refSelect.innerHTML = '<option value="">无可用参考图</option>';
+        }
+      } catch (e) {
+        refSelect.innerHTML = '<option value="">加载失败</option>';
+      }
+    }
+    loadReferences();
+
+    /* Provider / model selection */
+    const providerSelect = document.getElementById("providerSelect");
+    const modelSelect = document.getElementById("modelSelect");
+    let providerModels = {};
+
+    async function loadModels() {
+      try {
+        const resp = await fetch("/api/models");
+        const data = await resp.json();
+        providerModels = data.provider_models || {};
+        updateModelOptions();
+      } catch (e) {
+        modelSelect.innerHTML = '<option value="">默认</option>';
+      }
+    }
+
+    function updateModelOptions() {
+      const provider = providerSelect.value;
+      const models = providerModels[provider] || [];
+      modelSelect.innerHTML = '<option value="">默认</option>';
+      models.forEach(m => {
+        const opt = document.createElement("option");
+        opt.value = m.value;
+        opt.textContent = m.label;
+        modelSelect.appendChild(opt);
+      });
+    }
+
+    providerSelect.addEventListener("change", updateModelOptions);
+    loadModels();
+
+    /* Tabs */
+    document.querySelectorAll(".approach-tab").forEach(tab => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".approach-tab").forEach(t => t.classList.remove("active"));
+        document.querySelectorAll(".approach-content").forEach(c => c.classList.remove("active"));
+        tab.classList.add("active");
+        document.getElementById(tab.dataset.tab).classList.add("active");
+      });
+    });
+
+    /* Color name map */
+    const COLOR_NAMES = {
+      voltage_regulator: "调压器(黄)",
+      heating_unit: "加热装置(红)",
+      distillation_core: "蒸馏核心(绿)",
+      condenser_unit: "冷凝管(蓝)",
+      receiving_assembly: "接收装置(橙)",
+      vacuum_gauge: "真空表(紫)",
+    };
+
+    function renderTimings(timings) {
+      const tbody = document.querySelector("#timingTable tbody");
+      tbody.innerHTML = "";
+      const maxMs = Math.max(...Object.values(timings), 1);
+      for (const [name, ms] of Object.entries(timings)) {
+        const barW = Math.max(2, Math.round((ms / maxMs) * 120));
+        /* step numbering prefix like "1_", "5A_", "5B1_" → keep readable label */
+        const label = name.replace(/^\d+(A?\d?)_/, "");
+        let rowClass = "";
+        if (name.includes("A_")) rowClass = ' style="color:var(--accent)"';
+        if (name.includes("B1_") || name.includes("B2_")) rowClass = ' style="color:var(--blue)"';
+        tbody.innerHTML += `<tr${rowClass}>
+          <td>${label}</td>
+          <td>${ms.toFixed(1)} ms <span class="timing-bar" style="width:${barW}px"></span></td>
+        </tr>`;
+      }
+    }
+
+    function renderDetections(labelSummary) {
+      const tbody = document.querySelector("#detectionTable tbody");
+      tbody.innerHTML = "";
+      for (const [label, info] of Object.entries(labelSummary || {})) {
+        const name = COLOR_NAMES[label] || label;
+        const inC = info.in_correct ? '<span style="color:var(--ok)">✓</span>' : '<span style="color:var(--bad)">✗</span>';
+        const inW = info.in_wrong ? '<span style="color:var(--ok)">✓</span>' : '<span style="color:var(--bad)">✗</span>';
+        let note = "";
+        if (info.in_wrong && info.wrong_score != null) note += `score=${info.wrong_score.toFixed(3)} `;
+        if (!info.in_wrong && info.wrong_failure_reason) note += info.wrong_failure_reason;
+        tbody.innerHTML += `<tr><td>${name}</td><td>${inC}</td><td>${inW}</td><td style="font-size:.82rem;color:var(--muted)">${note}</td></tr>`;
+      }
+    }
+
+    /* Submit */
+    mainForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      statusEl.textContent = "正在运行 pipeline...";
+      runButton.disabled = true;
+
+      try {
+        const response = await fetch("/api/run", {
+          method: "POST",
+          body: new FormData(mainForm),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "运行失败");
+
+        /* Show images */
+        if (data.correct_data_url) {
+          document.getElementById("correctImage").src = data.correct_data_url;
+        }
+        if (data.wrong_data_url) {
+          document.getElementById("wrongImage").src = data.wrong_data_url;
+        }
+        resultsArea.hidden = false;
+
+        renderTimings(data.timings || {});
+        renderDetections(data.label_summary);
+
+        /* Approach A */
+        if (data.approach_a) {
+          document.getElementById("resultA").textContent = data.approach_a.analysis_text || "无结果";
+          document.querySelector('[data-tab="tabA"]').style.display = "";
+        } else {
+          document.getElementById("resultA").textContent = "未运行";
+          document.querySelector('[data-tab="tabA"]').style.display = "none";
+        }
+
+        /* Approach B */
+        if (data.approach_b) {
+          document.getElementById("resultBDiff").textContent = data.approach_b.diff_text || "无结果";
+          document.getElementById("resultBAnalysis").textContent = data.approach_b.analysis_text || "无结果";
+          document.querySelector('[data-tab="tabB"]').style.display = "";
+        } else {
+          document.getElementById("resultBDiff").textContent = "未运行";
+          document.getElementById("resultBAnalysis").textContent = "未运行";
+          document.querySelector('[data-tab="tabB"]').style.display = "none";
+        }
+
+        analysisArea.hidden = false;
+        statusEl.textContent = "Pipeline 完成。";
+      } catch (error) {
+        statusEl.textContent = error.message || String(error);
+      } finally {
+        runButton.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
