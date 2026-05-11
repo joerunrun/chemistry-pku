@@ -1,7 +1,8 @@
+"""CV 检测包装，支持自定义实验组件配置。所有 component_labels 参数可选，默认走 core.py 全局值。"""
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ class CVDetectionParams:
     top_k_per_label: int = 6
     overlap_weight: float = 0.75
     feature: str = "akaze"  # "akaze" or "sift"
+    component_labels: list[str] | None = None  # 不传则用 core.py 默认
 
 
 def detect_wrong_image(
@@ -41,6 +43,7 @@ def detect_wrong_image(
             min_inlier_ratio=p.min_inlier_ratio,
             top_k_per_label=p.top_k_per_label,
             overlap_weight=p.overlap_weight,
+            component_labels=p.component_labels,
         )
     return cv_core.detect_image_relaxed(
         image,
@@ -51,10 +54,16 @@ def detect_wrong_image(
         min_inlier_ratio=p.min_inlier_ratio,
         top_k_per_label=p.top_k_per_label,
         overlap_weight=p.overlap_weight,
+        component_labels=p.component_labels,
     )
 
 
-def build_reference_result(reference_id: str) -> dict[str, Any]:
+def build_reference_result(
+    reference_id: str,
+    component_labels: list[str] | None = None,
+) -> dict[str, Any]:
+    labels = component_labels or cv_core.COMPONENT_LABELS
+
     annotations = cv_core.load_annotations()
     target = None
     for ref in annotations.get("references", []):
@@ -66,7 +75,7 @@ def build_reference_result(reference_id: str) -> dict[str, Any]:
 
     boxes: dict[str, list[int]] = {}
     detections: dict[str, dict[str, Any]] = {}
-    for label in cv_core.COMPONENT_LABELS:
+    for label in labels:
         label_data = target.get("labels", {}).get(label, {})
         bbox = label_data.get("bbox", [])
         if bbox:
@@ -87,25 +96,24 @@ def encode_annotated_image(image: np.ndarray, quality: int = 86) -> str:
     return cv_core.encode_image_data_url(image, quality)
 
 
-def list_available_references() -> list[dict[str, Any]]:
+def list_available_references(component_labels: list[str] | None = None) -> list[dict[str, Any]]:
+    labels = component_labels or cv_core.COMPONENT_LABELS
     data = cv_core.list_references()
     result = []
     for ref in data.get("references", []):
         annotated = [
             label
-            for label in cv_core.COMPONENT_LABELS
+            for label in labels
             if ref.get("keypoints", {}).get(label, 0) > 0
             or ref.get("labels", {}).get(label, {}).get("bbox")
         ]
-        result.append(
-            {
-                "id": ref.get("id", ""),
-                "original_filename": ref.get("original_filename", ""),
-                "filename": ref.get("filename", ""),
-                "image_size": ref.get("image_size", {}),
-                "annotated_labels": annotated,
-            }
-        )
+        result.append({
+            "id": ref.get("id", ""),
+            "original_filename": ref.get("original_filename", ""),
+            "filename": ref.get("filename", ""),
+            "image_size": ref.get("image_size", {}),
+            "annotated_labels": annotated,
+        })
     return result
 
 
@@ -124,12 +132,7 @@ def decode_image(image_bytes: bytes) -> np.ndarray:
     return cv_core.decode_image(image_bytes, "uploaded_image")
 
 
-def get_component_info() -> list[dict[str, str]]:
-    return [
-        {
-            "label": item["label"],
-            "name": item["name"],
-            "color": item["color"],
-        }
-        for item in cv_core.COMPONENTS
-    ]
+def get_component_info(component_list: list[dict] | None = None) -> list[dict[str, str]]:
+    """返回组件信息；可传入自定义组件列表。"""
+    items = component_list or cv_core.COMPONENTS
+    return [{"label": item["label"], "name": item["name"], "color": item["color"]} for item in items]

@@ -1,0 +1,12 @@
+{
+  "distillation": {
+    "correct_source": "file",
+    "annotated_image_path": "D:/chemistry/化小北实验测试数据/减压蒸馏操作图片/人工正确.png",
+    "experiment_requirements": "减压蒸馏装置检查要点：必须使用克氏蒸馏头；接收装置应使用多尾接液管和圆底/梨形接收瓶，不能用锥形瓶；温度计液泡应位于蒸馏头侧管口中心；磨口连接处应使用磨口夹固定；冷凝管应接橡胶水管并下进上出，且用铁夹固定；尾接管侧口应连接真空泵或水泵；真空表示数应达到或超过0.08 MPa；调压仪出现在桌面上方视为错误；烧瓶下方应有电磁搅拌器防止爆沸。"
+  },
+  "photometer": {
+    "correct_source": "database",
+    "reference_id": "250bbf02fa04",
+    "experiment_requirements": "判断光斑最亮处是否与感光元件中心对准。"
+  }
+}

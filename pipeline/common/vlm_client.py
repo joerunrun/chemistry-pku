@@ -47,6 +47,8 @@ def create_vlm(provider: str, model: str | None = None) -> Any:
     client = create_chat_client(provider)
     if model:
         client.config.model = model
+    elif provider == "gemini":
+        client.config.model = "gemini-3-flash-preview"
     return client
 
 

@@ -44,6 +44,7 @@ COMPONENTS: list[dict[str, str]] = [
     {"label": "condenser_unit", "name": "condenser_unit", "color": "#00a2e8"},
     {"label": "receiving_assembly", "name": "receiving_assembly", "color": "#ff7f27"},
     {"label": "vacuum_gauge", "name": "vacuum_gauge", "color": "#a349a4"},
+    {"label": "light_spot", "name": "light_spot", "color": "#ff0000"},
 ]
 
 COMPONENT_LABELS = [item["label"] for item in COMPONENTS]
@@ -55,6 +56,7 @@ COLOR_BGR = {
     "condenser_unit": (232, 162, 0),
     "receiving_assembly": (39, 127, 255),
     "vacuum_gauge": (164, 73, 163),
+    "light_spot": (0, 0, 255),
 }
 
 
@@ -1323,6 +1325,7 @@ def detect_image_relaxed(
     min_inlier_ratio: float = RELAXED_MIN_INLIER_RATIO,
     top_k_per_label: int = RELAXED_TOP_K_PER_LABEL,
     overlap_weight: float = RELAXED_OVERLAP_WEIGHT,
+    component_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     total_started_at = time.perf_counter()
     metadata, arrays = load_descriptor_db()
@@ -1355,6 +1358,7 @@ def detect_image_relaxed(
         min_inlier_ratio=min_inlier_ratio,
         top_k_per_label=top_k_per_label,
         overlap_weight=overlap_weight,
+        component_labels=component_labels,
     )
     result["timings"]["feature_extract_ms"] = feature_extract_ms
     result["timings"]["total_ms"] = elapsed_ms(total_started_at)
@@ -1378,6 +1382,7 @@ def detect_image_sift_relaxed(
     min_inlier_ratio: float = RELAXED_MIN_INLIER_RATIO,
     top_k_per_label: int = RELAXED_TOP_K_PER_LABEL,
     overlap_weight: float = RELAXED_OVERLAP_WEIGHT,
+    component_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     total_started_at = time.perf_counter()
     ensure_sift_descriptor_db(max_side=max_side)
@@ -1411,6 +1416,7 @@ def detect_image_sift_relaxed(
         min_inlier_ratio=min_inlier_ratio,
         top_k_per_label=top_k_per_label,
         overlap_weight=overlap_weight,
+        component_labels=component_labels,
     )
     result["timings"]["feature_extract_ms"] = feature_extract_ms
     result["timings"]["total_ms"] = elapsed_ms(total_started_at)
@@ -1442,14 +1448,16 @@ def detect_relaxed_generic(
     min_inlier_ratio: float,
     top_k_per_label: int,
     overlap_weight: float,
+    component_labels: list[str] | None = None,
 ) -> dict[str, Any]:
-    boxes: dict[str, list[int]] = {label: [] for label in COMPONENT_LABELS}
+    labels = component_labels or COMPONENT_LABELS
+    boxes: dict[str, list[int]] = {label: [] for label in labels}
     detections: dict[str, dict[str, Any]] = {}
     component_ms: dict[str, float] = {}
     candidates_by_label: dict[str, list[dict[str, Any]]] = {}
     all_candidates_by_label: dict[str, list[dict[str, Any]]] = {}
 
-    for label in COMPONENT_LABELS:
+    for label in labels:
         component_started_at = time.perf_counter()
         label_samples = [sample for sample in samples if sample.get("label") == label]
         candidates = collect_relaxed_candidates(
@@ -1475,10 +1483,11 @@ def detect_relaxed_generic(
     selected, penalties = select_non_overlapping_candidates(
         candidates_by_label,
         overlap_weight=overlap_weight,
+        component_labels=labels,
     )
     selection_ms = elapsed_ms(selection_started_at)
 
-    for label in COMPONENT_LABELS:
+    for label in labels:
         candidate = selected.get(label)
         all_candidates = all_candidates_by_label.get(label, [])
         boxes[label] = candidate.get("box", []) if candidate else []
@@ -1731,9 +1740,11 @@ def select_non_overlapping_candidates(
     candidates_by_label: dict[str, list[dict[str, Any]]],
     *,
     overlap_weight: float,
+    component_labels: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+    labels = component_labels or COMPONENT_LABELS
     options_by_label: list[tuple[str, list[dict[str, Any] | None]]] = []
-    for label in COMPONENT_LABELS:
+    for label in labels:
         options = list(candidates_by_label.get(label, []))
         options_by_label.append((label, [None, *options]))
 

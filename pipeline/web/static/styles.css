@@ -122,6 +122,17 @@ textarea {
   min-height: 60px;
 }
 
+.readonly-box {
+  min-height: 42px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfaf8;
+  color: var(--ink);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 /* Action bar */
 .action-bar {
   display: flex;
@@ -186,6 +197,47 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .side { display: grid; gap: 14px; }
 
 .card { padding: 14px; }
+
+.ref-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.ref-card {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px;
+  background: #fbfaf8;
+}
+
+.ref-card img {
+  width: 100%;
+  max-height: 160px;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #f2eee8;
+}
+
+.ref-card .meta {
+  font-size: .82rem;
+  margin-top: 4px;
+}
+
+.ref-card .title {
+  color: var(--muted);
+}
+
+.ref-card .score {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.ref-card .rectification {
+  color: var(--muted);
+  margin-top: 2px;
+}
 
 /* Timings */
 .timing-table {

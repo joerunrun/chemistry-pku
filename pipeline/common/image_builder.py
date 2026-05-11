@@ -1,3 +1,4 @@
+"""标注图构建 + label_summary + CV 结构化摘要。支持自定义组件列表。"""
 from __future__ import annotations
 
 from typing import Any
@@ -32,10 +33,41 @@ def build_annotated_pair(
     }
 
 
+def build_label_summary(
+    correct_result: dict[str, Any],
+    wrong_result: dict[str, Any],
+    components: list[dict] | None = None,
+) -> dict[str, dict[str, Any]]:
+    wrong_boxes = wrong_result.get("boxes", {})
+    wrong_detections = wrong_result.get("detections", {})
+    correct_boxes = correct_result.get("boxes", {})
+
+    label_summary: dict[str, dict[str, Any]] = {}
+    for comp in get_component_info(components if components else None):
+        label = comp["label"]
+        c_box = correct_boxes.get(label, [])
+        w_box = wrong_boxes.get(label, [])
+        sentinel = [0, 0, 1, 1]
+        label_summary[label] = {
+            "name": comp["name"],
+            "color": comp["color"],
+            "in_correct": bool(c_box),
+            "in_wrong": bool(w_box),
+            "correct_box": c_box if c_box != sentinel else [],
+            "wrong_box": w_box,
+            "wrong_score": wrong_detections.get(label, {}).get("score"),
+            "wrong_raw_score": wrong_detections.get(label, {}).get("raw_score"),
+            "wrong_failure_reason": wrong_detections.get(label, {}).get("failure_reason"),
+            "correct_score": None,
+        }
+    return label_summary
+
+
 def build_cv_structured_summary(
     label_summary: dict[str, Any],
     *,
     correct_is_uploaded: bool = False,
+    wrong_is_uploaded: bool = False,
 ) -> str:
     lines: list[str] = []
 
@@ -60,22 +92,18 @@ def build_cv_structured_summary(
     ]
 
     if correct_is_uploaded:
-        lines.append(f"图A（参考图，人工标注）包含的装置：{', '.join(correct_labels) or '未知（由人工标注）'}")
+        lines.append(f"图A（参考图，人工标注）包含的装置：{', '.join(correct_labels) or '未知'}")
     else:
         lines.append(f"图A（参考图）检测到的装置：{', '.join(correct_labels) or '无'}")
-    lines.append(f"图B（待纠错图）检测到的装置：{', '.join(wrong_labels) or '无'}")
-
-    if not correct_is_uploaded:
-        if only_correct:
-            lines.append(f"仅在图A中检测到（图B可能缺失）：{', '.join(only_correct)}")
-        if only_wrong:
-            lines.append(f"仅在图B中检测到（图A可能缺失）：{', '.join(only_wrong)}")
+    if wrong_is_uploaded:
+        lines.append(f"图B（待纠错图，人工标注）包含的装置：{', '.join(wrong_labels) or '未知'}")
     else:
-        if only_correct:
-            lines.append(f"图A有人工标注但图B未检测到：{', '.join(only_correct)}")
-        if only_wrong:
-            lines.append(f"仅在图B中检测到（图A未标注）：{', '.join(only_wrong)}")
+        lines.append(f"图B（待纠错图）检测到的装置：{', '.join(wrong_labels) or '无'}")
 
+    if only_correct:
+        lines.append(f"图A有但图B未检测到：{', '.join(only_correct)}")
+    if only_wrong:
+        lines.append(f"仅在图B中检测到：{', '.join(only_wrong)}")
     if neither:
         lines.append(f"两张图都未检测到：{', '.join(neither)}")
 

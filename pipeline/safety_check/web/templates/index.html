@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实验室安全检查</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<main class="page">
+  <header>
+    <h1>实验室安全检查</h1>
+    <p class="subtle">上传实验室照片 → 检索相似安全隐患案例 → AI 分析是否存在同类问题</p>
+  </header>
+
+  <div id="errorBox"></div>
+
+  <form id="mainForm">
+    <div class="form-panel panel">
+      <label>上传待检图片
+        <input type="file" name="image" accept="image/*" required id="imageInput">
+      </label>
+      <img id="imagePreview" class="upload-preview" hidden alt="预览">
+    </div>
+
+    <div class="config-row panel" style="padding:10px 14px;">
+      <label>Provider <select name="provider" id="providerSelect">
+        <option value="gemini" selected>Gemini</option>
+        <option value="openrouter">OpenRouter</option>
+        <option value="ali">阿里云</option>
+      </select></label>
+      <label>模型 <select name="model" id="modelSelect"><option value="">默认</option></select></label>
+      <label>Top-K <input type="number" name="top_k" value="1" min="1" max="10"></label>
+    </div>
+
+    <div class="action-bar">
+      <button type="submit" id="runButton">开始检查</button>
+      <span id="status" class="status"></span>
+    </div>
+  </form>
+
+  <section class="results-grid" id="resultsArea" hidden>
+    <section class="card panel">
+      <h2>最相似参考案例（Top-K）</h2>
+      <div class="ref-grid" id="refGrid"></div>
+    </section>
+
+    <aside style="display:grid;gap:14px;">
+      <section class="card panel">
+        <h2>耗时</h2>
+        <table class="timing-table" id="timingTable"><tbody></tbody></table>
+      </section>
+      <section class="card panel">
+        <h2>VLM 分析结果</h2>
+        <div class="result-text" id="resultText">等待...</div>
+      </section>
+    </aside>
+  </section>
+</main>
+
+<script>
+  const runButton = document.getElementById("runButton");
+  const statusEl = document.getElementById("status");
+  const resultsArea = document.getElementById("resultsArea");
+  const errorBox = document.getElementById("errorBox");
+
+  /* preview */
+  document.getElementById("imageInput").addEventListener("change", function() {
+    if (this.files[0]) {
+      const p = document.getElementById("imagePreview");
+      p.src = URL.createObjectURL(this.files[0]);
+      p.hidden = false;
+    }
+  });
+
+  /* models by provider */
+  const MODELS = {
+    gemini: [
+      {v:"gemini-3-flash-preview", l:"Gemini 3 Flash"},
+      {v:"gemini-2.5-flash-preview-05-20", l:"Gemini 2.5 Flash"},
+      {v:"gemini-2.5-pro-preview-05-06", l:"Gemini 2.5 Pro"},
+    ],
+    openrouter: [
+      {v:"qwen/qwen3-vl-8b-instruct", l:"Qwen3-VL 8B"},
+      {v:"google/gemini-2.5-flash-preview", l:"Gemini 2.5 Flash"},
+    ],
+    ali: [
+      {v:"qwen3.6-flash", l:"Qwen3.6 Flash"},
+      {v:"qwen2.5-vl-72b-instruct", l:"Qwen2.5-VL 72B"},
+    ],
+  };
+  const ps = document.getElementById("providerSelect");
+  const ms = document.getElementById("modelSelect");
+  ps.addEventListener("change", () => {
+    const models = MODELS[ps.value] || [];
+    ms.innerHTML = '<option value="">默认</option>';
+    models.forEach(m => { const o = document.createElement("option"); o.value=m.v; o.textContent=m.l; ms.appendChild(o); });
+    if (ps.value === "gemini") ms.value = "gemini-3-flash-preview";
+  });
+  ps.dispatchEvent(new Event("change"));
+
+  document.getElementById("mainForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    statusEl.textContent = "正在检查...";
+    runButton.disabled = true;
+    resultsArea.hidden = true;
+    errorBox.style.display = "none";
+
+    try {
+      const resp = await fetch("/api/check", { method:"POST", body:new FormData(e.target) });
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        let msg = data.error || "未知错误";
+        // 如果有部分结果仍然展示
+        if (data.retrieved) showRetrieved(data.retrieved);
+        if (data.timings) showTimings(data.timings);
+        throw new Error(msg);
+      }
+
+      showRetrieved(data.ref_cases || []);
+      document.getElementById("resultText").textContent = data.analysis_text || "无分析结果";
+      showTimings(data.timings || {});
+      resultsArea.hidden = false;
+      statusEl.textContent = "检查完成。";
+    } catch (err) {
+      errorBox.style.display = "block";
+      errorBox.textContent = err.message;
+      statusEl.textContent = "检查失败。";
+    } finally {
+      runButton.disabled = false;
+    }
+  });
+
+  function showRetrieved(cases) {
+    const grid = document.getElementById("refGrid");
+    grid.innerHTML = cases.map(c => `<div class="ref-card">
+      ${c.image_data_url ? `<img src="${c.image_data_url}" alt="${c.image_file}">` : ''}
+      <div class="meta">
+        <div class="title">${c.title || '-'}</div>
+        <div class="score">匹配分: ${(c.score||0).toFixed(1)}</div>
+        <div style="font-size:.8rem;color:var(--muted);margin-top:2px;">${(c.rectification||'').slice(0,80)}...</div>
+      </div>
+    </div>`).join("");
+  }
+
+  function showTimings(timings) {
+    const tbody = document.querySelector("#timingTable tbody");
+    tbody.innerHTML = "";
+    const maxMs = Math.max(...Object.values(timings), 1);
+    for (const [k, v] of Object.entries(timings)) {
+      const w = Math.max(2, Math.round(v / maxMs * 120));
+      tbody.innerHTML += `<tr><td>${k}</td><td>${v.toFixed(0)} ms <span style="display:inline-block;height:12px;width:${w}px;background:var(--muted);border-radius:3px;margin-left:6px;vertical-align:middle;"></span></td></tr>`;
+    }
+  }
+</script>
+</body>
+</html>

@@ -1,10 +1,14 @@
+"""化学实验 Pipeline Web：检测/标注后立刻显示结果，VLM 分析异步进行。"""
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
@@ -22,10 +26,23 @@ from pipeline.common.cv_wrapper import (
 )
 from pipeline.common.timing import StepTimer, TimingRecord
 from pipeline.common.vlm_client import PROVIDER_MODELS
-
+from pipeline.experiments import get_experiment_config
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+
+# 内存存储：session_id → detection 结果
+_detect_store: dict[str, dict] = {}
+_TTL_SECONDS = 3600
+EXPERIMENT_UI_CONFIG_PATH = Path(__file__).resolve().parent.parent / "experiment_ui_config.json"
+
+
+def _cleanup_store():
+    now = time.time()
+    expired = [k for k, v in _detect_store.items()
+               if now - v.get("_created", 0) > _TTL_SECONDS]
+    for k in expired:
+        _detect_store.pop(k, None)
 
 
 @app.get("/")
@@ -36,8 +53,13 @@ def index():
 @app.get("/api/references")
 def references():
     try:
-        refs = list_available_references()
-        return jsonify({"references": refs})
+        experiment_type = request.args.get("experiment_type", "distillation").strip() or "distillation"
+        cfg = get_experiment_config(experiment_type)
+        if cfg is None:
+            return jsonify({"error": f"未知实验类型: {experiment_type}"}), 400
+        if not getattr(cfg, "HAS_REFERENCE_DB", True):
+            return jsonify({"references": []})
+        return jsonify({"references": _list_experiment_references(cfg)})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -47,9 +69,106 @@ def models():
     return jsonify({"provider_models": PROVIDER_MODELS})
 
 
-@app.post("/api/run")
-def run_pipeline():
-    request_started_at = time.perf_counter()
+@app.get("/api/experiment-configs")
+def experiment_configs():
+    try:
+        configs = _load_experiment_ui_config()
+        enriched: dict[str, dict] = {}
+        for experiment_type, item in configs.items():
+            cfg = get_experiment_config(experiment_type)
+            refs = _list_experiment_references(cfg) if cfg is not None else []
+            ref_by_id = {str(ref.get("id", "")): ref for ref in refs}
+            ref = ref_by_id.get(str(item.get("reference_id", "")))
+            configured_file = str(item.get("annotated_image_path", "")).strip()
+            enriched[experiment_type] = {
+                **item,
+                "reference_name": Path(configured_file).name if configured_file else (ref.get("original_filename", "") if ref else ""),
+            }
+        return jsonify({"experiment_configs": enriched})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/config-reference-image")
+def config_reference_image():
+    try:
+        experiment_type = request.args.get("experiment_type", "distillation").strip() or "distillation"
+        cfg = get_experiment_config(experiment_type)
+        if cfg is None:
+            return jsonify({"error": f"未知实验类型: {experiment_type}"}), 400
+        component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
+        ui_config = _get_experiment_ui_config(experiment_type)
+        from pipeline.common.cv_wrapper import encode_annotated_image
+        if str(ui_config.get("correct_source", "")).strip() == "file":
+            image_path = _resolve_configured_image_path(ui_config)
+            annotated = decode_image(image_path.read_bytes())
+            return jsonify({"data_url": encode_annotated_image(annotated)})
+
+        reference_id = str(ui_config.get("reference_id", "")).strip()
+        if not reference_id:
+            return jsonify({"error": "未配置参考图。"}), 400
+
+        image = load_reference_image(reference_id)
+        result = build_reference_result(reference_id, component_labels)
+        annotated = cv_core.annotate_image(image, result)
+        return jsonify({"data_url": encode_annotated_image(annotated)})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/api/safety/check")
+def safety_check():
+    """实验室安全检查：上传图片 → 检索相似安全案例 → VLM 分析。"""
+    request_started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    try:
+        uploaded = request.files.get("image")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "请上传待检查图片。"}), 400
+
+        image_bytes = uploaded.read()
+        top_k = int(request.form.get("top_k", "1"))
+        provider = request.form.get("provider", "gemini").strip()
+        model = request.form.get("model", "").strip() or None
+
+        from pipeline.safety_check.retriever import retrieve
+        from pipeline.safety_check.vlm_check import analyze as analyze_safety
+
+        with StepTimer(timing := TimingRecord(), "检索"):
+            results = retrieve(image_bytes, top_k=top_k, include_images=False)
+        timings.update(timing.to_dict())
+
+        if not results:
+            timings["总计"] = round((time.perf_counter() - request_started) * 1000, 1)
+            return jsonify({
+                "analysis_text": "未发现明显安全问题。",
+                "timings": timings,
+            }), 200
+
+        with StepTimer(timing := TimingRecord(), "VLM分析"):
+            analysis_text, _ = analyze_safety(
+                image_bytes,
+                results,
+                provider=provider,
+                model=model,
+            )
+        timings.update(timing.to_dict())
+        timings["总计"] = round((time.perf_counter() - request_started) * 1000, 1)
+
+        return jsonify({
+            "analysis_text": analysis_text,
+            "timings": timings,
+        })
+
+    except Exception as exc:
+        return jsonify({"error": f"安全检查失败: {exc}"}), 500
+
+
+@app.post("/api/detect")
+def detect():
+    """Step 1: CV 检测，立即返回标注图，同时缓存结果供后续 VLM 调用。"""
+    _cleanup_store()
     timing = TimingRecord()
 
     try:
@@ -57,17 +176,30 @@ def run_pipeline():
         if uploaded is None or not uploaded.filename:
             return jsonify({"error": "缺少待纠错图片。"}), 400
 
-        with StepTimer(timing, "1_图片解码"):
+        with StepTimer(timing, "图片解码"):
             wrong_image = decode_image(uploaded.read())
 
-        experiment_requirements = request.form.get("experiment_requirements", "").strip()
-        if not experiment_requirements:
-            return jsonify({"error": "请填写实验要求。"}), 400
+        experiment_type = request.form.get("experiment_type", "distillation").strip() or "distillation"
+        cfg = get_experiment_config(experiment_type)
+        if cfg is None:
+            return jsonify({"error": f"未知实验类型: {experiment_type}"}), 400
 
-        provider = request.form.get("provider", "openrouter").strip()
-        model = request.form.get("model", "").strip() or None
-        approach = request.form.get("approach", "both").strip()
-        correct_source = request.form.get("correct_source", "database").strip()
+        component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
+        components = list(getattr(cfg, "COMPONENTS", []))
+        if not component_labels or not components:
+            return jsonify({"error": f"{experiment_type} 实验缺少组件配置。"}), 400
+
+        ui_config = _get_experiment_ui_config(experiment_type)
+        reference_id = request.form.get("reference_id", "").strip() or str(ui_config.get("reference_id", "")).strip()
+        experiment_requirements = (
+            request.form.get("experiment_requirements", "").strip()
+            or str(ui_config.get("experiment_requirements", "")).strip()
+        )
+        correct_source = (
+            request.form.get("correct_source", "").strip()
+            or str(ui_config.get("correct_source", "database")).strip()
+            or "database"
+        )
 
         cv_params = CVDetectionParams(
             max_side=int(request.form.get("max_side", "1600")),
@@ -78,75 +210,122 @@ def run_pipeline():
             top_k_per_label=int(request.form.get("top_k_per_label", "6")),
             overlap_weight=float(request.form.get("overlap_weight", "0.75")),
             feature=request.form.get("feature", "akaze").strip(),
+            component_labels=component_labels,
         )
 
         from pipeline.common.cv_wrapper import detect_wrong_image
 
-        with StepTimer(timing, "2_CV检测"):
+        with StepTimer(timing, "CV检测"):
             wrong_result = detect_wrong_image(wrong_image, cv_params)
 
-        # --- 正确参考图：两种来源 ---
-        if correct_source == "upload":
+        if correct_source == "file":
+            with StepTimer(timing, "加载正确标注图"):
+                image_path = _resolve_configured_image_path(ui_config)
+                correct_annotated = decode_image(image_path.read_bytes())
+            correct_result = _build_uploaded_result(components)
+        elif correct_source == "upload":
             uploaded_correct = request.files.get("correct_image")
             if uploaded_correct is None or not uploaded_correct.filename:
-                return jsonify({"error": "选择了上传正确图，但未上传文件。"}), 400
-
-            with StepTimer(timing, "3_解码正确图"):
+                return jsonify({"error": "选择了上传模式但未上传正确图。"}), 400
+            with StepTimer(timing, "解码正确图"):
                 correct_annotated = decode_image(uploaded_correct.read())
 
-            # 上传的已标注图：不做画框，直接用
-            # 构造一个空的 correct_result 让 label_summary 知道参考图"全部存在"
-            correct_result = _make_full_reference_result()
-            label_summary = _build_label_summary_from_results(correct_result, wrong_result)
-
+            correct_result = _build_uploaded_result(components)
         else:
-            reference_id = request.form.get("reference_id", "").strip()
-            refs = list_available_references()
+            refs = _list_experiment_references(cfg)
             if not reference_id and refs:
                 reference_id = refs[0]["id"]
             if not reference_id:
                 return jsonify({"error": "没有可用的参考图。"}), 400
 
-            with StepTimer(timing, "3_加载参考图"):
+            with StepTimer(timing, "加载参考图"):
                 correct_image = load_reference_image(reference_id)
-                correct_result = build_reference_result(reference_id)
+                correct_result = build_reference_result(reference_id, component_labels)
+                correct_annotated = cv_core.annotate_image(correct_image, correct_result)
 
-            # 需要画框
-            from pipeline.common.image_builder import build_annotated_pair
-            from pipeline.common.cv_wrapper import annotate_image
-
-            correct_annotated = annotate_image(correct_image, correct_result)
-            label_summary = _build_label_summary_from_results(correct_result, wrong_result)
-
-        # --- 构建标注图 ---
-        with StepTimer(timing, "4_构建标注图"):
-            from pipeline.common.image_builder import build_cv_structured_summary
+        with StepTimer(timing, "构建标注图"):
             from pipeline.common.cv_wrapper import annotate_image, encode_annotated_image
+            from pipeline.common.image_builder import build_cv_structured_summary
 
             wrong_annotated = annotate_image(wrong_image, wrong_result)
+
+            # label_summary
+            label_summary = _build_label_summary_from_results(correct_result, wrong_result, components)
+            cv_summary = build_cv_structured_summary(
+                label_summary,
+                correct_is_uploaded=(correct_source == "upload"),
+            )
+
             correct_data_url = encode_annotated_image(correct_annotated)
             wrong_data_url = encode_annotated_image(wrong_annotated)
 
-            cv_summary = build_cv_structured_summary(label_summary, correct_is_uploaded=(correct_source == "upload"))
-
-            import cv2
+            # 给 VLM 用的 JPEG
             _, c_jpg = cv2.imencode(".jpg", correct_annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             _, w_jpg = cv2.imencode(".jpg", wrong_annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            jpeg_pair = (c_jpg.tobytes(), w_jpg.tobytes())
 
-        result: dict = {
+        session_id = uuid.uuid4().hex[:12]
+        _detect_store[session_id] = {
+            "experiment_type": experiment_type,
+            "correct_source": correct_source,
             "label_summary": label_summary,
-            "correct_data_url": correct_data_url,
-            "wrong_data_url": wrong_data_url,
+            "cv_summary": cv_summary,
+            "jpeg_pair": (c_jpg.tobytes(), w_jpg.tobytes()),
+            "experiment_requirements": experiment_requirements,
+            "_created": time.time(),
         }
 
-        need_a = approach in ("a", "both")
-        need_b = approach in ("b", "both")
+        timing.record(
+            "总计",
+            timing.to_dict().get("CV检测", 0)
+            + timing.to_dict().get("加载正确标注图", 0)
+            + timing.to_dict().get("构建标注图", 0),
+        )
+        return jsonify({
+            "session_id": session_id,
+            "correct_data_url": correct_data_url,
+            "wrong_data_url": wrong_data_url,
+            "label_summary": label_summary,
+            "timings": timing.to_dict(),
+        })
+
+    except Exception as exc:
+        return jsonify({"error": f"检测失败: {exc}"}), 500
+
+
+@app.post("/api/analyze")
+def analyze():
+    """Step 2: VLM 分析。传入 session_id + approach + provider/model。"""
+    _cleanup_store()
+    timing = TimingRecord()
+
+    try:
+        session_id = request.form.get("session_id", "").strip()
+        approach = request.form.get("approach", "a").strip()
+        provider = request.form.get("provider", "openrouter").strip()
+        model = request.form.get("model", "").strip() or None
+
+        stored = _detect_store.get(session_id)
+        if stored is None:
+            return jsonify({"error": "会话已过期，请重新检测。"}), 400
+        cfg = get_experiment_config(stored.get("experiment_type", "distillation"))
+        if cfg is None:
+            return jsonify({"error": "实验配置已失效，请重新检测。"}), 400
+
+        jpeg_pair = stored["jpeg_pair"]
+        cv_summary = stored["cv_summary"]
+        label_summary = stored["label_summary"]
+        experiment_requirements = stored["experiment_requirements"]
+
+        result: dict = {}
+
+        # 当前生产路径只触发 Approach A。Approach B 的实现保留在代码里，
+        # 但不会被 Web 流程调用，避免两次 VLM 调用。
+        need_a = True
+        need_b = False
 
         if need_a:
             from pipeline.approach_a.pipeline_a import run_pipeline_a
-
-            with StepTimer(timing, "5A_VLM调用"):
+            with StepTimer(timing, "方案A_VLM"):
                 a_result = run_pipeline_a(
                     experiment_requirements=experiment_requirements,
                     vlm_provider=provider,
@@ -154,125 +333,127 @@ def run_pipeline():
                     label_summary=label_summary,
                     cv_summary=cv_summary,
                     prebuilt_jpeg=jpeg_pair,
+                    experiment_config=cfg,
                 )
-            result["approach_a"] = {
-                "analysis_text": a_result.analysis_text,
-            }
+            result["approach_a"] = {"analysis_text": a_result.analysis_text}
 
         if need_b:
-            with StepTimer(timing, "5B1_VLM找不同"):
+            with StepTimer(timing, "方案B_找不同"):
                 diff_text = _run_b_step1(
-                    vlm_provider=provider,
-                    vlm_model=model,
-                    cv_summary=cv_summary,
-                    prebuilt_jpeg=jpeg_pair,
+                    vlm_provider=provider, vlm_model=model,
+                    cv_summary=cv_summary, prebuilt_jpeg=jpeg_pair,
                 )
-
-            with StepTimer(timing, "5B2_VLM分析"):
+            with StepTimer(timing, "方案B_分析"):
                 analysis_text = _run_b_step2(
-                    diff_text=diff_text,
-                    cv_summary=cv_summary,
+                    diff_text=diff_text, cv_summary=cv_summary,
                     experiment_requirements=experiment_requirements,
-                    vlm_provider=provider,
-                    vlm_model=model,
+                    vlm_provider=provider, vlm_model=model,
                 )
+            result["approach_b"] = {"diff_text": diff_text, "analysis_text": analysis_text}
 
-            result["approach_b"] = {
-                "diff_text": diff_text,
-                "analysis_text": analysis_text,
-            }
-
-        timing.record("总计", (time.perf_counter() - request_started_at) * 1000)
         result["timings"] = timing.to_dict()
         return jsonify(result)
 
     except Exception as exc:
-        return jsonify({"error": f"Pipeline 失败: {exc}"}), 500
+        return jsonify({"error": f"分析失败: {exc}"}), 500
 
 
-def _make_full_reference_result() -> dict:
-    """上传已标注图时，假设所有 6 个装置在参考图中都存在（由人工标注保证）。"""
-    from pipeline.common.cv_wrapper import get_component_info
-    boxes = {}
-    detections = {}
-    for comp in get_component_info():
-        # 标记为"存在"但无具体 box 坐标（因为上传图已经画好框了）
-        boxes[comp["label"]] = [0, 0, 1, 1]  # sentinel: non-empty means "present"
-        detections[comp["label"]] = {"score": None}
-    return {"boxes": boxes, "detections": detections}
-
-
-def _build_label_summary_from_results(
-    correct_result: dict,
-    wrong_result: dict,
-) -> dict:
-    from pipeline.common.cv_wrapper import get_component_info
-
-    wrong_boxes = wrong_result.get("boxes", {})
-    wrong_detections = wrong_result.get("detections", {})
-    correct_boxes = correct_result.get("boxes", {})
-
-    label_summary: dict = {}
-    for comp in get_component_info():
-        label = comp["label"]
-        c_box = correct_boxes.get(label, [])
-        w_box = wrong_boxes.get(label, [])
-        label_summary[label] = {
-            "name": comp["name"],
-            "color": comp["color"],
-            "in_correct": bool(c_box),
-            "in_wrong": bool(w_box),
-            "correct_box": c_box if c_box != [0, 0, 1, 1] else [],
-            "wrong_box": w_box,
-            "wrong_score": wrong_detections.get(label, {}).get("score"),
-            "wrong_raw_score": wrong_detections.get(label, {}).get("raw_score"),
-            "wrong_failure_reason": wrong_detections.get(label, {}).get("failure_reason"),
-        }
-    return label_summary
-
-
-def _run_b_step1(
-    *,
-    vlm_provider: str,
-    vlm_model: str | None,
-    cv_summary: str,
-    prebuilt_jpeg: tuple[bytes, bytes],
-) -> str:
+def _run_b_step1(*, vlm_provider, vlm_model, cv_summary, prebuilt_jpeg):
     from pipeline.approach_b.pipeline_b import build_diff_messages
     from pipeline.common.vlm_client import call_vlm, create_vlm
-
     client = create_vlm(vlm_provider, vlm_model)
-    correct_jpeg_bytes, wrong_jpeg_bytes = prebuilt_jpeg
-    messages = build_diff_messages(correct_jpeg_bytes, wrong_jpeg_bytes, cv_summary, client)
+    messages = build_diff_messages(prebuilt_jpeg[0], prebuilt_jpeg[1], cv_summary, client)
     result, _ = call_vlm(client, messages)
     return result
 
 
-def _run_b_step2(
-    *,
-    diff_text: str,
-    cv_summary: str,
-    experiment_requirements: str,
-    vlm_provider: str,
-    vlm_model: str | None,
-) -> str:
+def _run_b_step2(*, diff_text, cv_summary, experiment_requirements, vlm_provider, vlm_model):
     from pipeline.approach_b.pipeline_b import build_analysis_messages
     from pipeline.common.vlm_client import call_vlm, create_vlm
-
     client = create_vlm(vlm_provider, vlm_model)
     messages = build_analysis_messages(diff_text, cv_summary, experiment_requirements)
     result, _ = call_vlm(client, messages)
     return result
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Chemistry Pipeline Web")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=5080)
-    parser.add_argument("--debug", action="store_true")
-    return parser.parse_args()
+def _build_uploaded_result(components):
+    return {
+        "boxes": {c["label"]: [0, 0, 1, 1] for c in components},
+        "detections": {c["label"]: {"score": None} for c in components},
+    }
 
+
+def _load_experiment_ui_config() -> dict[str, dict]:
+    if not EXPERIMENT_UI_CONFIG_PATH.exists():
+        return {}
+    data = json.loads(EXPERIMENT_UI_CONFIG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _get_experiment_ui_config(experiment_type: str) -> dict:
+    return _load_experiment_ui_config().get(experiment_type, {})
+
+
+def _resolve_configured_image_path(ui_config: dict) -> Path:
+    raw_path = str(ui_config.get("annotated_image_path", "")).strip()
+    if not raw_path:
+        raise FileNotFoundError("未配置 annotated_image_path。")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = (EXPERIMENT_UI_CONFIG_PATH.parent / path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"配置参考图不存在: {path}")
+    return path
+
+
+def _list_experiment_references(cfg):
+    refs = list_available_references(getattr(cfg, "COMPONENT_LABELS", None))
+    if getattr(cfg, "REQUIRE_REFERENCE_LABELS", False):
+        refs = [ref for ref in refs if ref.get("annotated_labels")]
+    return refs
+
+
+def _build_label_summary_from_results(correct_result, wrong_result, components):
+    from pipeline.common.cv_wrapper import get_component_info
+    wrong_boxes = wrong_result.get("boxes", {})
+    wrong_detections = wrong_result.get("detections", {})
+    correct_boxes = correct_result.get("boxes", {})
+    result = {}
+    for comp in get_component_info(components):
+        label = comp["label"]
+        c_box = correct_boxes.get(label, [])
+        w_box = wrong_boxes.get(label, [])
+        sentinel = [0, 0, 1, 1]
+        result[label] = {
+            "name": comp["name"], "color": comp["color"],
+            "in_correct": bool(c_box),
+            "in_wrong": bool(w_box),
+            "correct_box": c_box if c_box != sentinel else [],
+            "wrong_box": w_box,
+            "wrong_score": wrong_detections.get(label, {}).get("score"),
+            "wrong_raw_score": wrong_detections.get(label, {}).get("raw_score"),
+            "wrong_failure_reason": wrong_detections.get(label, {}).get("failure_reason"),
+        }
+    return result
+
+
+# 延迟导入，避免循环
+import pipeline.common.cv_wrapper as cv_core
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Distillation Pipeline Web")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=5080)
+    p.add_argument("--debug", action="store_true")
+    return p.parse_args()
 
 if __name__ == "__main__":
+    try:
+        from pipeline.safety_check.retriever import reload_db
+        reload_db()
+    except Exception as exc:
+        print(f"[safety_check] warmup skipped: {exc}")
     args = parse_args()
     app.run(host=args.host, port=args.port, debug=args.debug)
