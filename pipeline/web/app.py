@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
 import time
 import uuid
 from pathlib import Path
+from threading import Lock
+from typing import Any
 
 import cv2
 import numpy as np
@@ -34,6 +37,20 @@ app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 # 内存存储：session_id → detection 结果
 _detect_store: dict[str, dict] = {}
 _TTL_SECONDS = 3600
+_GLASSES_JOB_TTL_SECONDS = 30 * 60
+_GLASSES_DEFAULT_PROVIDER = "gemini"
+_GLASSES_DEFAULT_MODEL = "gemini-3-flash-preview"
+_GLASSES_JOB_WORKERS = 2
+_GLASSES_EXPERIMENTS = {
+    "distillation": "减压蒸馏",
+    "photometer": "光度计",
+}
+_glasses_executor = ThreadPoolExecutor(
+    max_workers=_GLASSES_JOB_WORKERS,
+    thread_name_prefix="glasses-job",
+)
+_glasses_jobs: dict[str, dict[str, Any]] = {}
+_glasses_lock = Lock()
 EXPERIMENT_UI_CONFIG_PATH = Path(__file__).resolve().parent.parent / "experiment_ui_config.json"
 
 
@@ -67,6 +84,75 @@ def references():
 @app.get("/api/models")
 def models():
     return jsonify({"provider_models": PROVIDER_MODELS})
+
+
+@app.get("/api/glasses/health")
+def glasses_health():
+    return jsonify({
+        "status": "ok",
+        "default_provider": _GLASSES_DEFAULT_PROVIDER,
+        "default_model": _GLASSES_DEFAULT_MODEL,
+        "modes": ["experiment", "safety"],
+        "experiments": [
+            {"value": key, "label": label}
+            for key, label in _GLASSES_EXPERIMENTS.items()
+        ],
+    })
+
+
+@app.post("/api/glasses/jobs")
+def create_glasses_job():
+    _cleanup_glasses_jobs()
+    try:
+        uploaded = request.files.get("image")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Missing image file."}), 400
+
+        mode = request.form.get("mode", "experiment").strip() or "experiment"
+        if mode not in {"experiment", "safety"}:
+            return jsonify({"error": "mode must be experiment or safety."}), 400
+
+        experiment_type = request.form.get("experiment_type", "distillation").strip() or "distillation"
+        if mode == "experiment" and get_experiment_config(experiment_type) is None:
+            return jsonify({"error": f"Unknown experiment_type: {experiment_type}"}), 400
+
+        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
+        model = request.form.get("model", _GLASSES_DEFAULT_MODEL).strip() or _GLASSES_DEFAULT_MODEL
+        image_bytes = uploaded.read()
+        if not image_bytes:
+            return jsonify({"error": "Uploaded image is empty."}), 400
+
+        job_id = _submit_glasses_job(
+            image_bytes=image_bytes,
+            mode=mode,
+            experiment_type=experiment_type,
+            provider=provider,
+            model=model,
+        )
+        return jsonify({
+            "job_id": job_id,
+            "status": "queued",
+            "poll_url": f"/api/glasses/jobs/{job_id}",
+        }), 202
+    except Exception as exc:
+        return jsonify({"error": f"Failed to create job: {exc}"}), 500
+
+
+@app.get("/api/glasses/jobs/<job_id>")
+def get_glasses_job(job_id: str):
+    _cleanup_glasses_jobs()
+    job = _snapshot_glasses_job(job_id)
+    if job is None:
+        return jsonify({
+            "job_id": job_id,
+            "status": "expired",
+            "stage": "done",
+            "message": "Job not found or expired.",
+            "preview_data_url": None,
+            "result": None,
+            "error": "Job not found or expired.",
+        }), 404
+    return jsonify(job)
 
 
 @app.get("/api/experiment-configs")
@@ -358,6 +444,282 @@ def analyze():
         return jsonify({"error": f"分析失败: {exc}"}), 500
 
 
+def _cleanup_glasses_jobs():
+    cutoff = time.time() - (_GLASSES_JOB_TTL_SECONDS * 2)
+    with _glasses_lock:
+        expired = [
+            job_id for job_id, job in _glasses_jobs.items()
+            if job.get("created_at", 0) < cutoff
+        ]
+        for job_id in expired:
+            _glasses_jobs.pop(job_id, None)
+
+
+def _submit_glasses_job(
+    *,
+    image_bytes: bytes,
+    mode: str,
+    experiment_type: str,
+    provider: str,
+    model: str,
+) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    now = time.time()
+    with _glasses_lock:
+        _glasses_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "upload",
+            "message": "Job queued.",
+            "preview_data_url": None,
+            "result": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    _glasses_executor.submit(
+        _run_glasses_job,
+        job_id,
+        image_bytes,
+        mode,
+        experiment_type,
+        provider,
+        model,
+    )
+    return job_id
+
+
+def _update_glasses_job(job_id: str, **updates: Any) -> None:
+    updates["updated_at"] = time.time()
+    with _glasses_lock:
+        job = _glasses_jobs.get(job_id)
+        if job is not None:
+            job.update(updates)
+
+
+def _snapshot_glasses_job(job_id: str) -> dict[str, Any] | None:
+    with _glasses_lock:
+        job = _glasses_jobs.get(job_id)
+        if job is None:
+            return None
+        snapshot = dict(job)
+
+    if time.time() - snapshot.get("created_at", 0) > _GLASSES_JOB_TTL_SECONDS:
+        snapshot.update({
+            "status": "expired",
+            "stage": "done",
+            "message": "Job expired.",
+            "preview_data_url": None,
+            "result": None,
+            "error": "Job expired.",
+        })
+
+    return {
+        "job_id": snapshot.get("job_id", job_id),
+        "status": snapshot.get("status", "expired"),
+        "stage": snapshot.get("stage", "done"),
+        "message": snapshot.get("message", ""),
+        "preview_data_url": snapshot.get("preview_data_url"),
+        "result": snapshot.get("result"),
+        "error": snapshot.get("error"),
+    }
+
+
+def _run_glasses_job(
+    job_id: str,
+    image_bytes: bytes,
+    mode: str,
+    experiment_type: str,
+    provider: str,
+    model: str,
+) -> None:
+    _update_glasses_job(job_id, status="running", stage="upload", message="Image accepted.")
+    try:
+        if mode == "safety":
+            result = _run_glasses_safety_job(
+                job_id=job_id,
+                image_bytes=image_bytes,
+                provider=provider,
+                model=model,
+            )
+        else:
+            result = _run_glasses_experiment_job(
+                job_id=job_id,
+                image_bytes=image_bytes,
+                experiment_type=experiment_type,
+                provider=provider,
+                model=model,
+            )
+        _update_glasses_job(
+            job_id,
+            status="succeeded",
+            stage="done",
+            message="Done.",
+            result=result,
+            error=None,
+        )
+    except Exception as exc:
+        _update_glasses_job(
+            job_id,
+            status="failed",
+            stage="done",
+            message="Failed.",
+            result=None,
+            error=str(exc),
+        )
+
+
+def _run_glasses_safety_job(
+    *,
+    job_id: str,
+    image_bytes: bytes,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+    from pipeline.safety_check.retriever import retrieve
+    from pipeline.safety_check.vlm_check import analyze as analyze_safety
+
+    _update_glasses_job(job_id, stage="retrieval", message="Retrieving safety cases.")
+    with StepTimer(timing := TimingRecord(), "retrieval"):
+        results = retrieve(image_bytes, top_k=1, include_images=False)
+    timings.update(timing.to_dict())
+
+    if not results:
+        timings["total"] = round((time.perf_counter() - started) * 1000, 1)
+        return {
+            "analysis_text": "未发现明显安全问题。",
+            "mode": "safety",
+            "experiment_type": None,
+            "timings": timings,
+        }
+
+    _update_glasses_job(job_id, stage="vlm", message="Analyzing safety image.")
+    with StepTimer(timing := TimingRecord(), "vlm"):
+        analysis_text, _ = analyze_safety(
+            image_bytes,
+            results,
+            provider=provider,
+            model=model,
+        )
+    timings.update(timing.to_dict())
+    timings["total"] = round((time.perf_counter() - started) * 1000, 1)
+
+    return {
+        "analysis_text": analysis_text,
+        "mode": "safety",
+        "experiment_type": None,
+        "timings": timings,
+    }
+
+
+def _run_glasses_experiment_job(
+    *,
+    job_id: str,
+    image_bytes: bytes,
+    experiment_type: str,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    timing = TimingRecord()
+
+    cfg = get_experiment_config(experiment_type)
+    if cfg is None:
+        raise ValueError(f"Unknown experiment_type: {experiment_type}")
+
+    component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
+    components = list(getattr(cfg, "COMPONENTS", []))
+    if not component_labels or not components:
+        raise ValueError(f"{experiment_type} is missing component config.")
+
+    ui_config = _get_experiment_ui_config(experiment_type)
+    reference_id = str(ui_config.get("reference_id", "")).strip()
+    experiment_requirements = str(ui_config.get("experiment_requirements", "")).strip()
+    correct_source = str(ui_config.get("correct_source", "database")).strip() or "database"
+
+    _update_glasses_job(job_id, stage="cv_detection", message="Running CV detection.")
+    with StepTimer(timing, "decode"):
+        wrong_image = decode_image(image_bytes)
+
+    cv_params = CVDetectionParams(
+        max_side=1600,
+        lowe_ratio=0.75,
+        min_good_matches=3,
+        min_inliers=2,
+        min_inlier_ratio=0.08,
+        top_k_per_label=6,
+        overlap_weight=0.75,
+        feature="akaze",
+        component_labels=component_labels,
+    )
+
+    from pipeline.common.cv_wrapper import detect_wrong_image
+
+    with StepTimer(timing, "cv_detection"):
+        wrong_result = detect_wrong_image(wrong_image, cv_params)
+
+    if correct_source == "file":
+        with StepTimer(timing, "load_reference"):
+            image_path = _resolve_configured_image_path(ui_config)
+            correct_annotated = decode_image(image_path.read_bytes())
+        correct_result = _build_uploaded_result(components)
+    elif correct_source == "upload":
+        raise ValueError("Glasses jobs do not support correct_source=upload.")
+    else:
+        refs = _list_experiment_references(cfg)
+        if not reference_id and refs:
+            reference_id = refs[0]["id"]
+        if not reference_id:
+            raise ValueError("No configured reference image is available.")
+        with StepTimer(timing, "load_reference"):
+            correct_image = load_reference_image(reference_id)
+            correct_result = build_reference_result(reference_id, component_labels)
+            correct_annotated = cv_core.annotate_image(correct_image, correct_result)
+
+    with StepTimer(timing, "build_vlm_images"):
+        from pipeline.common.cv_wrapper import annotate_image, encode_annotated_image
+        from pipeline.common.image_builder import build_cv_structured_summary
+
+        wrong_annotated = annotate_image(wrong_image, wrong_result)
+        preview_data_url = encode_annotated_image(wrong_annotated)
+        label_summary = _build_label_summary_from_results(correct_result, wrong_result, components)
+        cv_summary = build_cv_structured_summary(
+            label_summary,
+            correct_is_uploaded=(correct_source == "upload"),
+        )
+        _, c_jpg = cv2.imencode(".jpg", correct_annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        _, w_jpg = cv2.imencode(".jpg", wrong_annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+
+    _update_glasses_job(
+        job_id,
+        stage="vlm",
+        message="Analyzing experiment image.",
+        preview_data_url=preview_data_url,
+    )
+    from pipeline.approach_a.pipeline_a import run_pipeline_a
+    with StepTimer(timing, "vlm"):
+        a_result = run_pipeline_a(
+            experiment_requirements=experiment_requirements,
+            vlm_provider=provider,
+            vlm_model=model,
+            label_summary=label_summary,
+            cv_summary=cv_summary,
+            prebuilt_jpeg=(c_jpg.tobytes(), w_jpg.tobytes()),
+            experiment_config=cfg,
+        )
+
+    timings = timing.to_dict()
+    timings["total"] = round((time.perf_counter() - started) * 1000, 1)
+    return {
+        "analysis_text": a_result.analysis_text,
+        "mode": "experiment",
+        "experiment_type": experiment_type,
+        "timings": timings,
+    }
+
+
 def _run_b_step1(*, vlm_provider, vlm_model, cv_summary, prebuilt_jpeg):
     from pipeline.approach_b.pipeline_b import build_diff_messages
     from pipeline.common.vlm_client import call_vlm, create_vlm
@@ -444,7 +806,7 @@ import pipeline.common.cv_wrapper as cv_core
 
 def parse_args():
     p = argparse.ArgumentParser(description="Distillation Pipeline Web")
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=5080)
     p.add_argument("--debug", action="store_true")
     return p.parse_args()

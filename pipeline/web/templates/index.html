@@ -25,77 +25,112 @@
       </label>
     </section>
 
-    <form id="mainForm" data-module="experiment">
-      <!-- 实验选择 -->
-      <section class="panel" style="padding:14px; margin-bottom:14px;">
-        <label style="font-weight:700; display:flex; align-items:center; gap:10px;">
-          实验类型：
-          <select name="experiment_type" id="experimentType" style="width:200px;font:inherit;border:1px solid var(--line);border-radius:6px;padding:7px 10px;">
-            <option value="distillation" selected>减压蒸馏实验</option>
-            <option value="photometer">光度计实验</option>
-            <option value="electrolysis">电解实验</option>
-          </select>
-        </label>
+    <section id="experimentModule">
+      <form id="mainForm" data-module="experiment">
+        <!-- 实验选择 -->
+        <section class="panel" style="padding:14px; margin-bottom:14px;">
+          <label style="font-weight:700; display:flex; align-items:center; gap:10px;">
+            实验类型：
+            <select name="experiment_type" id="experimentType" style="width:200px;font:inherit;border:1px solid var(--line);border-radius:6px;padding:7px 10px;">
+              <option value="distillation" selected>减压蒸馏实验</option>
+              <option value="photometer">光度计实验</option>
+              <option value="electrolysis">电解实验</option>
+            </select>
+          </label>
+        </section>
+
+        <!-- ====== 实验输入 ====== -->
+        <div id="distillationBlock">
+          <section class="upload-grid">
+            <div class="upload-card panel">
+              <label id="wrongInputLabel">待纠错图片（学生图）</label>
+              <input type="file" name="wrong_image" accept="image/*" id="wrongInput">
+              <img id="wrongPreview" class="upload-preview" hidden alt="学生图预览">
+            </div>
+            <div class="upload-card panel">
+              <label>正确参考图</label>
+              <div class="readonly-box" id="referenceDisplay">读取配置中...</div>
+              <img id="configuredReferencePreview" class="upload-preview" hidden alt="配置参考图预览">
+              <input type="hidden" name="correct_source" id="correctSourceInput" value="database">
+              <input type="hidden" name="reference_id" id="referenceIdInput">
+            </div>
+          </section>
+
+          <section class="panel" style="padding:14px; margin-bottom:14px;">
+            <label style="display:block;font-weight:700;margin-bottom:6px;">实验要求</label>
+            <div class="readonly-box" id="requirementsDisplay">读取配置中...</div>
+            <input type="hidden" name="experiment_requirements" id="requirementsInput">
+          </section>
+
+          <details class="config-panel panel" style="margin-bottom:14px;">
+            <summary style="font-weight:700;color:var(--accent-dark);cursor:pointer;">CV / VLM 参数</summary>
+            <div class="config-grid" style="margin-top:10px;">
+              <label>特征 <select name="feature"><option value="akaze" selected>AKAZE</option><option value="sift">SIFT</option></select></label>
+              <label>Provider <select name="provider" id="providerSelect"><option value="gemini" selected>Gemini</option><option value="openrouter">OpenRouter</option><option value="ali">阿里云</option></select></label>
+              <label>模型 <select name="model" id="modelSelect"><option value="">默认</option></select></label>
+              <input type="hidden" name="approach" value="a">
+              <label>max_side <input type="number" name="max_side" value="1600" min="600" max="2600" step="100"></label>
+              <label>lowe_ratio <input type="number" name="lowe_ratio" value="0.75" min="0.5" max="0.95" step="0.05"></label>
+              <label>min_good <input type="number" name="min_good_matches" value="3" min="1" max="20"></label>
+              <label>min_inliers <input type="number" name="min_inliers" value="2" min="1" max="20"></label>
+              <label>inlier_ratio <input type="number" name="min_inlier_ratio" value="0.08" min="0.01" max="0.5" step="0.01"></label>
+              <label>top_k <input type="number" name="top_k_per_label" value="6" min="1" max="20"></label>
+              <label>overlap_w <input type="number" name="overlap_weight" value="0.75" min="0" max="2" step="0.05"></label>
+            </div>
+          </details>
+        </div>
+
+        <!-- ====== 占位实验 ====== -->
+        <div id="placeholderBlock" hidden>
+          <section class="panel placeholder" style="margin-bottom:14px;">
+            <div style="text-align:center;padding:60px 20px;">
+              <h2 id="placeholderTitle">该实验模块尚未实现</h2>
+              <p class="subtle" id="placeholderDesc">请选择"减压蒸馏实验"进行演示。</p>
+            </div>
+          </section>
+        </div>
+
+        <div class="action-bar">
+          <button type="submit" id="runButton">开始检测</button>
+          <span id="status" class="status"></span>
+        </div>
+      </form>
+
+      <!-- 检测结果（立刻显示） -->
+      <section class="results-grid" id="detectArea" data-module="experiment" hidden>
+        <section class="images-panel panel">
+          <h2>检测/标注结果</h2>
+          <div class="image-pair">
+            <figure><figcaption>参考图（正确）</figcaption><img id="correctImage" alt="参考图标注"></figure>
+            <figure><figcaption>待纠错图</figcaption><img id="wrongImage" alt="待纠错图标注"></figure>
+          </div>
+        </section>
+        <aside class="side">
+          <section class="card panel"><h2>检测耗时</h2><table class="timing-table" id="detectTiming"><tbody></tbody></table></section>
+          <section class="card panel"><h2>目标检测</h2><table class="timing-table" id="detectionTable"><tbody></tbody></table></section>
+        </aside>
       </section>
 
-      <!-- ====== 实验输入 ====== -->
-      <div id="distillationBlock">
-        <section class="upload-grid">
-          <div class="upload-card panel">
-            <label id="wrongInputLabel">待纠错图片（学生图）</label>
-            <input type="file" name="wrong_image" accept="image/*" id="wrongInput">
-            <img id="wrongPreview" class="upload-preview" hidden alt="学生图预览">
-          </div>
-          <div class="upload-card panel">
-            <label>正确参考图</label>
-            <div class="readonly-box" id="referenceDisplay">读取配置中...</div>
-            <img id="configuredReferencePreview" class="upload-preview" hidden alt="配置参考图预览">
-            <input type="hidden" name="correct_source" id="correctSourceInput" value="database">
-            <input type="hidden" name="reference_id" id="referenceIdInput">
-          </div>
-        </section>
+      <!-- VLM 分析结果（异步显示） -->
+      <section id="analyzeArea" data-module="experiment" hidden style="margin-top:14px;">
+        <div class="action-bar"><span id="analyzeStatus" class="status">正在 VLM 分析...</span></div>
+        <div class="approach-tabs">
+          <button type="button" class="approach-tab active" data-tab="tabA">方案A 一步到位</button>
+          <button type="button" class="approach-tab" data-tab="tabB" hidden>方案B 两步式</button>
+        </div>
+        <div id="tabA" class="approach-content active panel" style="padding:14px;">
+          <h2>方案A 分析结果</h2><div class="result-text" id="resultA"></div>
+        </div>
+        <div id="tabB" class="approach-content panel" style="padding:14px;">
+          <div class="diff-section"><h3>Step 1: 逐色框找不同</h3><div class="result-text" id="resultBDiff"></div></div>
+          <div class="diff-section"><h3>Step 2: 结合实验要求分析</h3><div class="result-text" id="resultBAnalysis"></div></div>
+        </div>
+        <section class="card panel" style="margin-top:10px;"><h2>VLM 耗时</h2><table class="timing-table" id="analyzeTiming"><tbody></tbody></table></section>
+      </section>
+    </section>
 
-        <section class="panel" style="padding:14px; margin-bottom:14px;">
-          <label style="display:block;font-weight:700;margin-bottom:6px;">实验要求</label>
-          <div class="readonly-box" id="requirementsDisplay">读取配置中...</div>
-          <input type="hidden" name="experiment_requirements" id="requirementsInput">
-        </section>
-
-        <details class="config-panel panel" style="margin-bottom:14px;">
-          <summary style="font-weight:700;color:var(--accent-dark);cursor:pointer;">CV / VLM 参数</summary>
-          <div class="config-grid" style="margin-top:10px;">
-            <label>特征 <select name="feature"><option value="akaze" selected>AKAZE</option><option value="sift">SIFT</option></select></label>
-            <label>Provider <select name="provider" id="providerSelect"><option value="gemini" selected>Gemini</option><option value="openrouter">OpenRouter</option><option value="ali">阿里云</option></select></label>
-            <label>模型 <select name="model" id="modelSelect"><option value="">默认</option></select></label>
-            <input type="hidden" name="approach" value="a">
-            <label>max_side <input type="number" name="max_side" value="1600" min="600" max="2600" step="100"></label>
-            <label>lowe_ratio <input type="number" name="lowe_ratio" value="0.75" min="0.5" max="0.95" step="0.05"></label>
-            <label>min_good <input type="number" name="min_good_matches" value="3" min="1" max="20"></label>
-            <label>min_inliers <input type="number" name="min_inliers" value="2" min="1" max="20"></label>
-            <label>inlier_ratio <input type="number" name="min_inlier_ratio" value="0.08" min="0.01" max="0.5" step="0.01"></label>
-            <label>top_k <input type="number" name="top_k_per_label" value="6" min="1" max="20"></label>
-            <label>overlap_w <input type="number" name="overlap_weight" value="0.75" min="0" max="2" step="0.05"></label>
-          </div>
-        </details>
-      </div>
-
-      <!-- ====== 占位实验 ====== -->
-      <div id="placeholderBlock" hidden>
-        <section class="panel placeholder" style="margin-bottom:14px;">
-          <div style="text-align:center;padding:60px 20px;">
-            <h2 id="placeholderTitle">该实验模块尚未实现</h2>
-            <p class="subtle" id="placeholderDesc">请选择"减压蒸馏实验"进行演示。</p>
-          </div>
-        </section>
-      </div>
-
-      <div class="action-bar">
-        <button type="submit" id="runButton">开始检测</button>
-        <span id="status" class="status"></span>
-      </div>
-    </form>
-
-    <form id="safetyForm" data-module="safety" hidden>
+    <section id="safetyModule" hidden>
+    <form id="safetyForm" data-module="safety">
       <section class="upload-grid">
         <div class="upload-card panel">
           <label>待检查图片</label>
@@ -118,38 +153,6 @@
       </div>
     </form>
 
-    <!-- 检测结果（立刻显示） -->
-    <section class="results-grid" id="detectArea" hidden>
-      <section class="images-panel panel">
-        <h2>检测/标注结果</h2>
-        <div class="image-pair">
-          <figure><figcaption>参考图（正确）</figcaption><img id="correctImage" alt="参考图标注"></figure>
-          <figure><figcaption>待纠错图</figcaption><img id="wrongImage" alt="待纠错图标注"></figure>
-        </div>
-      </section>
-      <aside class="side">
-        <section class="card panel"><h2>检测耗时</h2><table class="timing-table" id="detectTiming"><tbody></tbody></table></section>
-        <section class="card panel"><h2>目标检测</h2><table class="timing-table" id="detectionTable"><tbody></tbody></table></section>
-      </aside>
-    </section>
-
-    <!-- VLM 分析结果（异步显示） -->
-    <section id="analyzeArea" hidden style="margin-top:14px;">
-      <div class="action-bar"><span id="analyzeStatus" class="status">正在 VLM 分析...</span></div>
-      <div class="approach-tabs">
-        <button type="button" class="approach-tab active" data-tab="tabA">方案A 一步到位</button>
-        <button type="button" class="approach-tab" data-tab="tabB" hidden>方案B 两步式</button>
-      </div>
-      <div id="tabA" class="approach-content active panel" style="padding:14px;">
-        <h2>方案A 分析结果</h2><div class="result-text" id="resultA"></div>
-      </div>
-      <div id="tabB" class="approach-content panel" style="padding:14px;">
-        <div class="diff-section"><h3>Step 1: 逐色框找不同</h3><div class="result-text" id="resultBDiff"></div></div>
-        <div class="diff-section"><h3>Step 2: 结合实验要求分析</h3><div class="result-text" id="resultBAnalysis"></div></div>
-      </div>
-      <section class="card panel" style="margin-top:10px;"><h2>VLM 耗时</h2><table class="timing-table" id="analyzeTiming"><tbody></tbody></table></section>
-    </section>
-
     <section class="results-grid" id="safetyResultsArea" hidden>
       <section class="card panel">
         <h2>安全检查结果</h2>
@@ -159,10 +162,13 @@
         <section class="card panel"><h2>耗时</h2><table class="timing-table" id="safetyTiming"><tbody></tbody></table></section>
       </aside>
     </section>
+    </section>
   </main>
 
   <script>
     const moduleType = document.getElementById("moduleType");
+    const experimentModule = document.getElementById("experimentModule");
+    const safetyModule = document.getElementById("safetyModule");
     const safetyForm = document.getElementById("safetyForm");
     const safetyResultsArea = document.getElementById("safetyResultsArea");
 
@@ -249,8 +255,8 @@
 
     function applyModuleMode() {
       const isSafety = moduleType.value === "safety";
-      mainForm.hidden = isSafety;
-      safetyForm.hidden = !isSafety;
+      experimentModule.hidden = isSafety;
+      safetyModule.hidden = !isSafety;
       detectArea.hidden = true;
       analyzeArea.hidden = true;
       safetyResultsArea.hidden = true;
@@ -424,6 +430,8 @@
       e.preventDefault();
       safetyStatus.textContent = "正在检查...";
       safetyRunButton.disabled = true;
+      detectArea.hidden = true;
+      analyzeArea.hidden = true;
       safetyResultsArea.hidden = true;
 
       try {

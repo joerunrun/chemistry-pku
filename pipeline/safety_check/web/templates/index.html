@@ -41,18 +41,14 @@
 
   <section class="results-grid" id="resultsArea" hidden>
     <section class="card panel">
-      <h2>最相似参考案例（Top-K）</h2>
-      <div class="ref-grid" id="refGrid"></div>
+      <h2>VLM 分析结果</h2>
+      <div class="result-text" id="resultText">等待...</div>
     </section>
 
     <aside style="display:grid;gap:14px;">
       <section class="card panel">
         <h2>耗时</h2>
         <table class="timing-table" id="timingTable"><tbody></tbody></table>
-      </section>
-      <section class="card panel">
-        <h2>VLM 分析结果</h2>
-        <div class="result-text" id="resultText">等待...</div>
       </section>
     </aside>
   </section>
@@ -112,13 +108,10 @@
 
       if (!resp.ok) {
         let msg = data.error || "未知错误";
-        // 如果有部分结果仍然展示
-        if (data.retrieved) showRetrieved(data.retrieved);
         if (data.timings) showTimings(data.timings);
         throw new Error(msg);
       }
 
-      showRetrieved(data.ref_cases || []);
       document.getElementById("resultText").textContent = data.analysis_text || "无分析结果";
       showTimings(data.timings || {});
       resultsArea.hidden = false;
@@ -131,18 +124,6 @@
       runButton.disabled = false;
     }
   });
-
-  function showRetrieved(cases) {
-    const grid = document.getElementById("refGrid");
-    grid.innerHTML = cases.map(c => `<div class="ref-card">
-      ${c.image_data_url ? `<img src="${c.image_data_url}" alt="${c.image_file}">` : ''}
-      <div class="meta">
-        <div class="title">${c.title || '-'}</div>
-        <div class="score">匹配分: ${(c.score||0).toFixed(1)}</div>
-        <div style="font-size:.8rem;color:var(--muted);margin-top:2px;">${(c.rectification||'').slice(0,80)}...</div>
-      </div>
-    </div>`).join("");
-  }
 
   function showTimings(timings) {
     const tbody = document.querySelector("#timingTable tbody");

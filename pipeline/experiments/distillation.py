@@ -30,7 +30,7 @@ COLOR_LEGEND = """色框对应关系：
 - 绿色框: 蒸馏核心 (distillation_core)
 - 蓝色框: 冷凝管 (condenser_unit)
 - 橙色框: 接收装置 (receiving_assembly)
-- 紫色框: 真空表 (vacuum_gauge)"""
+"""
 
 APPROACH_A_PROMPT = """请对比图A和图B，判断图B中最主要的减压蒸馏装置错误。
 
