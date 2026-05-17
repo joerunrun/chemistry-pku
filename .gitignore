@@ -1,0 +1,48 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Kotlin / IDE cache
+.kotlin/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+.idea/deploymentTargetSelector.xml
+
+# Android outputs
+*.apk
+*.aab
+*.ap_
+output-metadata.json
+
+# Signing / secrets
+*.jks
+*.keystore
+keystore.properties
+secrets.properties
+*.env
+.env
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Local recordings / pulled device files
+glasses_recordings/
+recordings/
+ChemRecordings/
+*.mp4
+*.mov

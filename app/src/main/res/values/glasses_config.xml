@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Use "usb" for adb reverse, or "network" for Wi-Fi/LAN testing. -->
+    <string name="glasses_connection_mode">usb</string>
+    <string name="glasses_service_base_url_usb">http://127.0.0.1:5080</string>
+    <string name="glasses_service_base_url_network">http://127.0.0.1:5080</string>
+</resources>
