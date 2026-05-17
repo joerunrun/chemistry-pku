@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -20,14 +21,16 @@ METADATA_JSON = DATA_DIR / "metadata.json"
 
 MAX_SIDE = 1000
 MIN_MATCHES = 4
+MAX_QUERY_DESCRIPTORS = max(200, int(os.environ.get("CHEM_SAFETY_MAX_QUERY_DESCRIPTORS", "1000")))
+MAX_DB_DESCRIPTORS_PER_SAMPLE = max(200, int(os.environ.get("CHEM_SAFETY_MAX_DB_DESCRIPTORS_PER_SAMPLE", "1000")))
 AKAZE = cv2.AKAZE_create()
 BF = cv2.BFMatcher(cv2.NORM_HAMMING)
 
 # 模块级缓存，避免每次检索都重新加载 37 万 keypoints
-_db: tuple[dict, dict[str, np.ndarray]] | None = None
+_db: tuple[dict, dict[str, np.ndarray], dict[str, np.ndarray]] | None = None
 
 
-def _load_db() -> tuple[dict, dict[str, np.ndarray]]:
+def _load_db() -> tuple[dict, dict[str, np.ndarray], dict[str, np.ndarray]]:
     global _db
     if _db is not None:
         return _db
@@ -38,8 +41,31 @@ def _load_db() -> tuple[dict, dict[str, np.ndarray]]:
     with np.load(FEATURES_NPZ, allow_pickle=False) as npz:
         for key in npz.files:
             arrays[key] = npz[key].copy()
-    _db = (meta, arrays)
+    flat = _build_flat_index(meta, arrays)
+    _db = (meta, arrays, flat)
     return _db
+
+
+def _build_flat_index(meta: dict, arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    descriptors: list[np.ndarray] = []
+    sample_indices: list[np.ndarray] = []
+    for idx, sample in enumerate(meta["samples"]):
+        desc = arrays.get(sample["desc_key"])
+        pts = arrays.get(sample["pts_key"])
+        if desc is None or pts is None or desc.shape[0] < MIN_MATCHES:
+            continue
+        desc = _sample_descriptors(desc, MAX_DB_DESCRIPTORS_PER_SAMPLE)
+        descriptors.append(desc)
+        sample_indices.append(np.full(desc.shape[0], idx, dtype=np.int32))
+    if not descriptors:
+        return {
+            "desc": np.zeros((0, 61), dtype=np.uint8),
+            "sample_index": np.zeros((0,), dtype=np.int32),
+        }
+    return {
+        "desc": np.concatenate(descriptors, axis=0),
+        "sample_index": np.concatenate(sample_indices, axis=0),
+    }
 
 
 def _preprocess(image: np.ndarray) -> np.ndarray:
@@ -55,6 +81,13 @@ def _preprocess(image: np.ndarray) -> np.ndarray:
     return clahe.apply(gray)
 
 
+def _sample_descriptors(desc: np.ndarray, max_count: int) -> np.ndarray:
+    if desc.shape[0] <= max_count:
+        return desc
+    indices = np.linspace(0, desc.shape[0] - 1, max_count, dtype=np.int32)
+    return desc[indices]
+
+
 def _extract(image_bytes: bytes) -> tuple[np.ndarray, np.ndarray | None]:
     data = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -64,7 +97,34 @@ def _extract(image_bytes: bytes) -> tuple[np.ndarray, np.ndarray | None]:
     kps, desc = AKAZE.detectAndCompute(gray, None)
     if not kps or desc is None:
         return np.zeros((0, 2), dtype=np.float32), None
-    return np.array([kp.pt for kp in kps], dtype=np.float32), desc
+    return np.array([kp.pt for kp in kps], dtype=np.float32), _sample_descriptors(desc, MAX_QUERY_DESCRIPTORS)
+
+
+def _score_samples(
+    query_desc: np.ndarray,
+    samples: list[dict[str, Any]],
+    flat: dict[str, np.ndarray],
+) -> list[tuple[float, dict[str, Any], int]]:
+    db_desc = flat["desc"]
+    sample_index = flat["sample_index"]
+    if db_desc.shape[0] < MIN_MATCHES:
+        return []
+
+    raw = BF.knnMatch(db_desc, query_desc, k=2)
+    counts = np.zeros(len(samples), dtype=np.int32)
+    for row_idx, pair in enumerate(raw):
+        if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance:
+            counts[int(sample_index[row_idx])] += 1
+
+    scores: list[tuple[float, dict[str, Any], int]] = []
+    for idx, good in enumerate(counts):
+        sample = samples[idx]
+        if good >= MIN_MATCHES:
+            score = int(good) / (1.0 + sample["keypoint_count"] * 0.0005)
+        else:
+            score = 0.0
+        scores.append((score, sample, int(good)))
+    return scores
 
 
 def retrieve(image_bytes: bytes, top_k: int = 5, *, include_images: bool = True) -> list[dict[str, Any]]:
@@ -74,33 +134,16 @@ def retrieve(image_bytes: bytes, top_k: int = 5, *, include_images: bool = True)
     if query_desc is None or len(query_pts) < MIN_MATCHES:
         return []
 
-    meta, arrays = _load_db()
+    meta, _arrays, flat = _load_db()
     samples = meta["samples"]
 
-    scores: list[tuple[float, dict]] = []
-
-    for s in samples:
-        db_desc = arrays.get(s["desc_key"])
-        db_pts = arrays.get(s["pts_key"])
-        if db_desc is None or db_pts is None or db_desc.shape[0] < MIN_MATCHES:
-            continue
-
-        raw = BF.knnMatch(db_desc, query_desc, k=2)
-        good = sum(1 for pair in raw if len(pair) == 2
-                   and pair[0].distance < 0.75 * pair[1].distance)
-
-        if good >= MIN_MATCHES:
-            score = good / (1.0 + len(db_pts) * 0.0005)
-        else:
-            score = 0.0
-        scores.append((score, s))
-
+    scores = _score_samples(query_desc, samples, flat)
     scores.sort(key=lambda x: x[0], reverse=True)
 
     seen_entries: set[int] = set()
     results: list[dict] = []
 
-    for score, s in scores:
+    for score, s, match_count in scores:
         ei = s["entry_index"]
         if ei in seen_entries:
             continue
@@ -115,7 +158,7 @@ def retrieve(image_bytes: bytes, top_k: int = 5, *, include_images: bool = True)
             "image_jpeg": jpeg_bytes,
             "title": s["title"],
             "rectification": s["rectification"],
-            "match_count": int(score * (1.0 + s["keypoint_count"] * 0.0005)) if score > 0 else 0,
+            "match_count": int(match_count),
             "score": round(score, 2),
         })
 

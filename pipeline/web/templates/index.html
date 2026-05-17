@@ -80,6 +80,21 @@
           </details>
         </div>
 
+        <!-- ====== 电解实验输入：检索 + VLM，不走检测框 ====== -->
+        <div id="electrolysisBlock" hidden>
+          <section class="upload-grid">
+            <div class="upload-card panel">
+              <label>待纠错图片（电解实验）</label>
+              <input type="file" name="image" accept="image/*" id="electrolysisInput">
+              <img id="electrolysisPreview" class="upload-preview" hidden alt="电解实验图片预览">
+            </div>
+            <div class="upload-card panel">
+              <label>处理方式</label>
+              <div class="readonly-box">从正确/错误样例各检索 1 张参考图，再由 VLM 输出问题和意见。</div>
+            </div>
+          </section>
+        </div>
+
         <!-- ====== 占位实验 ====== -->
         <div id="placeholderBlock" hidden>
           <section class="panel placeholder" style="margin-bottom:14px;">
@@ -175,6 +190,7 @@
     /* ---- 实验切换 ---- */
     const experimentType = document.getElementById("experimentType");
     const distillationBlock = document.getElementById("distillationBlock");
+    const electrolysisBlock = document.getElementById("electrolysisBlock");
     const placeholderBlock = document.getElementById("placeholderBlock");
     const placeholderTitle = document.getElementById("placeholderTitle");
     const placeholderDesc = document.getElementById("placeholderDesc");
@@ -220,16 +236,23 @@
       const val = experimentType.value;
       if (val === "distillation") {
         distillationBlock.hidden = false;
+        electrolysisBlock.hidden = true;
         placeholderBlock.hidden = true;
         wrongInputLabel.textContent = "待纠错图片（学生图）";
         applyExperimentConfig();
       } else if (val === "photometer") {
         distillationBlock.hidden = false;
+        electrolysisBlock.hidden = true;
         placeholderBlock.hidden = true;
         wrongInputLabel.textContent = "待纠错图片（学生图）";
         applyExperimentConfig();
+      } else if (val === "electrolysis") {
+        distillationBlock.hidden = true;
+        electrolysisBlock.hidden = false;
+        placeholderBlock.hidden = true;
       } else {
         distillationBlock.hidden = true;
+        electrolysisBlock.hidden = true;
         placeholderBlock.hidden = false;
         const info = PLACEHOLDERS[val] || {};
         placeholderTitle.textContent = info.title || "未实现";
@@ -244,6 +267,8 @@
     /* ---- 蒸馏功能 ---- */
     const wrongInput = document.getElementById("wrongInput");
     const wrongPreview = document.getElementById("wrongPreview");
+    const electrolysisInput = document.getElementById("electrolysisInput");
+    const electrolysisPreview = document.getElementById("electrolysisPreview");
     const mainForm = document.getElementById("mainForm");
     const runButton = document.getElementById("runButton");
     const statusEl = document.getElementById("status");
@@ -270,6 +295,13 @@
       if (wrongInput.files[0]) {
         wrongPreview.src = URL.createObjectURL(wrongInput.files[0]);
         wrongPreview.hidden = false;
+      }
+    });
+
+    electrolysisInput.addEventListener("change", () => {
+      if (electrolysisInput.files[0]) {
+        electrolysisPreview.src = URL.createObjectURL(electrolysisInput.files[0]);
+        electrolysisPreview.hidden = false;
       }
     });
 
@@ -368,6 +400,34 @@
     /* ---- 检测 + 单次 VLM 提交流程 ---- */
     mainForm.addEventListener("submit", async (e) => {
       e.preventDefault();
+
+      if (experimentType.value === "electrolysis") {
+        statusEl.textContent = "正在检索参考样例并分析...";
+        runButton.disabled = true;
+        detectArea.hidden = true;
+        analyzeArea.hidden = false;
+        analyzeStatus.textContent = "正在 VLM 分析...";
+        document.querySelector('[data-tab="tabA"]').hidden = false;
+        document.querySelector('[data-tab="tabA"]').classList.add("active");
+        document.getElementById("tabA").classList.add("active");
+        document.querySelector('[data-tab="tabB"]').hidden = true;
+        document.getElementById("tabB").classList.remove("active");
+        try {
+          const resp = await fetch("/api/electrolysis/check", { method: "POST", body: new FormData(mainForm) });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "电解实验纠错失败");
+          document.getElementById("resultA").textContent = data.analysis_text || "无结果";
+          renderTimings("#analyzeTiming", data.timings || {});
+          analyzeStatus.textContent = "VLM 分析完成。";
+          statusEl.textContent = "全部完成。";
+        } catch (err) {
+          statusEl.textContent = err.message;
+          analyzeStatus.textContent = "分析失败";
+        } finally {
+          runButton.disabled = false;
+        }
+        return;
+      }
 
       // 未接入的实验直接忽略
       if (!["distillation", "photometer"].includes(experimentType.value)) {

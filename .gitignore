@@ -1,2 +1,14 @@
 __pycache__
 data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+*.log
+outputs/
+runs/
+tmp/
+*.mp4
+*.zip

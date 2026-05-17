@@ -44,6 +44,7 @@ _GLASSES_JOB_WORKERS = 2
 _GLASSES_EXPERIMENTS = {
     "distillation": "减压蒸馏",
     "photometer": "光度计",
+    "electrolysis": "电解实验",
 }
 _glasses_executor = ThreadPoolExecutor(
     max_workers=_GLASSES_JOB_WORKERS,
@@ -113,7 +114,7 @@ def create_glasses_job():
             return jsonify({"error": "mode must be experiment or safety."}), 400
 
         experiment_type = request.form.get("experiment_type", "distillation").strip() or "distillation"
-        if mode == "experiment" and get_experiment_config(experiment_type) is None:
+        if mode == "experiment" and experiment_type != "electrolysis" and get_experiment_config(experiment_type) is None:
             return jsonify({"error": f"Unknown experiment_type: {experiment_type}"}), 400
 
         provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
@@ -249,6 +250,48 @@ def safety_check():
 
     except Exception as exc:
         return jsonify({"error": f"安全检查失败: {exc}"}), 500
+
+
+@app.post("/api/electrolysis/check")
+def electrolysis_check():
+    """电解实验纠错：上传图片 -> 正误样例各取 top1 -> VLM 简洁纠错。"""
+    request_started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    try:
+        uploaded = request.files.get("image") or request.files.get("wrong_image")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "请上传待纠错图片。"}), 400
+
+        image_bytes = uploaded.read()
+        provider = request.form.get("provider", "gemini").strip() or _GLASSES_DEFAULT_PROVIDER
+        model = request.form.get("model", "").strip() or _GLASSES_DEFAULT_MODEL
+
+        from pipeline.electrolysis_check.retriever import retrieve_pair
+        from pipeline.electrolysis_check.vlm_check import analyze as analyze_electrolysis
+
+        with StepTimer(timing := TimingRecord(), "检索"):
+            retrieved = retrieve_pair(image_bytes, include_images=True)
+        timings.update(timing.to_dict())
+
+        with StepTimer(timing := TimingRecord(), "VLM分析"):
+            analysis_text, _ = analyze_electrolysis(
+                image_bytes,
+                retrieved,
+                provider=provider,
+                model=model,
+            )
+        timings.update(timing.to_dict())
+        timings["总计"] = round((time.perf_counter() - request_started) * 1000, 1)
+
+        return jsonify({
+            "analysis_text": analysis_text,
+            "retrieved": _summarize_electrolysis_retrieval(retrieved),
+            "timings": timings,
+        })
+
+    except Exception as exc:
+        return jsonify({"error": f"电解实验纠错失败: {exc}"}), 500
 
 
 @app.post("/api/detect")
@@ -542,6 +585,13 @@ def _run_glasses_job(
                 provider=provider,
                 model=model,
             )
+        elif experiment_type == "electrolysis":
+            result = _run_glasses_electrolysis_job(
+                job_id=job_id,
+                image_bytes=image_bytes,
+                provider=provider,
+                model=model,
+            )
         else:
             result = _run_glasses_experiment_job(
                 job_id=job_id,
@@ -610,6 +660,43 @@ def _run_glasses_safety_job(
         "analysis_text": analysis_text,
         "mode": "safety",
         "experiment_type": None,
+        "timings": timings,
+    }
+
+
+def _run_glasses_electrolysis_job(
+    *,
+    job_id: str,
+    image_bytes: bytes,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
+    from pipeline.electrolysis_check.retriever import retrieve_pair
+    from pipeline.electrolysis_check.vlm_check import analyze as analyze_electrolysis
+
+    _update_glasses_job(job_id, stage="retrieval", message="Retrieving electrolysis references.")
+    with StepTimer(timing := TimingRecord(), "retrieval"):
+        retrieved = retrieve_pair(image_bytes, include_images=True)
+    timings.update(timing.to_dict())
+
+    _update_glasses_job(job_id, stage="vlm", message="Analyzing electrolysis image.")
+    with StepTimer(timing := TimingRecord(), "vlm"):
+        analysis_text, _ = analyze_electrolysis(
+            image_bytes,
+            retrieved,
+            provider=provider,
+            model=model,
+        )
+    timings.update(timing.to_dict())
+    timings["total"] = round((time.perf_counter() - started) * 1000, 1)
+
+    return {
+        "analysis_text": analysis_text,
+        "mode": "experiment",
+        "experiment_type": "electrolysis",
+        "retrieved": _summarize_electrolysis_retrieval(retrieved),
         "timings": timings,
     }
 
@@ -743,6 +830,24 @@ def _build_uploaded_result(components):
         "boxes": {c["label"]: [0, 0, 1, 1] for c in components},
         "detections": {c["label"]: {"score": None} for c in components},
     }
+
+
+def _summarize_electrolysis_retrieval(retrieved: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for label in ("correct", "wrong"):
+        item = retrieved.get(label)
+        if not item:
+            summary[label] = None
+            continue
+        summary[label] = {
+            "sample_id": item.get("sample_id"),
+            "label": item.get("label"),
+            "image_file": item.get("image_file"),
+            "description": item.get("description", ""),
+            "match_count": item.get("match_count"),
+            "score": item.get("score"),
+        }
+    return summary
 
 
 def _load_experiment_ui_config() -> dict[str, dict]:
