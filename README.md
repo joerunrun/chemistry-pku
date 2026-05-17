@@ -152,3 +152,11 @@ http://电脑IPv4:5080
 - 电脑能打开，但眼镜 `http://电脑IP:5080` 失败：网络不通或防火墙拦截。
 - USB 调试时失败：重新运行 `adb reverse tcp:5080 tcp:5080`，App 地址用 `http://127.0.0.1:5080`。
 - 拍照后等待很久：VLM 调用或安全检索耗时，先看电脑端 PowerShell/日志是否还在运行。
+
+
+
+如何无线 ？
+D:\Android\projects\app\src\main\res\values\glasses_config.xml  
+
+<string name="glasses_service_base_url">http://172.20.10.2:5080</string>
+改成电脑ip

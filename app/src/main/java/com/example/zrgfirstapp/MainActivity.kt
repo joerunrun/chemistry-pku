@@ -44,6 +44,7 @@ class MainActivity : AppCompatActivity() {
         CONSENT,
         HOME,
         EXPERIMENT_SELECT,
+        MORE_EXPERIMENT_SELECT,
         ACTION,
         RUNNING,
         RESULT,
@@ -57,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     private enum class ExperimentType {
         DISTILLATION,
         PHOTOMETER,
+        ELECTROLYSIS,
     }
 
     private enum class CameraPermissionAction {
@@ -267,8 +269,17 @@ class MainActivity : AppCompatActivity() {
                 title = "实验纠错",
                 subtitle = "选择实验",
                 primary = "减压蒸馏",
-                secondary = "光度计",
+                secondary = "更多实验",
                 status = "双击返回主页",
+                result = recordingSummary(),
+            )
+
+            ScreenState.MORE_EXPERIMENT_SELECT -> renderChoiceScreen(
+                title = "更多实验",
+                subtitle = "选择实验",
+                primary = "光度计",
+                secondary = "电解",
+                status = "双击返回上一层",
                 result = recordingSummary(),
             )
 
@@ -379,6 +390,7 @@ class MainActivity : AppCompatActivity() {
             Mode.EXPERIMENT -> when (selectedExperimentType) {
                 ExperimentType.DISTILLATION -> "减压蒸馏纠错"
                 ExperimentType.PHOTOMETER -> "光度计纠错"
+                ExperimentType.ELECTROLYSIS -> "电解纠错"
             }
         }
     }
@@ -399,6 +411,7 @@ class MainActivity : AppCompatActivity() {
         return when (selectedExperimentType) {
             ExperimentType.DISTILLATION -> "减压蒸馏"
             ExperimentType.PHOTOMETER -> "光度计"
+            ExperimentType.ELECTROLYSIS -> "电解"
         }
     }
 
@@ -440,10 +453,23 @@ class MainActivity : AppCompatActivity() {
             }
 
             ScreenState.EXPERIMENT_SELECT -> {
-                selectedExperimentType = if (focusIndex == 0) {
-                    ExperimentType.DISTILLATION
+                if (focusIndex == 0) {
+                    selectedExperimentType = ExperimentType.DISTILLATION
+                    clearTaskOutput()
+                    focusIndex = 0
+                    screenState = ScreenState.ACTION
                 } else {
+                    focusIndex = 0
+                    screenState = ScreenState.MORE_EXPERIMENT_SELECT
+                }
+                renderScreen()
+            }
+
+            ScreenState.MORE_EXPERIMENT_SELECT -> {
+                selectedExperimentType = if (focusIndex == 0) {
                     ExperimentType.PHOTOMETER
+                } else {
+                    ExperimentType.ELECTROLYSIS
                 }
                 clearTaskOutput()
                 focusIndex = 0
@@ -486,13 +512,25 @@ class MainActivity : AppCompatActivity() {
                 clearTaskOutput()
                 renderScreen()
             }
+            ScreenState.MORE_EXPERIMENT_SELECT -> {
+                focusIndex = 1
+                screenState = ScreenState.EXPERIMENT_SELECT
+                clearTaskOutput()
+                renderScreen()
+            }
             ScreenState.ACTION,
             ScreenState.RUNNING,
             ScreenState.RESULT -> {
                 focusIndex = 0
                 clearTaskOutput()
                 screenState = if (selectedMode == Mode.EXPERIMENT) {
-                    ScreenState.EXPERIMENT_SELECT
+                    if (selectedExperimentType == ExperimentType.PHOTOMETER ||
+                        selectedExperimentType == ExperimentType.ELECTROLYSIS
+                    ) {
+                        ScreenState.MORE_EXPERIMENT_SELECT
+                    } else {
+                        ScreenState.EXPERIMENT_SELECT
+                    }
                 } else {
                     ScreenState.HOME
                 }
@@ -505,6 +543,7 @@ class MainActivity : AppCompatActivity() {
         return this == ScreenState.CONSENT ||
             this == ScreenState.HOME ||
             this == ScreenState.EXPERIMENT_SELECT ||
+            this == ScreenState.MORE_EXPERIMENT_SELECT ||
             this == ScreenState.ACTION
     }
 
@@ -811,6 +850,7 @@ class MainActivity : AppCompatActivity() {
         return when (selectedExperimentType) {
             ExperimentType.DISTILLATION -> "distillation"
             ExperimentType.PHOTOMETER -> "photometer"
+            ExperimentType.ELECTROLYSIS -> "electrolysis"
         }
     }
 
