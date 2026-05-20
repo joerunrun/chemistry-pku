@@ -105,6 +105,8 @@ class CameraSessionManager(
         updateStatus("未录像")
     }
 
+    fun isRecordingActive(): Boolean = recordingDesired || activeRecording != null
+
     fun captureStillImage(outputFile: File, callback: (File?, Throwable?) -> Unit) {
         ensureCamera(
             onReady = {

@@ -15,6 +15,7 @@ import java.io.File
 class RecordingService : LifecycleService() {
     companion object {
         const val ACTION_START_RECORDING = "com.example.zrgfirstapp.START_RECORDING"
+        const val ACTION_START_CAPTURE_SESSION = "com.example.zrgfirstapp.START_CAPTURE_SESSION"
         const val ACTION_STOP_RECORDING = "com.example.zrgfirstapp.STOP_RECORDING"
         private const val CHANNEL_ID = "chem_recording"
         private const val NOTIFICATION_ID = 1208
@@ -49,6 +50,7 @@ class RecordingService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_START_RECORDING -> startRecording()
+            ACTION_START_CAPTURE_SESSION -> startCaptureSession()
             ACTION_STOP_RECORDING -> {
                 stopRecording()
                 stopSelf()
@@ -61,6 +63,19 @@ class RecordingService : LifecycleService() {
         startAsForegroundIfNeeded()
         lastStatus = "录像准备中"
         cameraSessionManager.startRecording()
+    }
+
+    fun startCaptureSession() {
+        startAsForegroundIfNeeded()
+        lastStatus = "相机准备中"
+        cameraSessionManager.ensureCamera(
+            onReady = {
+                lastStatus = cameraSessionManager.statusLabel
+            },
+            onError = {
+                lastStatus = "相机初始化失败"
+            },
+        )
     }
 
     fun stopRecording() {
@@ -80,6 +95,19 @@ class RecordingService : LifecycleService() {
     }
 
     fun recordingStatus(): String = cameraSessionManager.statusLabel.ifBlank { lastStatus }
+
+    fun stopCaptureSessionIfIdle() {
+        if (cameraSessionManager.isRecordingActive()) {
+            return
+        }
+        cameraSessionManager.shutdown()
+        lastStatus = "未录像"
+        if (foregroundStarted) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundStarted = false
+        }
+        stopSelf()
+    }
 
     override fun onDestroy() {
         cameraSessionManager.shutdown()

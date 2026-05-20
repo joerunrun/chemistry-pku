@@ -4,7 +4,7 @@
     android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#202124"
+    android:background="@android:color/transparent"
     android:orientation="horizontal"
     tools:context=".MainActivity">
 
