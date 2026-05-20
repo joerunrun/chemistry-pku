@@ -12,6 +12,7 @@ if _PARENT not in sys.path:
 
 from client_factory import create_chat_client
 from openrouter_client import build_text_part, prepare_image_part
+from pipeline.common.vlm_client import DEFAULT_VLM_MODEL, DEFAULT_VLM_PROVIDER
 
 SYSTEM_PROMPT = "你是实验室安全检查助手。请直接判断图片中的安全问题，并给出整改意见。"
 
@@ -38,7 +39,7 @@ def analyze(
     student_image_bytes: bytes,
     retrieved: list[dict],
     *,
-    provider: str = "openrouter",
+    provider: str = DEFAULT_VLM_PROVIDER,
     model: str | None = None,
 ) -> tuple[str, float]:
     if not retrieved:
@@ -47,6 +48,8 @@ def analyze(
     client = create_chat_client(provider)
     if model:
         client.config.model = model
+    elif provider == "ali":
+        client.config.model = DEFAULT_VLM_MODEL
     elif provider == "gemini":
         client.config.model = "gemini-3-flash-preview"
 

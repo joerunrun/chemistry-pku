@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pipeline.common.vlm_client import (
+    DEFAULT_VLM_PROVIDER,
     build_image_part_from_bytes,
     build_text_part,
     call_vlm,
@@ -41,7 +42,7 @@ def analyze(
     student_image_bytes: bytes,
     retrieved: dict[str, Any],
     *,
-    provider: str = "gemini",
+    provider: str = DEFAULT_VLM_PROVIDER,
     model: str | None = None,
 ) -> tuple[str, float]:
     correct = retrieved.get("correct")

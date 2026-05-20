@@ -11,6 +11,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from flask import Flask, jsonify, render_template, request
+from pipeline.common.vlm_client import DEFAULT_VLM_MODEL, DEFAULT_VLM_PROVIDER
 from pipeline.safety_check.retriever import retrieve, reload_db
 from pipeline.safety_check.vlm_check import analyze
 
@@ -35,8 +36,8 @@ def check():
 
         image_bytes = uploaded.read()
         top_k = int(request.form.get("top_k", "1"))
-        provider = request.form.get("provider", "gemini").strip()
-        model = request.form.get("model", "").strip() or None
+        provider = request.form.get("provider", DEFAULT_VLM_PROVIDER).strip()
+        model = request.form.get("model", "").strip() or DEFAULT_VLM_MODEL
 
         # Step 1: 检索
         t0 = time.perf_counter()

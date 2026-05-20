@@ -28,7 +28,7 @@ from pipeline.common.cv_wrapper import (
     load_reference_image,
 )
 from pipeline.common.timing import StepTimer, TimingRecord
-from pipeline.common.vlm_client import PROVIDER_MODELS
+from pipeline.common.vlm_client import DEFAULT_VLM_MODEL, DEFAULT_VLM_PROVIDER, PROVIDER_MODELS
 from pipeline.experiments import get_experiment_config
 
 app = Flask(__name__)
@@ -38,8 +38,8 @@ app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 _detect_store: dict[str, dict] = {}
 _TTL_SECONDS = 3600
 _GLASSES_JOB_TTL_SECONDS = 30 * 60
-_GLASSES_DEFAULT_PROVIDER = "gemini"
-_GLASSES_DEFAULT_MODEL = "gemini-3-flash-preview"
+_GLASSES_DEFAULT_PROVIDER = DEFAULT_VLM_PROVIDER
+_GLASSES_DEFAULT_MODEL = DEFAULT_VLM_MODEL
 _GLASSES_JOB_WORKERS = 2
 _GLASSES_EXPERIMENTS = {
     "distillation": "减压蒸馏",
@@ -94,11 +94,78 @@ def glasses_health():
         "default_provider": _GLASSES_DEFAULT_PROVIDER,
         "default_model": _GLASSES_DEFAULT_MODEL,
         "modes": ["experiment", "safety"],
+        "features": ["experiment", "safety", "qa", "qa_audio"],
         "experiments": [
             {"value": key, "label": label}
             for key, label in _GLASSES_EXPERIMENTS.items()
         ],
     })
+
+
+@app.post("/api/glasses/qa")
+def glasses_qa():
+    started = time.perf_counter()
+    try:
+        payload = request.get_json(silent=True) or {}
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            return jsonify({"error": "question is required."}), 400
+
+        provider = str(payload.get("provider", _GLASSES_DEFAULT_PROVIDER)).strip() or _GLASSES_DEFAULT_PROVIDER
+        model = str(payload.get("model", _GLASSES_DEFAULT_MODEL)).strip() or _GLASSES_DEFAULT_MODEL
+
+        from pipeline.qa.llm_qa import answer_question
+
+        answer, vlm_ms = answer_question(
+            question,
+            provider=provider,
+            model=model,
+        )
+        return jsonify({
+            "question": question,
+            "answer": answer,
+            "timings": {
+                "vlm": vlm_ms,
+                "total": round((time.perf_counter() - started) * 1000, 1),
+            },
+        })
+    except Exception as exc:
+        return jsonify({"error": f"QA failed: {exc}"}), 500
+
+
+@app.post("/api/glasses/qa/audio")
+def glasses_qa_audio():
+    started = time.perf_counter()
+    try:
+        uploaded = request.files.get("audio")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "audio is required."}), 400
+
+        audio_bytes = uploaded.read()
+        if not audio_bytes:
+            return jsonify({"error": "audio is empty."}), 400
+
+        model = request.form.get("model", "qwen3.5-omni-plus-realtime").strip()
+        timeout_raw = request.form.get("timeout_seconds", "").strip()
+        timeout_seconds = int(timeout_raw) if timeout_raw else None
+
+        from pipeline.qa.omni_audio_qa import answer_audio_question
+
+        result = answer_audio_question(
+            audio_bytes,
+            model=model or None,
+            timeout_seconds=timeout_seconds,
+        )
+        timings = dict(result.get("timings", {}))
+        timings["total_http"] = round((time.perf_counter() - started) * 1000, 1)
+        return jsonify({
+            "transcript": result.get("transcript", ""),
+            "answer_text": result.get("answer_text", ""),
+            "answer_audio_data_url": result.get("answer_audio_data_url"),
+            "timings": timings,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Audio QA failed: {exc}"}), 500
 
 
 @app.post("/api/glasses/jobs")
@@ -216,7 +283,7 @@ def safety_check():
 
         image_bytes = uploaded.read()
         top_k = int(request.form.get("top_k", "1"))
-        provider = request.form.get("provider", "gemini").strip()
+        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip()
         model = request.form.get("model", "").strip() or None
 
         from pipeline.safety_check.retriever import retrieve
@@ -264,7 +331,7 @@ def electrolysis_check():
             return jsonify({"error": "请上传待纠错图片。"}), 400
 
         image_bytes = uploaded.read()
-        provider = request.form.get("provider", "gemini").strip() or _GLASSES_DEFAULT_PROVIDER
+        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
         model = request.form.get("model", "").strip() or _GLASSES_DEFAULT_MODEL
 
         from pipeline.electrolysis_check.retriever import retrieve_pair
@@ -430,7 +497,7 @@ def analyze():
     try:
         session_id = request.form.get("session_id", "").strip()
         approach = request.form.get("approach", "a").strip()
-        provider = request.form.get("provider", "openrouter").strip()
+        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip()
         model = request.form.get("model", "").strip() or None
 
         stored = _detect_store.get(session_id)

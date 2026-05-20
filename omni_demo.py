@@ -14,7 +14,7 @@ dashscope.api_key = os.getenv('DASHSCOPE_API_KEY')
 # 指定音色
 voice = 'Ethan'
 # 指定模型
-model = 'qwen3.5-omni-flash-realtime'
+model = 'qwen3.5-omni-plus-realtime'
 # 指定模型角色
 instructions = "你是个人助理小云，请用幽默风趣的方式回答用户的问题"
 class SimpleCallback(OmniRealtimeCallback):

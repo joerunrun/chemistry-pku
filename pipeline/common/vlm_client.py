@@ -5,6 +5,9 @@ import time
 from pathlib import Path
 from typing import Any, Generator
 
+DEFAULT_VLM_PROVIDER = "ali"
+DEFAULT_VLM_MODEL = "qwen3.6-flash"
+
 PARENT_DIR = str(Path(__file__).resolve().parent.parent.parent)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
@@ -47,6 +50,8 @@ def create_vlm(provider: str, model: str | None = None) -> Any:
     client = create_chat_client(provider)
     if model:
         client.config.model = model
+    elif provider == "ali":
+        client.config.model = DEFAULT_VLM_MODEL
     elif provider == "gemini":
         client.config.model = "gemini-3-flash-preview"
     return client
