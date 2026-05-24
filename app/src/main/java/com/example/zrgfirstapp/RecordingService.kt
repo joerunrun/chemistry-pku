@@ -28,7 +28,7 @@ class RecordingService : LifecycleService() {
     private val binder = LocalBinder()
     private lateinit var cameraSessionManager: CameraSessionManager
     private var foregroundStarted = false
-    private var lastStatus = "未录像"
+    private var lastStatus = "未记录"
 
     override fun onCreate() {
         super.onCreate()
@@ -61,7 +61,7 @@ class RecordingService : LifecycleService() {
 
     fun startRecording() {
         startAsForegroundIfNeeded()
-        lastStatus = "录像准备中"
+        lastStatus = "记录准备中"
         cameraSessionManager.startRecording()
     }
 
@@ -80,7 +80,7 @@ class RecordingService : LifecycleService() {
 
     fun stopRecording() {
         cameraSessionManager.stopRecording()
-        lastStatus = "未录像"
+        lastStatus = "未记录"
         if (foregroundStarted) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             foregroundStarted = false
@@ -101,7 +101,7 @@ class RecordingService : LifecycleService() {
             return
         }
         cameraSessionManager.shutdown()
-        lastStatus = "未录像"
+        lastStatus = "未记录"
         if (foregroundStarted) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             foregroundStarted = false
@@ -119,7 +119,7 @@ class RecordingService : LifecycleService() {
             return
         }
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("录像准备中"))
+        startForeground(NOTIFICATION_ID, buildNotification("记录准备中"))
         foregroundStarted = true
     }
 
@@ -128,7 +128,7 @@ class RecordingService : LifecycleService() {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "化学实验后台录像",
+                "化学实验记录",
                 NotificationManager.IMPORTANCE_LOW,
             )
             manager.createNotificationChannel(channel)

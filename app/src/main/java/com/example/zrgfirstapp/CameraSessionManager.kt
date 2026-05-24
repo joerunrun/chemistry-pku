@@ -1,7 +1,10 @@
 package com.example.zrgfirstapp
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -15,6 +18,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.PendingRecording
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -49,7 +53,7 @@ class CameraSessionManager(
     private var activeRecording: Recording? = null
     private var cameraInitializing = false
     private var recordingDesired = false
-    private var currentStatus = "未录像"
+    private var currentStatus = "未记录"
 
     val statusLabel: String
         get() = currentStatus
@@ -93,7 +97,7 @@ class CameraSessionManager(
         recordingDesired = true
         ensureCamera(
             onReady = { startNewSegmentIfNeeded() },
-            onError = { updateStatus("录像异常") },
+            onError = { updateStatus("记录异常") },
         )
     }
 
@@ -102,7 +106,7 @@ class CameraSessionManager(
         mainHandler.removeCallbacksAndMessages(null)
         activeRecording?.stop()
         activeRecording = null
-        updateStatus("未录像")
+        updateStatus("未记录")
     }
 
     fun isRecordingActive(): Boolean = recordingDesired || activeRecording != null
@@ -177,27 +181,33 @@ class CameraSessionManager(
 
         imageCapture = capture
         videoCapture = video
-        updateStatus(if (recordingDesired) "录像准备中" else "相机已就绪")
+        updateStatus(if (recordingDesired) "记录准备中" else "相机已就绪")
     }
 
+    @SuppressLint("MissingPermission")
     private fun startNewSegmentIfNeeded() {
         if (!recordingDesired || activeRecording != null) {
             return
         }
         val recorder = videoCapture?.output ?: run {
-            updateStatus("录像异常")
+            updateStatus("记录异常")
             return
         }
         cleanupOldPrivateSegments()
-        val pendingRecording = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        var pendingRecording: PendingRecording = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             recorder.prepareRecording(context, nextMediaStoreOutputOptions())
         } else {
             recorder.prepareRecording(context, nextPrivateFileOutputOptions())
         }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingRecording = pendingRecording.withAudioEnabled()
+        }
         activeRecording = pendingRecording.start(mainExecutor) { event ->
                 when (event) {
                     is VideoRecordEvent.Start -> {
-                        updateStatus("录像中")
+                        updateStatus("记录中")
                         scheduleSegmentRollover()
                     }
 
@@ -205,11 +215,11 @@ class CameraSessionManager(
                         activeRecording = null
                         updateStatus(
                             if (event.hasError()) {
-                                "录像异常"
+                                "记录异常"
                             } else if (recordingDesired) {
-                                "录像分段已保存"
+                                "记录分段已保存"
                             } else {
-                                "未录像"
+                                "未记录"
                             },
                         )
                         if (recordingDesired) {
@@ -231,11 +241,11 @@ class CameraSessionManager(
 
     private fun nextMediaStoreOutputOptions(): MediaStoreOutputOptions {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val displayName = "chem_recording_$timestamp.mp4"
+        val displayName = "chem_record_$timestamp.mp4"
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ChemistryRecords")
             put(DATE_TAKEN, System.currentTimeMillis())
         }
         return MediaStoreOutputOptions.Builder(
@@ -249,18 +259,18 @@ class CameraSessionManager(
     private fun nextPrivateFileOutputOptions(): FileOutputOptions {
         val dir = File(
             context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir,
-            "chem_recordings",
+            "ChemistryRecords",
         )
         dir.mkdirs()
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val displayName = "chem_recording_$timestamp"
+        val displayName = "chem_record_$timestamp"
         return FileOutputOptions.Builder(File(dir, "$displayName.mp4")).build()
     }
 
     private fun cleanupOldPrivateSegments() {
         val dir = File(
             context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir,
-            "chem_recordings",
+            "ChemistryRecords",
         )
         val files = dir.listFiles { file -> file.extension.equals("mp4", ignoreCase = true) }
             ?.sortedByDescending { it.lastModified() }

@@ -160,3 +160,6 @@ D:\Android\projects\app\src\main\res\values\glasses_config.xml
 
 <string name="glasses_service_base_url">http://172.20.10.2:5080</string>
 改成电脑ip
+
+
+D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SETTINGS
