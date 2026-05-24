@@ -14,6 +14,7 @@ from dashscope.audio.qwen_omni import (
 
 from ali_client import AliyunError
 from omni_client import load_omni_config
+from pipeline.qa.omni_tts import pcm16_to_wav_bytes, wav_data_url
 
 
 SYSTEM_INSTRUCTIONS = (
@@ -30,11 +31,16 @@ class OmniAudioQACallback(OmniRealtimeCallback):
         self.transcript: str = ""
         self.answer_text: str = ""
         self._answer_chunks: list[str] = []
+        self._audio_chunks: list[bytes] = []
 
     def on_event(self, response: dict[str, Any]) -> None:
         event_type = str(response.get("type", ""))
         if event_type == "conversation.item.input_audio_transcription.completed":
             self.transcript = str(response.get("transcript", "")).strip()
+        elif event_type == "response.audio.delta":
+            delta = response.get("delta", "")
+            if delta:
+                self._audio_chunks.append(base64.b64decode(delta))
         elif event_type == "response.text.delta":
             delta = str(response.get("delta", ""))
             if delta:
@@ -51,6 +57,11 @@ class OmniAudioQACallback(OmniRealtimeCallback):
             if not self.answer_text:
                 self.answer_text = "".join(self._answer_chunks).strip()
             self.done = True
+
+    def answer_audio_data_url(self) -> str | None:
+        if not self._audio_chunks:
+            return None
+        return wav_data_url(pcm16_to_wav_bytes(b"".join(self._audio_chunks)))
 
 
 def answer_audio_question(
@@ -80,7 +91,7 @@ def answer_audio_question(
     try:
         conv.connect()
         conv.update_session(
-            output_modalities=[MultiModality.TEXT],
+            output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
             voice=config.voice,
             enable_input_audio_transcription=True,
             enable_turn_detection=False,
@@ -98,7 +109,7 @@ def answer_audio_question(
                 "请先理解用户语音问题，再给出简短中文回答。"
                 "回答控制在三句话以内；如涉及实验安全，优先给安全建议。"
             ),
-            output_modalities=[MultiModality.TEXT],
+            output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
         )
 
         deadline = time.time() + config.timeout_seconds
@@ -117,7 +128,7 @@ def answer_audio_question(
         return {
             "transcript": callback.transcript,
             "answer_text": answer_text,
-            "answer_audio_data_url": None,
+            "answer_audio_data_url": callback.answer_audio_data_url(),
             "timings": {
                 "omni": round((time.perf_counter() - model_started_at) * 1000, 1),
                 "total": round((time.perf_counter() - started_at) * 1000, 1),

@@ -5,8 +5,8 @@ import time
 from pathlib import Path
 from typing import Any, Generator
 
-DEFAULT_VLM_PROVIDER = "ali"
-DEFAULT_VLM_MODEL = "qwen3.6-flash"
+DEFAULT_VLM_PROVIDER = "qiniu"
+DEFAULT_VLM_MODEL = "google/gemini-3.5-flash"
 
 PARENT_DIR = str(Path(__file__).resolve().parent.parent.parent)
 if PARENT_DIR not in sys.path:
@@ -43,6 +43,10 @@ PROVIDER_MODELS: dict[str, list[dict[str, str]]] = {
         {"value": "gemini-2.5-flash-preview-05-20", "label": "Gemini 2.5 Flash"},
         {"value": "gemini-2.5-pro-preview-05-06", "label": "Gemini 2.5 Pro"},
     ],
+    "qiniu": [
+        {"value": "google/gemini-3.5-flash", "label": "Qiniu Gemini 3.5 Flash"},
+        {"value": "gemini3flash", "label": "Qiniu Gemini 3 Flash"},
+    ],
 }
 
 
@@ -51,9 +55,11 @@ def create_vlm(provider: str, model: str | None = None) -> Any:
     if model:
         client.config.model = model
     elif provider == "ali":
-        client.config.model = DEFAULT_VLM_MODEL
+        client.config.model = "qwen3.6-flash"
     elif provider == "gemini":
         client.config.model = "gemini-3-flash-preview"
+    elif provider == "qiniu":
+        client.config.model = "google/gemini-3.5-flash"
     return client
 
 

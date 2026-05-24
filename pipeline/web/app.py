@@ -18,7 +18,7 @@ PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file, url_for
 
 from pipeline.common.cv_wrapper import (
     CVDetectionParams,
@@ -45,6 +45,9 @@ _GLASSES_EXPERIMENTS = {
     "distillation": "减压蒸馏",
     "photometer": "光度计",
     "electrolysis": "电解实验",
+}
+_DEMO_VIDEO_DIRS = {
+    "distillation": Path(r"D:\chemistry\化小北实验测试数据\减压蒸馏"),
 }
 _glasses_executor = ThreadPoolExecutor(
     max_workers=_GLASSES_JOB_WORKERS,
@@ -94,12 +97,41 @@ def glasses_health():
         "default_provider": _GLASSES_DEFAULT_PROVIDER,
         "default_model": _GLASSES_DEFAULT_MODEL,
         "modes": ["experiment", "safety"],
-        "features": ["experiment", "safety", "qa", "qa_audio"],
+        "features": ["experiment", "safety", "qa", "qa_audio", "voice_intent", "tts_audio", "demo_video"],
         "experiments": [
             {"value": key, "label": label}
             for key, label in _GLASSES_EXPERIMENTS.items()
         ],
     })
+
+
+@app.get("/api/glasses/demo/videos")
+def glasses_demo_videos():
+    experiment_type = request.args.get("experiment_type", "distillation").strip() or "distillation"
+    try:
+        videos = _list_demo_videos(experiment_type)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({
+        "experiment_type": experiment_type,
+        "videos": [
+            {
+                "id": item["id"],
+                "label": item["label"],
+                "filename": item["filename"],
+                "stream_url": url_for("glasses_demo_video_stream", video_id=item["id"]),
+            }
+            for item in videos
+        ],
+    })
+
+
+@app.get("/api/glasses/demo/videos/<video_id>/stream")
+def glasses_demo_video_stream(video_id: str):
+    video_path = _resolve_demo_video(video_id)
+    if video_path is None:
+        return jsonify({"error": "video not found"}), 404
+    return send_file(video_path, mimetype="video/mp4", conditional=True)
 
 
 @app.post("/api/glasses/qa")
@@ -166,6 +198,70 @@ def glasses_qa_audio():
         })
     except Exception as exc:
         return jsonify({"error": f"Audio QA failed: {exc}"}), 500
+
+
+@app.post("/api/glasses/tts")
+def glasses_tts():
+    started = time.perf_counter()
+    try:
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            return jsonify({"error": "text is required."}), 400
+
+        model = str(payload.get("model", "qwen3.5-omni-plus-realtime")).strip() or None
+        timeout_raw = str(payload.get("timeout_seconds", "")).strip()
+        timeout_seconds = int(timeout_raw) if timeout_raw else None
+
+        from pipeline.qa.omni_tts import synthesize_text_to_audio
+
+        result = synthesize_text_to_audio(
+            text,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+        timings = dict(result.get("timings", {}))
+        timings["total_http"] = round((time.perf_counter() - started) * 1000, 1)
+        return jsonify({
+            "audio_data_url": result.get("audio_data_url"),
+            "transcript": result.get("transcript", ""),
+            "timings": timings,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"TTS failed: {exc}"}), 500
+
+
+@app.post("/api/glasses/voice/intent")
+def glasses_voice_intent():
+    started = time.perf_counter()
+    try:
+        uploaded = request.files.get("audio")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "audio is required."}), 400
+
+        audio_bytes = uploaded.read()
+        if not audio_bytes:
+            return jsonify({"error": "audio is empty."}), 400
+
+        model = request.form.get("model", "qwen3.5-omni-plus-realtime").strip()
+        context = request.form.get("context", "").strip() or None
+        timeout_raw = request.form.get("timeout_seconds", "").strip()
+        timeout_seconds = int(timeout_raw) if timeout_raw else None
+
+        from pipeline.voice_control.intent_omni import classify_audio_intent
+
+        result = classify_audio_intent(
+            audio_bytes,
+            context=context,
+            model=model or None,
+            timeout_seconds=timeout_seconds,
+        )
+        timings = dict(result.get("timings", {}))
+        timings["total_http"] = round((time.perf_counter() - started) * 1000, 1)
+        result["timings"] = timings
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": f"Voice intent failed: {exc}"}), 500
 
 
 @app.post("/api/glasses/jobs")
@@ -667,6 +763,7 @@ def _run_glasses_job(
                 provider=provider,
                 model=model,
             )
+        _attach_analysis_audio(job_id, result)
         _update_glasses_job(
             job_id,
             status="succeeded",
@@ -684,6 +781,28 @@ def _run_glasses_job(
             result=None,
             error=str(exc),
         )
+
+
+def _attach_analysis_audio(job_id: str, result: dict[str, Any]) -> None:
+    analysis_text = str(result.get("analysis_text", "")).strip()
+    if not analysis_text:
+        result["analysis_audio_data_url"] = None
+        return
+
+    _update_glasses_job(job_id, stage="tts", message="Preparing voice summary.")
+    timings = result.setdefault("timings", {})
+    try:
+        from pipeline.qa.omni_tts import synthesize_text_to_audio
+
+        tts_text = analysis_text[:220]
+        audio = synthesize_text_to_audio(tts_text)
+        result["analysis_audio_data_url"] = audio.get("audio_data_url")
+        if isinstance(timings, dict):
+            timings.update(audio.get("timings", {}))
+    except Exception as exc:
+        result["analysis_audio_data_url"] = None
+        if isinstance(timings, dict):
+            timings["tts_error"] = str(exc)
 
 
 def _run_glasses_safety_job(
@@ -947,6 +1066,46 @@ def _list_experiment_references(cfg):
     if getattr(cfg, "REQUIRE_REFERENCE_LABELS", False):
         refs = [ref for ref in refs if ref.get("annotated_labels")]
     return refs
+
+
+def _list_demo_videos(experiment_type: str) -> list[dict[str, str]]:
+    video_dir = _DEMO_VIDEO_DIRS.get(experiment_type)
+    if video_dir is None:
+        return []
+    if not video_dir.exists():
+        raise ValueError(f"演示视频目录不存在: {video_dir}")
+
+    videos = []
+    for path in sorted(video_dir.glob("*.mp4")):
+        videos.append({
+            "id": _demo_video_id(experiment_type, path),
+            "label": _demo_video_label(path),
+            "filename": path.name,
+            "path": str(path),
+        })
+    return videos
+
+
+def _resolve_demo_video(video_id: str) -> Path | None:
+    for experiment_type in _DEMO_VIDEO_DIRS:
+        for item in _list_demo_videos(experiment_type):
+            if item["id"] == video_id:
+                path = Path(item["path"])
+                return path if path.exists() and path.suffix.lower() == ".mp4" else None
+    return None
+
+
+def _demo_video_id(experiment_type: str, path: Path) -> str:
+    import base64
+    raw = f"{experiment_type}:{path.stem}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _demo_video_label(path: Path) -> str:
+    label = path.stem
+    label = label.split("_", 1)[1] if "_" in label else label
+    label = label.replace("减压蒸馏_", "").replace("_", " ")
+    return label.strip() or path.stem
 
 
 def _build_label_summary_from_results(correct_result, wrong_result, components):

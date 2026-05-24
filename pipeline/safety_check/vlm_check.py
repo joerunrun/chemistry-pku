@@ -49,9 +49,11 @@ def analyze(
     if model:
         client.config.model = model
     elif provider == "ali":
-        client.config.model = DEFAULT_VLM_MODEL
+        client.config.model = "qwen3.6-flash"
     elif provider == "gemini":
         client.config.model = "gemini-3-flash-preview"
+    elif provider == "qiniu":
+        client.config.model = "google/gemini-3.5-flash"
 
     # 构建安全检查要点。对模型隐藏检索/数据库来源，只作为内部上下文。
     desc_parts: list[str] = []
