@@ -11,6 +11,13 @@ import core
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
 
+OTHER_COMPONENTS = [
+    {"label": "object_a", "name": "测试物体A", "color": "#ff3b30"},
+    {"label": "object_b", "name": "测试物体B", "color": "#34c759"},
+    {"label": "object_c", "name": "测试物体C", "color": "#007aff"},
+    {"label": "object_d", "name": "测试物体D", "color": "#ffcc00"},
+]
+
 
 PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -283,7 +290,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
   </main>
 
   <script>
-    const COMPONENTS = {{ components | tojson }};
+    const COMPONENT_SETS = {{ component_sets | tojson }};
+    let COMPONENTS = COMPONENT_SETS.default;
     const imageInput = document.getElementById("imageInput");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
@@ -428,6 +436,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
     }
 
     function resetAnnotations() {
+      state.polygons = {};
       for (const item of COMPONENTS) {
         state.polygons[item.label] = [];
       }
@@ -451,6 +460,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
       image.onerror = () => setStatus("图片加载失败。", true);
       image.src = URL.createObjectURL(file);
     });
+
+    const modeSelect = document.createElement("select");
+    modeSelect.innerHTML = '<option value="default">化学实验标签</option><option value="other">其它测试标签</option>';
+    modeSelect.addEventListener("change", () => {
+      COMPONENTS = COMPONENT_SETS[modeSelect.value] || COMPONENT_SETS.default;
+      resetAnnotations();
+      setStatus(`已切换到 ${modeSelect.options[modeSelect.selectedIndex].text}。`);
+      render();
+    });
+    document.querySelector(".toolbar").insertBefore(modeSelect, imageInput.nextSibling);
 
     canvas.addEventListener("click", (event) => {
       if (!state.image) return;
@@ -602,7 +621,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 @app.get("/")
 def index():
-    return render_template_string(PAGE_HTML, components=core.COMPONENTS)
+    return render_template_string(
+        PAGE_HTML,
+        component_sets={"default": core.COMPONENTS, "other": OTHER_COMPONENTS},
+    )
 
 
 @app.get("/api/references")

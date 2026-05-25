@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import sys
 import time
 import uuid
@@ -45,10 +46,19 @@ _GLASSES_EXPERIMENTS = {
     "distillation": "减压蒸馏",
     "photometer": "光度计",
     "electrolysis": "电解实验",
+    "other": "其它测试",
 }
 _DEMO_VIDEO_DIRS = {
     "distillation": Path(r"D:\chemistry\化小北实验测试数据\减压蒸馏"),
 }
+_TEACHER_SPEAKER_THRESHOLD = 0.5
+_TEACHER_SPEAKER_MIN_SPEECH_MS = 200
+_TEACHER_DEFAULT_EMBEDDING_MODEL = Path(
+    r"D:\chemistry\speaker_verify_test\models\3dspeaker_speech_eres2net_base_200k_sv_zh-cn_16k-common.onnx"
+)
+_teacher_speaker_lock = Lock()
+_teacher_reference_audio: bytes | None = None
+_teacher_reference_created_at: float | None = None
 _glasses_executor = ThreadPoolExecutor(
     max_workers=_GLASSES_JOB_WORKERS,
     thread_name_prefix="glasses-job",
@@ -97,12 +107,106 @@ def glasses_health():
         "default_provider": _GLASSES_DEFAULT_PROVIDER,
         "default_model": _GLASSES_DEFAULT_MODEL,
         "modes": ["experiment", "safety"],
-        "features": ["experiment", "safety", "qa", "qa_audio", "voice_intent", "tts_audio", "demo_video"],
+        "features": [
+            "experiment",
+            "safety",
+            "qa",
+            "qa_audio",
+            "voice_intent",
+            "tts_audio",
+            "demo_video",
+            "teacher_speaker_verify",
+        ],
         "experiments": [
             {"value": key, "label": label}
             for key, label in _GLASSES_EXPERIMENTS.items()
         ],
     })
+
+
+@app.post("/api/glasses/teacher/enroll")
+def glasses_teacher_enroll():
+    try:
+        uploaded = request.files.get("audio")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "audio is required."}), 400
+
+        audio_bytes = uploaded.read()
+        if not audio_bytes:
+            return jsonify({"error": "audio is empty."}), 400
+
+        model_path = _teacher_embedding_model_path()
+        from pipeline.speaker_verify.compare import compare_speakers
+
+        # Self-compare once to validate that the reference clip contains speech
+        # and that the speaker embedding model can load before entering the loop.
+        result = compare_speakers(
+            audio_bytes,
+            audio_bytes,
+            embedding_model=model_path,
+            min_speech_ms=_TEACHER_SPEAKER_MIN_SPEECH_MS,
+            same_threshold=_TEACHER_SPEAKER_THRESHOLD,
+            uncertain_threshold=_TEACHER_SPEAKER_THRESHOLD,
+        )
+        if result.decision in {"no_speech", "too_short", "bad_reference"}:
+            return jsonify({
+                "ok": False,
+                "error": result.message or result.decision,
+                "decision": result.to_dict(),
+            }), 400
+
+        global _teacher_reference_audio, _teacher_reference_created_at
+        with _teacher_speaker_lock:
+            _teacher_reference_audio = audio_bytes
+            _teacher_reference_created_at = time.time()
+
+        return jsonify({
+            "ok": True,
+            "message": "teacher reference enrolled",
+            "threshold": _TEACHER_SPEAKER_THRESHOLD,
+            "decision": result.to_dict(),
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Teacher enroll failed: {exc}"}), 500
+
+
+@app.post("/api/glasses/teacher/verify")
+def glasses_teacher_verify():
+    try:
+        uploaded = request.files.get("audio")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "audio is required."}), 400
+
+        query_bytes = uploaded.read()
+        if not query_bytes:
+            return jsonify({"error": "audio is empty."}), 400
+
+        with _teacher_speaker_lock:
+            reference_bytes = _teacher_reference_audio
+            enrolled_at = _teacher_reference_created_at
+        if reference_bytes is None:
+            return jsonify({"error": "teacher reference is not enrolled."}), 409
+
+        threshold = float(request.form.get("threshold", str(_TEACHER_SPEAKER_THRESHOLD)))
+        model_path = _teacher_embedding_model_path()
+        from pipeline.speaker_verify.compare import compare_speakers
+
+        result = compare_speakers(
+            reference_bytes,
+            query_bytes,
+            embedding_model=model_path,
+            min_speech_ms=_TEACHER_SPEAKER_MIN_SPEECH_MS,
+            same_threshold=threshold,
+            uncertain_threshold=max(0.0, threshold - 0.08),
+        )
+        return jsonify({
+            "match": result.decision == "same_speaker",
+            "threshold": threshold,
+            "enrolled_at": enrolled_at,
+            **result.to_dict(),
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Teacher verify failed: {exc}"}), 500
 
 
 @app.get("/api/glasses/demo/videos")
@@ -264,6 +368,57 @@ def glasses_voice_intent():
         return jsonify({"error": f"Voice intent failed: {exc}"}), 500
 
 
+@app.post("/api/glasses/overlay-test")
+def glasses_overlay_test():
+    try:
+        uploaded = request.files.get("image")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Missing image file."}), 400
+
+        image_bytes = uploaded.read()
+        if not image_bytes:
+            return jsonify({"error": "Uploaded image is empty."}), 400
+
+        experiment_type = request.form.get("experiment_type", "other").strip() or "other"
+        cfg = get_experiment_config(experiment_type)
+        if cfg is None:
+            return jsonify({"error": f"Unknown experiment_type: {experiment_type}"}), 400
+
+        component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
+        components = list(getattr(cfg, "COMPONENTS", []))
+        if not component_labels or not components:
+            return jsonify({"error": f"{experiment_type} is missing component config."}), 400
+
+        image = decode_image(image_bytes)
+        cv_params = CVDetectionParams(
+            max_side=1600,
+            lowe_ratio=0.75,
+            min_good_matches=3,
+            min_inliers=2,
+            min_inlier_ratio=0.08,
+            top_k_per_label=6,
+            overlap_weight=0.75,
+            feature="akaze",
+            component_labels=component_labels,
+        )
+        from pipeline.common.cv_wrapper import detect_wrong_image, annotate_image, encode_annotated_image
+
+        result = detect_wrong_image(image, cv_params)
+        image_size = {"width": int(image.shape[1]), "height": int(image.shape[0])}
+        overlay_boxes = _build_overlay_boxes(result, components, image_size)
+        preview_data_url = encode_annotated_image(annotate_image(image, result))
+
+        return jsonify({
+            "experiment_type": experiment_type,
+            "overlay_image_size": image_size,
+            "overlay_boxes": overlay_boxes,
+            "preview_data_url": preview_data_url,
+            "message": "Overlay test detection finished.",
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Overlay test failed: {exc}"}), 500
+
+
 @app.post("/api/glasses/jobs")
 def create_glasses_job():
     _cleanup_glasses_jobs()
@@ -313,6 +468,8 @@ def get_glasses_job(job_id: str):
             "stage": "done",
             "message": "Job not found or expired.",
             "preview_data_url": None,
+            "overlay_image_size": None,
+            "overlay_boxes": [],
             "result": None,
             "error": "Job not found or expired.",
         }), 404
@@ -678,6 +835,8 @@ def _submit_glasses_job(
             "stage": "upload",
             "message": "Job queued.",
             "preview_data_url": None,
+            "overlay_image_size": None,
+            "overlay_boxes": [],
             "result": None,
             "error": None,
             "created_at": now,
@@ -716,6 +875,8 @@ def _snapshot_glasses_job(job_id: str) -> dict[str, Any] | None:
             "stage": "done",
             "message": "Job expired.",
             "preview_data_url": None,
+            "overlay_image_size": None,
+            "overlay_boxes": [],
             "result": None,
             "error": "Job expired.",
         })
@@ -726,6 +887,8 @@ def _snapshot_glasses_job(job_id: str) -> dict[str, Any] | None:
         "stage": snapshot.get("stage", "done"),
         "message": snapshot.get("message", ""),
         "preview_data_url": snapshot.get("preview_data_url"),
+        "overlay_image_size": snapshot.get("overlay_image_size"),
+        "overlay_boxes": snapshot.get("overlay_boxes", []),
         "result": snapshot.get("result"),
         "error": snapshot.get("error"),
     }
@@ -957,6 +1120,11 @@ def _run_glasses_experiment_job(
 
         wrong_annotated = annotate_image(wrong_image, wrong_result)
         preview_data_url = encode_annotated_image(wrong_annotated)
+        overlay_image_size = {
+            "width": int(wrong_image.shape[1]),
+            "height": int(wrong_image.shape[0]),
+        }
+        overlay_boxes = _build_overlay_boxes(wrong_result, components, overlay_image_size)
         label_summary = _build_label_summary_from_results(correct_result, wrong_result, components)
         cv_summary = build_cv_structured_summary(
             label_summary,
@@ -970,6 +1138,8 @@ def _run_glasses_experiment_job(
         stage="vlm",
         message="Analyzing experiment image.",
         preview_data_url=preview_data_url,
+        overlay_image_size=overlay_image_size,
+        overlay_boxes=overlay_boxes,
     )
     from pipeline.approach_a.pipeline_a import run_pipeline_a
     with StepTimer(timing, "vlm"):
@@ -1036,6 +1206,45 @@ def _summarize_electrolysis_retrieval(retrieved: dict[str, Any]) -> dict[str, An
     return summary
 
 
+def _build_overlay_boxes(
+    detection_result: dict[str, Any],
+    components: list[dict[str, Any]],
+    image_size: dict[str, int],
+) -> list[dict[str, Any]]:
+    width = max(1, int(image_size.get("width", 1)))
+    height = max(1, int(image_size.get("height", 1)))
+    component_by_label = {str(item.get("label", "")): item for item in components}
+    boxes = detection_result.get("boxes", {}) or {}
+    detections = detection_result.get("detections", {}) or {}
+    overlay: list[dict[str, Any]] = []
+
+    for label, raw_box in boxes.items():
+        if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [float(v) for v in raw_box]
+        except (TypeError, ValueError):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        comp = component_by_label.get(str(label), {})
+        detection = detections.get(label, {}) if isinstance(detections, dict) else {}
+        overlay.append({
+            "label": str(label),
+            "name": str(comp.get("name", label)),
+            "color": str(comp.get("color", "#FFD54F")),
+            "box": [
+                round(max(0.0, min(1.0, x1 / width)), 6),
+                round(max(0.0, min(1.0, y1 / height)), 6),
+                round(max(0.0, min(1.0, x2 / width)), 6),
+                round(max(0.0, min(1.0, y2 / height)), 6),
+            ],
+            "score": detection.get("score") if isinstance(detection, dict) else None,
+        })
+    return overlay
+
+
 def _load_experiment_ui_config() -> dict[str, dict]:
     if not EXPERIMENT_UI_CONFIG_PATH.exists():
         return {}
@@ -1093,6 +1302,17 @@ def _resolve_demo_video(video_id: str) -> Path | None:
                 path = Path(item["path"])
                 return path if path.exists() and path.suffix.lower() == ".mp4" else None
     return None
+
+
+def _teacher_embedding_model_path() -> Path:
+    raw = os.getenv("SPEAKER_VERIFY_EMBEDDING_MODEL", "").strip()
+    path = Path(raw) if raw else _TEACHER_DEFAULT_EMBEDDING_MODEL
+    if not path.exists():
+        raise FileNotFoundError(
+            "声纹模型不存在。请设置 SPEAKER_VERIFY_EMBEDDING_MODEL，"
+            f"当前路径: {path}"
+        )
+    return path
 
 
 def _demo_video_id(experiment_type: str, path: Path) -> str:

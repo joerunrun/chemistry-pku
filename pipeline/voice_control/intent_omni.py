@@ -22,6 +22,7 @@ SUPPORTED_INTENTS = {
     "start_recording",
     "stop_recording",
     "capture_photo",
+    "overlay_test",
     "experiment_check",
     "safety_check",
     "select_experiment",
@@ -44,6 +45,7 @@ SYSTEM_INSTRUCTIONS = """你是智能眼镜的语音指令解析器。
 - start_recording: 用户要求开始记录、开始录像、开始录制实验过程
 - stop_recording: 用户要求结束记录、结束录像、停止录制并保存
 - capture_photo: 用户要求拍照、拍一张照片、保存照片
+- overlay_test: 用户要求投影测试、框测试、透明框叠加测试、检测框投到实物上
 - experiment_check: 用户要求实验纠错、检查实验装置、装置检测，但还没有明确实验类型
 - safety_check: 用户要求安全检查、检查安全问题、检查安全隐患
 - select_experiment: 用户选择实验类型
@@ -168,6 +170,13 @@ def classify_audio_intent(
             raise AliyunError(callback.error)
 
         result = _parse_intent_json(callback.answer_text, callback.transcript)
+        if (context or "").strip() == "recording_stop_only" and result.get("intent") != "stop_recording":
+            result = _safe_intent(
+                str(result.get("transcript") or callback.transcript or ""),
+                "unknown",
+                "",
+                0.5,
+            )
         result["timings"] = {
             "omni": round((time.perf_counter() - model_started_at) * 1000, 1),
             "total": round((time.perf_counter() - started_at) * 1000, 1),
@@ -265,6 +274,8 @@ def _fallback_from_transcript(transcript: str) -> dict[str, Any]:
         )
     if any(word in normalized for word in ("演示指引", "播放演示", "看演示", "看视频", "操作视频")):
         return _safe_intent(normalized, "demo_guide", "进入演示指引。", 0.7)
+    if any(word in normalized for word in ("投影测试", "框测试", "叠加测试", "检测框测试", "实物叠加", "透明框")):
+        return _safe_intent(normalized, "overlay_test", "开始投影测试，请保持目标在视野中央。", 0.7)
     if any(word in normalized for word in ("开始记录", "开始录像", "开始录制")):
         return _safe_intent(normalized, "start_recording", "开始记录。", 0.7)
     if any(word in normalized for word in ("结束记录", "停止记录", "结束录像", "停止录像", "保存录像")):
@@ -360,6 +371,8 @@ def _default_reply(intent: str, slots: dict[str, Any]) -> str:
         return "结束记录。"
     if intent == "capture_photo":
         return "开始拍照。"
+    if intent == "overlay_test":
+        return "开始投影测试，请保持目标在视野中央。"
     if intent == "experiment_check":
         return "开始实验纠错，请说实验名称。"
     if intent == "safety_check":

@@ -45,6 +45,10 @@ COMPONENTS: list[dict[str, str]] = [
     {"label": "receiving_assembly", "name": "receiving_assembly", "color": "#ff7f27"},
     {"label": "vacuum_gauge", "name": "vacuum_gauge", "color": "#a349a4"},
     {"label": "light_spot", "name": "light_spot", "color": "#ff0000"},
+    {"label": "object_a", "name": "测试物体A", "color": "#ff3b30"},
+    {"label": "object_b", "name": "测试物体B", "color": "#34c759"},
+    {"label": "object_c", "name": "测试物体C", "color": "#007aff"},
+    {"label": "object_d", "name": "测试物体D", "color": "#ffcc00"},
 ]
 
 COMPONENT_LABELS = [item["label"] for item in COMPONENTS]
@@ -57,6 +61,10 @@ COLOR_BGR = {
     "receiving_assembly": (39, 127, 255),
     "vacuum_gauge": (164, 73, 163),
     "light_spot": (0, 0, 255),
+    "object_a": (48, 59, 255),
+    "object_b": (89, 199, 52),
+    "object_c": (255, 122, 0),
+    "object_d": (0, 204, 255),
 }
 
 

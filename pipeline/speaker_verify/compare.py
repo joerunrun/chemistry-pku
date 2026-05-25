@@ -99,7 +99,7 @@ def compare_speakers(
             bank_score=0.0,
             message="No speech was detected in query audio.",
         )
-    if query_speech_ms < MIN_SPEECH_MS:
+    if query_speech_ms < min_speech_ms:
         return SpeakerCompareResult(
             decision="too_short",
             score=0.0,

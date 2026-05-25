@@ -1,13 +1,15 @@
-"""实验配置注册中心。每个实验一个 .py 文件，通过 get_experiment_config(name) 获取。"""
+"""Experiment config registry."""
 from __future__ import annotations
 
-from pipeline.experiments import distillation, photometer
+from pipeline.experiments import distillation, other, photometer
 
 _REGISTRY = {
     "distillation": distillation,
     "photometer": photometer,
+    "other": other,
 }
 
+
 def get_experiment_config(name: str):
-    """返回实验配置模块。name 不存在时返回 None。"""
+    """Return an experiment config module, or None when the name is unknown."""
     return _REGISTRY.get(name)
