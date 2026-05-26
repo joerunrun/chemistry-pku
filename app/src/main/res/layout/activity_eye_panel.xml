@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content"
+    android:layout_height="match_parent"
     android:gravity="center_horizontal"
     android:orientation="vertical"
     android:paddingStart="28dp"
@@ -60,16 +60,30 @@
             android:textSize="20sp" />
     </LinearLayout>
 
-    <ImageView
-        android:id="@+id/detection_preview"
+    <FrameLayout
+        android:id="@+id/detection_overlay_container"
         android:layout_width="match_parent"
-        android:layout_height="220dp"
+        android:layout_height="260dp"
         android:layout_marginTop="18dp"
-        android:adjustViewBounds="true"
-        android:background="#151618"
-        android:contentDescription="检测框预览"
-        android:scaleType="centerInside"
-        android:visibility="gone" />
+        android:background="@android:color/transparent"
+        android:visibility="gone">
+
+        <ImageView
+            android:id="@+id/detection_preview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:adjustViewBounds="true"
+            android:background="#151618"
+            android:contentDescription="检测框预览"
+            android:scaleType="centerInside"
+            android:visibility="gone" />
+
+        <com.example.zrgfirstapp.DetectionOverlayView
+            android:id="@+id/detection_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone" />
+    </FrameLayout>
 
     <VideoView
         android:id="@+id/demo_video_view"

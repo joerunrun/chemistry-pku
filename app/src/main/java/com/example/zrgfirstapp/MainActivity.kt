@@ -22,11 +22,13 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Base64
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -38,6 +40,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.File
@@ -74,12 +77,14 @@ class MainActivity : AppCompatActivity() {
         EXPERIMENT,
         SAFETY,
         QA,
+        OVERLAY_TEST,
     }
 
     private enum class ExperimentType {
         DISTILLATION,
         PHOTOMETER,
         ELECTROLYSIS,
+        OTHER,
     }
 
     private enum class CameraPermissionAction {
@@ -102,7 +107,9 @@ class MainActivity : AppCompatActivity() {
         val optionsRow: LinearLayout,
         val primaryButton: Button,
         val secondaryButton: Button,
+        val detectionOverlayContainer: FrameLayout,
         val detectionPreview: ImageView,
+        val detectionOverlay: DetectionOverlayView,
         val demoVideoView: VideoView,
         val progress: ProgressBar,
         val thinkingText: TextView,
@@ -298,6 +305,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (BuildConfig.APP_MODE == "teacher") {
+            startActivity(Intent(this, TeacherActivity::class.java))
+            finish()
+            return
+        }
         enableEdgeToEdge()
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
@@ -335,7 +347,9 @@ class MainActivity : AppCompatActivity() {
             optionsRow = root.findViewById(R.id.options_row),
             primaryButton = root.findViewById(R.id.primary_button),
             secondaryButton = root.findViewById(R.id.secondary_button),
+            detectionOverlayContainer = root.findViewById(R.id.detection_overlay_container),
             detectionPreview = root.findViewById(R.id.detection_preview),
+            detectionOverlay = root.findViewById(R.id.detection_overlay),
             demoVideoView = root.findViewById(R.id.demo_video_view),
             progress = root.findViewById(R.id.progress),
             thinkingText = root.findViewById(R.id.thinking_text),
@@ -413,7 +427,7 @@ class MainActivity : AppCompatActivity() {
             )
 
             ScreenState.CAPTURE_COUNTDOWN -> renderProcessScreen(
-                title = "装置检测",
+                title = activeTaskTitle.ifBlank { "装置检测" },
                 subtitle = "准备拍照",
                 status = lastStatusText,
                 result = lastResultText,
@@ -465,15 +479,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderWelcomeScreen() {
-        setTransparentChrome(false)
+        setTransparentChrome(true)
         panels.forEach { panel ->
+            setPanelGravity(panel, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            panel.titleText.visibility = View.VISIBLE
+            panel.subtitleText.visibility = View.VISIBLE
             panel.titleText.text = "化学实验识别"
             panel.titleText.textSize = 30f
             panel.subtitleText.text = "智能眼镜实验辅助"
             panel.optionsRow.visibility = View.GONE
             panel.progress.visibility = View.VISIBLE
             panel.thinkingText.visibility = View.GONE
+            panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
+            panel.detectionOverlay.clearBoxes()
             panel.demoVideoView.visibility = View.GONE
             panel.statusText.text = ""
             panel.resultText.text = "实验纠错  |  语音问答"
@@ -484,13 +503,19 @@ class MainActivity : AppCompatActivity() {
         stopThinking()
         setTransparentChrome(true)
         panels.forEach { panel ->
+            setPanelGravity(panel, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
             panel.titleText.textSize = 18f
-            panel.titleText.text = "助手就绪"
+            panel.titleText.text = ""
+            panel.titleText.visibility = View.GONE
             panel.subtitleText.text = ""
+            panel.subtitleText.visibility = View.GONE
             panel.optionsRow.visibility = View.GONE
             panel.progress.visibility = View.GONE
             panel.thinkingText.visibility = View.GONE
+            panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
+            panel.detectionOverlay.clearBoxes()
+            panel.statusText.visibility = View.GONE
             panel.statusText.text = ""
             panel.resultText.text = ""
             panel.resultText.visibility = View.GONE
@@ -506,8 +531,11 @@ class MainActivity : AppCompatActivity() {
         result: String,
     ) {
         stopThinking()
-        setTransparentChrome(false)
+        setTransparentChrome(true)
         panels.forEach { panel ->
+            setPanelGravity(panel, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            panel.titleText.visibility = View.VISIBLE
+            panel.subtitleText.visibility = View.VISIBLE
             panel.titleText.textSize = 26f
             panel.titleText.text = title
             panel.subtitleText.text = subtitle
@@ -522,7 +550,9 @@ class MainActivity : AppCompatActivity() {
             panel.secondaryButton.alpha = if (focusIndex == 1) 1.0f else 0.62f
             panel.progress.visibility = View.GONE
             panel.thinkingText.visibility = View.GONE
+            panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
+            panel.detectionOverlay.clearBoxes()
             panel.demoVideoView.visibility = View.GONE
             panel.statusText.text = status
             panel.resultText.visibility = View.VISIBLE
@@ -537,8 +567,11 @@ class MainActivity : AppCompatActivity() {
         result: String,
         running: Boolean,
     ) {
-        setTransparentChrome(false)
+        setTransparentChrome(true)
         panels.forEach { panel ->
+            setPanelGravity(panel, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            panel.titleText.visibility = View.VISIBLE
+            panel.subtitleText.visibility = View.VISIBLE
             panel.titleText.textSize = 26f
             panel.titleText.text = title
             panel.subtitleText.text = subtitle
@@ -546,7 +579,9 @@ class MainActivity : AppCompatActivity() {
             panel.primaryButton.alpha = 1.0f
             panel.secondaryButton.alpha = 1.0f
             panel.demoVideoView.visibility = View.GONE
-            panel.progress.visibility = if (running && panel.detectionPreview.visibility != View.VISIBLE) {
+            val hasDetectionView = panel.detectionPreview.visibility == View.VISIBLE ||
+                panel.detectionOverlay.visibility == View.VISIBLE
+            panel.progress.visibility = if (running && !hasDetectionView) {
                 View.VISIBLE
             } else {
                 View.GONE
@@ -573,14 +608,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun setPanelGravity(panel: EyePanel, gravity: Int) {
+        (panel.root as? LinearLayout)?.gravity = gravity
+    }
+
     private fun selectedTitle(): String {
         return when (selectedMode) {
             Mode.SAFETY -> "安全检查"
             Mode.QA -> "语音问答"
+            Mode.OVERLAY_TEST -> "投影测试"
             Mode.EXPERIMENT -> when (selectedExperimentType) {
                 ExperimentType.DISTILLATION -> "减压蒸馏纠错"
                 ExperimentType.PHOTOMETER -> "光度计纠错"
                 ExperimentType.ELECTROLYSIS -> "电解纠错"
+                ExperimentType.OTHER -> "其它测试"
             }
         }
     }
@@ -589,6 +630,7 @@ class MainActivity : AppCompatActivity() {
         val selection = when (selectedMode) {
             Mode.SAFETY -> "当前模式：安全检查"
             Mode.QA -> "当前模式：语音问答"
+            Mode.OVERLAY_TEST -> "当前模式：投影测试"
             Mode.EXPERIMENT -> "当前实验：${experimentLabel()}"
         }
         return "$selection\n${recordingSummary()}\n连接方式：$connectionLabel"
@@ -607,6 +649,7 @@ class MainActivity : AppCompatActivity() {
             ExperimentType.DISTILLATION -> "减压蒸馏"
             ExperimentType.PHOTOMETER -> "光度计"
             ExperimentType.ELECTROLYSIS -> "电解"
+            ExperimentType.OTHER -> "其它测试"
         }
     }
 
@@ -817,6 +860,8 @@ class MainActivity : AppCompatActivity() {
         panels.forEach { panel ->
             panel.detectionPreview.setImageDrawable(null)
             panel.detectionPreview.visibility = View.GONE
+            panel.detectionOverlay.clearBoxes()
+            panel.detectionOverlayContainer.visibility = View.GONE
             panel.demoVideoView.stopPlayback()
             panel.demoVideoView.visibility = View.GONE
         }
@@ -939,15 +984,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderDemoPlayingScreen() {
         stopThinking()
-        setTransparentChrome(false)
+        setTransparentChrome(true)
         panels.forEach { panel ->
+            setPanelGravity(panel, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            panel.titleText.visibility = View.VISIBLE
+            panel.subtitleText.visibility = View.VISIBLE
             panel.titleText.textSize = 22f
             panel.titleText.text = "演示指引"
             panel.subtitleText.text = activeDemoVideo?.label ?: "正在播放"
             panel.optionsRow.visibility = View.GONE
             panel.progress.visibility = View.GONE
             panel.thinkingText.visibility = View.GONE
+            panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
+            panel.detectionOverlay.clearBoxes()
             panel.demoVideoView.visibility = View.VISIBLE
             panel.statusText.text = "说“停止播放”可退出"
             panel.resultText.visibility = View.GONE
@@ -1097,6 +1147,7 @@ class MainActivity : AppCompatActivity() {
         }
         val token = operationToken
         val returnState = screenState
+        val stopOnlyMode = recordingRequested
         voiceReturnState = returnState
         val minBufferSize = AudioRecord.getMinBufferSize(
             qaSampleRate,
@@ -1160,14 +1211,16 @@ class MainActivity : AppCompatActivity() {
                     averageRms >= voiceIntentMinRms * 0.45
                 if (token == operationToken && hasSpeech) {
                     submitted = true
-                    runOnUiIfCurrent(token) {
-                        activeTaskTitle = "Voice control"
-                        lastStatusText = "Understanding command"
-                        lastResultText = ""
-                        screenState = ScreenState.VOICE_LISTENING
-                        renderScreen()
+                    if (!stopOnlyMode) {
+                        runOnUiIfCurrent(token) {
+                            activeTaskTitle = "Voice control"
+                            lastStatusText = "Understanding command"
+                            lastResultText = ""
+                            screenState = ScreenState.VOICE_LISTENING
+                            renderScreen()
+                        }
                     }
-                    submitVoiceIntent(outputFile, token)
+                    submitVoiceIntent(outputFile, token, stopOnlyMode)
                 } else if (token == operationToken) {
                     mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
                 }
@@ -1222,31 +1275,49 @@ class MainActivity : AppCompatActivity() {
         return if (count > 0) Math.sqrt(sum / count.toDouble()) else 0.0
     }
 
-    private fun submitVoiceIntent(file: File, token: Int) {
+    private fun submitVoiceIntent(file: File, token: Int, stopOnlyMode: Boolean = false) {
         Thread {
             try {
                 val json = postMultipart(
                     "$baseUrl/api/glasses/voice/intent",
                     mapOf(
                         "model" to "qwen3.5-omni-plus-realtime",
-                        "context" to voiceContextValue(),
+                        "context" to if (stopOnlyMode) "recording_stop_only" else voiceContextValue(),
                     ),
                     "audio",
                     file,
                     "application/octet-stream",
                 )
                 runOnUiIfCurrent(token) {
-                    handleVoiceIntent(json)
+                    if (stopOnlyMode) {
+                        handleRecordingStopIntent(json)
+                    } else {
+                        handleVoiceIntent(json)
+                    }
                 }
             } catch (_: Exception) {
                 runOnUiIfCurrent(token) {
-                    playPrompt("unclear")
-                    enterLiveMinimal()
+                    if (stopOnlyMode) {
+                        mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
+                    } else {
+                        playPrompt("unclear")
+                        enterLiveMinimal()
+                    }
                 }
             } finally {
                 file.delete()
             }
         }.start()
+    }
+
+    private fun handleRecordingStopIntent(json: JSONObject) {
+        val intent = json.optString("intent", "unclear")
+        if (intent == "stop_recording") {
+            stopRecordingService()
+            enterLiveMinimal()
+        } else if (screenState.allowsVoiceIntent()) {
+            mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
+        }
     }
 
     private fun handleVoiceIntent(json: JSONObject) {
@@ -1264,6 +1335,9 @@ class MainActivity : AppCompatActivity() {
             }
             "capture_photo" -> {
                 startCaptureCountdown()
+            }
+            "overlay_test" -> {
+                startOverlayTestCountdown()
             }
             "safety_check" -> {
                 selectedMode = Mode.SAFETY
@@ -1807,8 +1881,12 @@ class MainActivity : AppCompatActivity() {
         val token = operationToken + 1
         operationToken = token
         clearTaskOutput()
-        activeTaskTitle = "装置检测"
-        lastStatusText = "请保持装置在视野中央"
+        activeTaskTitle = if (selectedMode == Mode.OVERLAY_TEST) "投影测试" else "装置检测"
+        lastStatusText = if (selectedMode == Mode.OVERLAY_TEST) {
+            "请保持目标在视野中央"
+        } else {
+            "请保持装置在视野中央"
+        }
         lastResultText = "即将自动拍照"
         screenState = ScreenState.CAPTURE_COUNTDOWN
         renderScreen()
@@ -1820,10 +1898,21 @@ class MainActivity : AppCompatActivity() {
         }, captureCountdownMs)
     }
 
+    private fun startOverlayTestCountdown() {
+        selectedMode = Mode.OVERLAY_TEST
+        selectedExperimentType = ExperimentType.OTHER
+        startCaptureCountdown()
+    }
+
     private fun startCaptureFlow() {
         clearTaskOutput()
-        activeTaskTitle = "装置检测"
-        startRunning("正在观察装置...", "")
+        activeTaskTitle = if (selectedMode == Mode.OVERLAY_TEST) "投影测试" else "装置检测"
+        val status = if (selectedMode == Mode.OVERLAY_TEST) {
+            "正在检测投影框..."
+        } else {
+            "正在观察装置..."
+        }
+        startRunning(status, "")
         ensureCameraPermission(CameraPermissionAction.CAPTURE)
     }
 
@@ -1904,6 +1993,8 @@ class MainActivity : AppCompatActivity() {
                 cleanupCaptureOnly()
                 if (error != null || file == null) {
                     showResult("无法抓取当前画面：${error?.message ?: "未知错误"}", "拍照失败")
+                } else if (selectedMode == Mode.OVERLAY_TEST) {
+                    submitOverlayTest(file)
                 } else {
                     submitImage(file)
                 }
@@ -1977,6 +2068,35 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private fun submitOverlayTest(file: File) {
+        val token = startRunning("正在计算叠加框...", "")
+        Thread {
+            try {
+                val json = postMultipart(
+                    "$baseUrl/api/glasses/overlay-test",
+                    mapOf("experiment_type" to "other"),
+                    "image",
+                    file,
+                )
+                val boxes = json.optJSONArray("overlay_boxes")
+                runOnUiIfCurrent(token) {
+                    val overlayShown = showOverlayBoxes(boxes)
+                    if (overlayShown) {
+                        showResult("已显示透明叠加框。请保持头部稳定。", "投影测试完成")
+                    } else {
+                        showResult("未检测到可叠加框。请确认已用“其它测试标签”标注参考图。", "未检测到框")
+                    }
+                }
+            } catch (exc: Exception) {
+                runOnUiIfCurrent(token) {
+                    showResult(exc.message ?: "投影测试失败", "投影测试失败")
+                }
+            } finally {
+                file.delete()
+            }
+        }.start()
+    }
+
     private fun pollJob(url: String, token: Int) {
         val deadline = System.currentTimeMillis() + 180_000L
         while (System.currentTimeMillis() < deadline && token == operationToken) {
@@ -1986,12 +2106,17 @@ class MainActivity : AppCompatActivity() {
                 val stage = json.optString("stage", "")
                 val message = json.optString("message", "")
                 val previewDataUrl = json.optString("preview_data_url", "")
+                val overlayBoxes = json.optJSONArray("overlay_boxes")
 
                 runOnUiIfCurrent(token) {
-                    if (previewDataUrl.isNotBlank() && previewDataUrl != "null") {
+                    val overlayShown = showOverlayBoxes(overlayBoxes)
+                    if (!overlayShown && !shouldUseWorldOverlay() && previewDataUrl.isNotBlank() && previewDataUrl != "null") {
                         showPreview(previewDataUrl)
                     }
-                    val hasPreview = panels.any { it.detectionPreview.visibility == View.VISIBLE }
+                    val hasPreview = panels.any {
+                        it.detectionPreview.visibility == View.VISIBLE ||
+                            it.detectionOverlay.visibility == View.VISIBLE
+                    }
                     lastStatusText = fieldFriendlyStatus(stage, message, hasPreview, status)
                     renderScreen()
                 }
@@ -2066,7 +2191,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectedModeValue(): String {
-        return if (selectedMode == Mode.SAFETY) "safety" else "experiment"
+        return when (selectedMode) {
+            Mode.SAFETY -> "safety"
+            Mode.OVERLAY_TEST -> "overlay_test"
+            else -> "experiment"
+        }
+    }
+
+    private fun shouldUseWorldOverlay(): Boolean {
+        return selectedMode == Mode.OVERLAY_TEST || selectedMode == Mode.EXPERIMENT
     }
 
     private fun selectedExperimentTypeValue(): String {
@@ -2074,6 +2207,7 @@ class MainActivity : AppCompatActivity() {
             ExperimentType.DISTILLATION -> "distillation"
             ExperimentType.PHOTOMETER -> "photometer"
             ExperimentType.ELECTROLYSIS -> "electrolysis"
+            ExperimentType.OTHER -> "other"
         }
     }
 
@@ -2109,6 +2243,8 @@ class MainActivity : AppCompatActivity() {
             val bytes = Base64.decode(base64Text, Base64.DEFAULT)
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
             panels.forEach { panel ->
+                panel.detectionOverlayContainer.visibility = View.VISIBLE
+                panel.detectionOverlay.clearBoxes()
                 panel.detectionPreview.setImageBitmap(bitmap)
                 panel.detectionPreview.visibility = View.VISIBLE
                 panel.progress.visibility = View.GONE
@@ -2117,6 +2253,20 @@ class MainActivity : AppCompatActivity() {
         } catch (_: IllegalArgumentException) {
             // Ignore malformed preview payloads; final text result can still arrive.
         }
+    }
+
+    private fun showOverlayBoxes(boxes: JSONArray?): Boolean {
+        if (boxes == null || boxes.length() == 0) {
+            return false
+        }
+        panels.forEach { panel ->
+            panel.detectionOverlayContainer.visibility = View.VISIBLE
+            panel.detectionPreview.setImageDrawable(null)
+            panel.detectionPreview.visibility = View.GONE
+            panel.detectionOverlay.setBoxes(boxes)
+            panel.progress.visibility = View.GONE
+        }
+        return true
     }
 
     override fun onStop() {

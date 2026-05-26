@@ -53,6 +53,13 @@
             android:foregroundServiceType="camera|microphone" />
 
         <activity
+            android:name=".TeacherActivity"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.Zrgfirstapp" />
+
+        <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"

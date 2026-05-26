@@ -20,6 +20,20 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    flavorDimensions += "role"
+    productFlavors {
+        create("student") {
+            dimension = "role"
+            buildConfigField("String", "APP_MODE", "\"student\"")
+        }
+        create("teacher") {
+            dimension = "role"
+            applicationIdSuffix = ".teacher"
+            versionNameSuffix = "-teacher"
+            buildConfigField("String", "APP_MODE", "\"teacher\"")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -34,6 +48,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
     buildFeatures {
+        buildConfig = true
         viewBinding = true
     }
 }
