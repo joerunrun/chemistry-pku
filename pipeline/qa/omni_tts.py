@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 from dataclasses import replace
 import io
@@ -23,6 +24,7 @@ SAMPLE_RATE = 24_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
 DEFAULT_GAIN = 3.0
+DEFAULT_TTS_MODEL = "qwen3.5-omni-plus-realtime"
 
 
 class OmniTTSCallback(OmniRealtimeCallback):
@@ -105,8 +107,8 @@ def synthesize_text_to_audio(
         raise ValueError("text is empty")
 
     config = load_omni_config()
-    if model:
-        config = replace(config, model=model)
+    tts_model = model or os.getenv("OMNI_TTS_MODEL", DEFAULT_TTS_MODEL).strip() or DEFAULT_TTS_MODEL
+    config = replace(config, model=tts_model)
     if timeout_seconds is not None:
         config = replace(config, timeout_seconds=timeout_seconds)
 
@@ -131,8 +133,20 @@ def synthesize_text_to_audio(
                 "请只自然朗读用户给出的内容，不要添加解释、前后缀或口头禅。"
             ),
         )
+        conv.send_raw(json.dumps({
+            "event_id": f"event_tts_text_{int(time.time() * 1000)}",
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": f"请只朗读下面这段中文，不要回答，不要翻译，不要添加任何内容：\n{cleaned}",
+                }],
+            },
+        }, ensure_ascii=False))
         conv.create_response(
-            instructions=f"请用清晰、平稳、简短的中文播报下面内容：\n{cleaned}",
+            instructions="只朗读用户消息中给出的中文内容，不要解释，不要添加其它文字。",
             output_modalities=[MultiModality.AUDIO, MultiModality.TEXT],
         )
 

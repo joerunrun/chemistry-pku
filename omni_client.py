@@ -37,7 +37,7 @@ def load_omni_config(require_api_key: bool = True) -> OmniConfig:
     ali_cfg = load_aliyun_config(require_api_key=False)
     return OmniConfig(
         api_key=api_key,
-        model=os.getenv("OMNI_MODEL", "qwen3.5-omni-plus-realtime").strip(),
+        model=os.getenv("OMNI_MODEL", "qwen3.5-omni-flash-realtime").strip(),
         url=os.getenv(
             "OMNI_REALTIME_URL", "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
         ).strip(),

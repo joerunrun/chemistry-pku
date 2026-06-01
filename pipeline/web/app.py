@@ -347,7 +347,7 @@ def glasses_voice_intent():
         if not audio_bytes:
             return jsonify({"error": "audio is empty."}), 400
 
-        model = request.form.get("model", "qwen3.5-omni-plus-realtime").strip()
+        model = request.form.get("model", "qwen3.5-omni-flash-realtime").strip()
         context = request.form.get("context", "").strip() or None
         timeout_raw = request.form.get("timeout_seconds", "").strip()
         timeout_seconds = int(timeout_raw) if timeout_raw else None
@@ -957,8 +957,8 @@ def _attach_analysis_audio(job_id: str, result: dict[str, Any]) -> None:
     try:
         from pipeline.qa.omni_tts import synthesize_text_to_audio
 
-        tts_text = analysis_text[:220]
-        audio = synthesize_text_to_audio(tts_text)
+        tts_text = analysis_text[:160]
+        audio = synthesize_text_to_audio(tts_text, timeout_seconds=8)
         result["analysis_audio_data_url"] = audio.get("audio_data_url")
         if isinstance(timings, dict):
             timings.update(audio.get("timings", {}))

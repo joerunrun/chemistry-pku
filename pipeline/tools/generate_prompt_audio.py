@@ -12,14 +12,9 @@ from pipeline.qa.omni_tts import synthesize_text_to_audio
 
 
 PROMPTS = {
-    "assistant_ready": "助手就绪，请说指令。",
-    "ask_experiment": "进入实验纠错，请选择具体要纠正的实验。",
-    "start_safety": "开始安全检查，请保持装置在视野中央。",
-    "start_capture": "开始拍照，请保持画面稳定。",
-    "unclear": "我没有听清，请再说一遍。",
-    "qa_start": "请开始提问。",
-    "recording_start": "开始记录。",
-    "recording_stop": "记录已停止。",
+
+"tail":"We look forward to seeing these smart glasses play a greater role in chemistry education."
+
 }
 def default_output_dir() -> Path:
     return Path(r"D:\Android\projects\app\src\main\res\raw")
