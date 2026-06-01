@@ -12,9 +12,11 @@ from typing import Any
 import cv2
 import numpy as np
 
+from pipeline.resource_paths import preferred_runtime_dir
+
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = preferred_runtime_dir("cv_detection2_data", BASE_DIR / "data")
 IMAGES_DIR = DATA_DIR / "images"
 ANNOTATIONS_PATH = DATA_DIR / "annotations.json"
 DB_JSON_PATH = DATA_DIR / "descriptor_db.json"

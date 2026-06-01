@@ -10,8 +10,10 @@ from typing import Any
 import cv2
 import numpy as np
 
+from pipeline.resource_paths import preferred_runtime_dir
+
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
+DATA_DIR = preferred_runtime_dir("electrolysis_check_data", HERE / "data")
 FEATURES_NPZ = DATA_DIR / "features.npz"
 METADATA_JSON = DATA_DIR / "metadata.json"
 
@@ -158,7 +160,7 @@ def retrieve_pair(image_bytes: bytes, *, include_images: bool = True) -> dict[st
             results[label] = None
             continue
         score, match_count, sample = item
-        image_path = Path(sample["image_path"])
+        image_path = _resolve_sample_image_path(sample)
         image_jpeg = image_path.read_bytes() if include_images and image_path.exists() else b""
         results[label] = {
             "sample_id": sample["sample_id"],
@@ -185,3 +187,13 @@ def reload_db() -> None:
     _db = None
     _load_db()
     print(f"[electrolysis.retrieve] db reloaded: {_db[0]['sample_count']} samples")
+
+
+def _resolve_sample_image_path(sample: dict[str, Any]) -> Path:
+    label = str(sample.get("label", ""))
+    image_file = str(sample.get("image_file", ""))
+    if label and image_file:
+        runtime_path = DATA_DIR / "images" / label / image_file
+        if runtime_path.exists():
+            return runtime_path
+    return Path(str(sample.get("image_path", "")))

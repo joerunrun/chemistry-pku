@@ -31,6 +31,7 @@ from pipeline.common.cv_wrapper import (
 from pipeline.common.timing import StepTimer, TimingRecord
 from pipeline.common.vlm_client import DEFAULT_VLM_MODEL, DEFAULT_VLM_PROVIDER, PROVIDER_MODELS
 from pipeline.experiments import get_experiment_config
+from pipeline.resource_paths import runtime_asset_path
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
@@ -48,13 +49,12 @@ _GLASSES_EXPERIMENTS = {
     "electrolysis": "电解实验",
     "other": "其它测试",
 }
-_DEMO_VIDEO_DIRS = {
-    "distillation": Path(r"D:\chemistry\化小北实验测试数据\减压蒸馏"),
-}
+_DEMO_VIDEO_EXPERIMENTS = ("distillation",)
 _TEACHER_SPEAKER_THRESHOLD = 0.5
 _TEACHER_SPEAKER_MIN_SPEECH_MS = 200
-_TEACHER_DEFAULT_EMBEDDING_MODEL = Path(
-    r"D:\chemistry\speaker_verify_test\models\3dspeaker_speech_eres2net_base_200k_sv_zh-cn_16k-common.onnx"
+_TEACHER_DEFAULT_EMBEDDING_MODEL = runtime_asset_path(
+    "speaker_models",
+    "3dspeaker_speech_eres2net_base_200k_sv_zh-cn_16k-common.onnx",
 )
 _teacher_speaker_lock = Lock()
 _teacher_reference_audio: bytes | None = None
@@ -349,6 +349,7 @@ def glasses_voice_intent():
 
         model = request.form.get("model", "qwen3.5-omni-flash-realtime").strip()
         context = request.form.get("context", "").strip() or None
+        demo_options = request.form.get("demo_options", "").strip() or None
         timeout_raw = request.form.get("timeout_seconds", "").strip()
         timeout_seconds = int(timeout_raw) if timeout_raw else None
 
@@ -357,6 +358,7 @@ def glasses_voice_intent():
         result = classify_audio_intent(
             audio_bytes,
             context=context,
+            demo_options=demo_options,
             model=model or None,
             timeout_seconds=timeout_seconds,
         )
@@ -1262,7 +1264,10 @@ def _resolve_configured_image_path(ui_config: dict) -> Path:
     raw_path = str(ui_config.get("annotated_image_path", "")).strip()
     if not raw_path:
         raise FileNotFoundError("未配置 annotated_image_path。")
-    path = Path(raw_path)
+    if raw_path.startswith("assets://"):
+        path = runtime_asset_path(*[part for part in raw_path[len("assets://"):].split("/") if part])
+    else:
+        path = Path(raw_path)
     if not path.is_absolute():
         path = (EXPERIMENT_UI_CONFIG_PATH.parent / path).resolve()
     if not path.exists():
@@ -1278,17 +1283,17 @@ def _list_experiment_references(cfg):
 
 
 def _list_demo_videos(experiment_type: str) -> list[dict[str, str]]:
-    video_dir = _DEMO_VIDEO_DIRS.get(experiment_type)
-    if video_dir is None:
+    if experiment_type not in _DEMO_VIDEO_EXPERIMENTS:
         return []
+    video_dir = runtime_asset_path("demo_videos", experiment_type)
     if not video_dir.exists():
         raise ValueError(f"演示视频目录不存在: {video_dir}")
 
     videos = []
-    for path in sorted(video_dir.glob("*.mp4")):
+    for index, path in enumerate(sorted(video_dir.glob("*.mp4"), key=lambda item: item.name.lower()), start=1):
         videos.append({
             "id": _demo_video_id(experiment_type, path),
-            "label": _demo_video_label(path),
+            "label": _demo_video_label(index, path),
             "filename": path.name,
             "path": str(path),
         })
@@ -1296,7 +1301,7 @@ def _list_demo_videos(experiment_type: str) -> list[dict[str, str]]:
 
 
 def _resolve_demo_video(video_id: str) -> Path | None:
-    for experiment_type in _DEMO_VIDEO_DIRS:
+    for experiment_type in _DEMO_VIDEO_EXPERIMENTS:
         for item in _list_demo_videos(experiment_type):
             if item["id"] == video_id:
                 path = Path(item["path"])
@@ -1321,11 +1326,8 @@ def _demo_video_id(experiment_type: str, path: Path) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _demo_video_label(path: Path) -> str:
-    label = path.stem
-    label = label.split("_", 1)[1] if "_" in label else label
-    label = label.replace("减压蒸馏_", "").replace("_", " ")
-    return label.strip() or path.stem
+def _demo_video_label(index: int, path: Path) -> str:
+    return f"{index}. {path.name}"
 
 
 def _build_label_summary_from_results(correct_result, wrong_result, components):

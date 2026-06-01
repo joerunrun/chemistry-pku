@@ -13,8 +13,10 @@ from typing import Any
 import cv2
 import numpy as np
 
+from pipeline.resource_paths import preferred_runtime_dir
+
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
+DATA_DIR = preferred_runtime_dir("safety_check_data", HERE / "data")
 IMAGES_DIR = DATA_DIR / "images"
 FEATURES_NPZ = DATA_DIR / "features.npz"
 METADATA_JSON = DATA_DIR / "metadata.json"

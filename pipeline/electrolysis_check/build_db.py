@@ -10,8 +10,10 @@ import cv2
 import numpy as np
 import openpyxl
 
+from pipeline.resource_paths import preferred_runtime_dir
+
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
+DATA_DIR = preferred_runtime_dir("electrolysis_check_data", HERE / "data")
 FEATURES_NPZ = DATA_DIR / "features.npz"
 METADATA_JSON = DATA_DIR / "metadata.json"
 

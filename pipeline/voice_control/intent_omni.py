@@ -134,6 +134,7 @@ def classify_audio_intent(
     audio_bytes: bytes,
     *,
     context: str | None = None,
+    demo_options: str | None = None,
     model: str | None = None,
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
@@ -159,8 +160,15 @@ def classify_audio_intent(
     else:
         config = replace(config, timeout_seconds=8)
 
-    # 根据模式选择 prompt
-    system_prompt = SLEEP_MODE_PROMPT if is_sleep_mode else AWAKE_MODE_PROMPT
+    # Keep passive states narrow at both session and response levels. Otherwise
+    # the model still sees the full awake intent list and may emit unrelated
+    # intents such as qa while a video is playing.
+    if is_sleep_mode:
+        system_prompt = SLEEP_MODE_PROMPT
+    elif ctx in {"demo_playing", "recording_stop_only", "demo_select"}:
+        system_prompt = _build_response_instruction(ctx, demo_options=demo_options)
+    else:
+        system_prompt = AWAKE_MODE_PROMPT
     print(f"[voice_intent] 使用 prompt: {mode_name}_MODE_PROMPT")
 
     dashscope.api_key = config.api_key
@@ -189,7 +197,11 @@ def classify_audio_intent(
 
         model_started_at = time.perf_counter()
         conv.create_response(
-            instructions=_build_response_instruction(ctx, is_sleep_mode=is_sleep_mode),
+            instructions=_build_response_instruction(
+                ctx,
+                is_sleep_mode=is_sleep_mode,
+                demo_options=demo_options,
+            ),
             output_modalities=[MultiModality.TEXT],
         )
 
@@ -229,6 +241,13 @@ def classify_audio_intent(
             print(f"[voice_intent] 解析结果: wake={result.get('wake')}, transcript={result.get('transcript')!r}")
         else:
             result = _parse_intent_json(callback.answer_text, callback.transcript)
+            if ctx == "demo_playing" and result.get("intent") != "stop_demo_video":
+                result = _safe_intent(
+                    str(result.get("transcript") or callback.transcript or ""),
+                    "unknown",
+                    "",
+                    0.5,
+                )
             if ctx == "recording_stop_only" and result.get("intent") != "stop_recording":
                 result = _safe_intent(
                     str(result.get("transcript") or callback.transcript or ""),
@@ -248,15 +267,62 @@ def classify_audio_intent(
         conv.close()
 
 
-def _build_response_instruction(context: str | None, *, is_sleep_mode: bool = False) -> str:
+def _build_response_instruction(
+    context: str | None,
+    *,
+    is_sleep_mode: bool = False,
+    demo_options: str | None = None,
+) -> str:
     if is_sleep_mode:
-        return "只判断是否出现“小北助手”，输出严格 JSON。"
-    context_text = (context or "VOICE_IDLE").strip() or "VOICE_IDLE"
-    return (
-        f"当前眼镜状态: {context_text}\n"
-        "请根据用户语音输出严格 JSON。confidence 小于 0.65 时使用 unclear。"
-    )
+        return (
+            "Wake-word detector. Only decide whether the audio clearly contains the Chinese wake phrase "
+            "'xiao bei zhu shou'. Output strict JSON: "
+            "{\"wake\": true/false, \"transcript\": \"recognized text\"}."
+        )
 
+    context_text = (context or "VOICE_IDLE").strip() or "VOICE_IDLE"
+    options = (demo_options or "").strip()
+
+    if context_text == "demo_playing":
+        return (
+            "The glasses are currently playing a demo video. Your only task is to decide whether "
+            "the user asks to stop playback. Allowed intents: stop_demo_video or unknown. "
+            "If the user says stop playback / exit playback / stop demo / pause demo / cancel, "
+            "return stop_demo_video. For noise, questions, video selection, unclear speech, or any "
+            "other content, return unknown. Output strict JSON with slots all null."
+        )
+
+    if context_text == "recording_stop_only":
+        return (
+            "The glasses are currently recording an experiment. Your only task is to decide whether "
+            "the user asks to stop recording. Allowed intents: stop_recording or unknown. "
+            "If the user says end recording / stop recording / save recording, return stop_recording. "
+            "For noise, questions, unclear speech, or any other content, return unknown. "
+            "Output strict JSON with slots all null."
+        )
+
+    if context_text == "demo_select":
+        extra = ""
+        if options:
+            extra = (
+                "\nAvailable demo videos:\n"
+                f"{options}\n"
+                "When the user says first/second/third/number 3, output video_index as a 0-based index. "
+                "When the user says filename keywords, output video_query as the original phrase.\n"
+            )
+        return (
+            "The glasses are on the demo-video selection page. Only decide which video the user selected, "
+            "or whether the user cancelled. Allowed intents: select_demo_video, cancel, unknown. "
+            "Do not output qa, demo_guide, or other intents. "
+            f"{extra}"
+            "Output strict JSON. slots.video_index must be 0-based."
+        )
+
+    return (
+        f"Current glasses state: {context_text}\n"
+        "Map the user's Chinese speech to one supported intent and output strict JSON. "
+        "Use unclear when confidence is below 0.65."
+    )
 
 def _parse_wake_json(text: str, fallback_transcript: str) -> dict[str, Any]:
     """解析沉睡模式返回：只提取 wake 和 transcript。"""
@@ -290,15 +356,35 @@ def _parse_intent_json(text: str, fallback_transcript: str) -> dict[str, Any]:
         experiment_type = str(experiment_type).strip() or None
     if experiment_type not in SUPPORTED_EXPERIMENTS:
         experiment_type = None
-    video_index = _coerce_video_index(slots.get("video_index"))
+    # Prefer an explicit ordinal in the transcript ("第二个", "3号").
+    # Model responses are not always consistent about 0-based vs 1-based indices,
+    # while transcript ordinals are unambiguous for the user-facing list.
+    transcript_video_index = _match_demo_video_index(transcript)
+    video_index = transcript_video_index
+    if video_index is None:
+        video_index = _coerce_video_index(slots.get("video_index"))
     video_query = str(slots.get("video_query") or "").strip() or None
+    if (
+        intent == "select_demo_video"
+        and video_index is None
+        and not video_query
+        and _looks_like_demo_guide_request(transcript)
+    ):
+        intent = "demo_guide"
     slots = {
         "experiment_type": experiment_type,
         "video_index": video_index,
         "video_query": video_query,
     }
 
-    confidence = _coerce_confidence(payload.get("confidence"))
+    raw_confidence = payload.get("confidence")
+    confidence = _coerce_confidence(raw_confidence)
+    if raw_confidence is None and intent not in {"unknown", "unclear"}:
+        # Qwen Omni sometimes returns a minimal but valid JSON such as
+        # {"intent": "select_demo_video", "slots": {"video_index": 1}}.
+        # Treat that as usable instead of downgrading it to unclear only
+        # because the optional confidence field is missing.
+        confidence = 0.7
     if confidence < 0.65 and intent not in {"unknown", "unclear"}:
         intent = "unclear"
         slots = {"experiment_type": None, "video_index": None, "video_query": None}
@@ -342,6 +428,8 @@ def _fallback_from_transcript(transcript: str) -> dict[str, Any]:
     lower = normalized.lower()
     if any(word in normalized for word in ("停止播放", "退出播放", "暂停演示", "停止演示")):
         return _safe_intent(normalized, "stop_demo_video", "已停止播放。", 0.7)
+    if any(word in normalized for word in ("停止播放", "退出播放", "暂停演示", "停止演示")):
+        return _safe_intent(normalized, "stop_demo_video", "已停止播放。", 0.7)
     video_index = _match_demo_video_index(normalized)
     if video_index is not None or any(word in normalized for word in ("操作流程", "操作视频", "原理", "小结")):
         return _safe_intent(
@@ -352,6 +440,17 @@ def _fallback_from_transcript(transcript: str) -> dict[str, Any]:
             video_index=video_index,
             video_query=normalized,
         )
+    if video_index is not None or any(word in normalized for word in ("操作流程", "操作视频", "原理", "小结")):
+        return _safe_intent(
+            normalized,
+            "select_demo_video",
+            "开始播放演示视频。",
+            0.7,
+            video_index=video_index,
+            video_query=normalized,
+        )
+    if any(word in normalized for word in ("演示指引", "播放演示", "看演示", "看视频", "演示视频")):
+        return _safe_intent(normalized, "demo_guide", "进入演示指引。", 0.7)
     if any(word in normalized for word in ("演示指引", "播放演示", "看演示", "看视频", "操作视频")):
         return _safe_intent(normalized, "demo_guide", "进入演示指引。", 0.7)
     if any(word in normalized for word in ("投影测试", "框测试", "叠加测试", "检测框测试", "实物叠加", "透明框")):
@@ -385,6 +484,18 @@ def _fallback_from_transcript(transcript: str) -> dict[str, Any]:
     return _safe_intent(normalized, "unknown", "这个指令暂不支持。你可以说：演示指引、开始记录、安全检查、实验纠错或我要提问。", 0.5)
 
 
+def _looks_like_demo_guide_request(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    has_demo_request = any(word in compact for word in ("演示指引", "播放演示", "放演示", "演示视频", "看视频", "看演示"))
+    has_specific_video = (
+        _match_demo_video_index(compact) is not None
+        or any(word in compact for word in ("操作流程", "操作视频", "原理", "小结"))
+    )
+    return has_demo_request and not has_specific_video
+
+
 def _match_experiment_type(text: str) -> str | None:
     if "减压" in text or "蒸馏" in text:
         return "distillation"
@@ -397,12 +508,45 @@ def _match_experiment_type(text: str) -> str | None:
 
 def _match_demo_video_index(text: str) -> int | None:
     compact = re.sub(r"\s+", "", text)
-    if any(word in text for word in ("第一个", "第一段", "一号", "1号")) or compact in {"一", "1"}:
-        return 0
-    if any(word in text for word in ("第二个", "第二段", "二号", "2号")) or compact in {"二", "2"}:
-        return 1
-    if any(word in text for word in ("第三个", "第三段", "三号", "3号")) or compact in {"三", "3"}:
-        return 2
+    digit_match = re.search(r"(?:第)?([0-9]{1,2})(?:个|段|号|部|集|条)?", compact)
+    if digit_match:
+        value = int(digit_match.group(1))
+        if 1 <= value <= 20:
+            return value - 1
+
+    numerals = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+        "十一": 11,
+        "十二": 12,
+        "十三": 13,
+        "十四": 14,
+        "十五": 15,
+        "十六": 16,
+        "十七": 17,
+        "十八": 18,
+        "十九": 19,
+        "二十": 20,
+    }
+    for word, value in sorted(numerals.items(), key=lambda item: len(item[0]), reverse=True):
+        if (
+            compact == word
+            or f"第{word}" in compact
+            or f"{word}号" in compact
+            or f"{word}个" in compact
+            or f"{word}段" in compact
+            or f"{word}部" in compact
+        ):
+            return value - 1
     return None
 
 
