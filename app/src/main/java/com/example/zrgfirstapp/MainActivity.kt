@@ -1008,7 +1008,7 @@ class MainActivity : AppCompatActivity() {
             panel.subtitleText.visibility = View.VISIBLE
             panel.titleText.textSize = 22f
             panel.titleText.text = "演示指引"
-            panel.subtitleText.text = activeDemoVideo?.label ?: "正在播放"
+            panel.subtitleText.text = activeDemoVideo?.let { demoDisplayLabel(it) } ?: "正在播放"
             panel.optionsRow.visibility = View.GONE
             panel.progress.visibility = View.GONE
             panel.thinkingText.visibility = View.GONE
@@ -1316,6 +1316,7 @@ class MainActivity : AppCompatActivity() {
                     mapOf(
                         "model" to "qwen3.5-omni-flash-realtime",
                         "context" to context,
+                        "demo_options" to demoOptionsForVoice(),
                     ),
                     "audio",
                     file,
@@ -1387,6 +1388,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun demoOptionsForVoice(): String {
+        if (demoVideos.isEmpty()) {
+            return ""
+        }
+        return demoVideos.mapIndexed { index, video -> "${index + 1}. ${demoDisplayLabel(video)}" }.joinToString("\n")
+    }
+
+    private fun demoDisplayLabel(video: DemoVideo): String {
+        return video.label.replace(Regex("^\\s*\\d+\\.\\s*"), "")
+    }
+
     private fun isPassiveListenMode(mode: PassiveListenMode): Boolean {
         return mode != PassiveListenMode.NONE
     }
@@ -1431,6 +1443,34 @@ class MainActivity : AppCompatActivity() {
         val intent = json.optString("intent", "unclear")
         val slots = json.optJSONObject("slots")
         val experimentType = slots?.optString("experiment_type", "") ?: ""
+
+        if (passiveMode == PassiveListenMode.DEMO_STOP) {
+            if (intent == "stop_demo_video" || intent == "cancel") {
+                stopDemoPlayback()
+                finishPassiveVoiceControl()
+            } else {
+                resumePassiveStopOnlyListening(passiveMode)
+            }
+            return
+        }
+
+        if (passiveMode == PassiveListenMode.RECORD_STOP) {
+            if (intent == "stop_recording" || intent == "cancel") {
+                stopRecordingService()
+                finishPassiveVoiceControl(1_000L)
+            } else {
+                resumePassiveStopOnlyListening(passiveMode)
+            }
+            return
+        }
+
+        if (passiveMode == PassiveListenMode.DEMO_SELECT) {
+            if (intent != "select_demo_video" && intent != "demo_guide" && intent != "cancel") {
+                resumePassiveStopOnlyListening(passiveMode)
+                return
+            }
+        }
+
         when (intent) {
             "start_recording" -> {
                 enterAwakeModeNoTimeout()
@@ -1452,6 +1492,7 @@ class MainActivity : AppCompatActivity() {
             }
             "experiment_check" -> {
                 selectedMode = Mode.EXPERIMENT
+                enterAwakeModeNoTimeout()
                 playPrompt("ask_experiment")
                 // 保持苏醒等待用户说实验类型
                 mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
@@ -1558,7 +1599,7 @@ class MainActivity : AppCompatActivity() {
         passiveListenMode = PassiveListenMode.DEMO_SELECT
         enterAwakeModeNoTimeout()  // 选择视频期间保持苏醒
         activeTaskTitle = "演示指引"
-        val options = demoVideos.mapIndexed { index, video -> "${index + 1}. ${video.label}" }
+        val options = demoVideos.mapIndexed { index, video -> "${index + 1}. ${demoDisplayLabel(video)}" }
         lastStatusText = "请说视频序号或名称"
         lastResultText = options.joinToString("\n")
         screenState = ScreenState.DEMO_SELECT
@@ -1575,16 +1616,21 @@ class MainActivity : AppCompatActivity() {
             startDemoGuideThenSelect(index, query)
             return
         }
+        if (index == null && isGenericDemoGuideRequest(query)) {
+            enterDemoSelect()
+            return
+        }
         val video = when {
             index != null && index in demoVideos.indices -> demoVideos[index]
             else -> matchDemoVideoByText(query)
         }
         if (video == null) {
             lastStatusText = "没有匹配到视频"
-            lastResultText = "请说视频序号或名称。\n" + demoVideos.mapIndexed { i, item -> "${i + 1}. ${item.label}" }.joinToString("\n")
+            lastResultText = "请说视频序号或名称。\n" + demoVideos.mapIndexed { i, item -> "${i + 1}. ${demoDisplayLabel(item)}" }.joinToString("\n")
             screenState = ScreenState.DEMO_SELECT
             renderScreen()
             passiveListenMode = PassiveListenMode.DEMO_SELECT
+            enterAwakeModeNoTimeout()
             mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
             return
         }
@@ -1612,7 +1658,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 runOnUiIfCurrent(token) {
                     demoVideos = videos
-                    selectAndPlayDemoVideo(index, query)
+                    if (index == null && isGenericDemoGuideRequest(query)) {
+                        enterDemoSelect()
+                    } else {
+                        selectAndPlayDemoVideo(index, query)
+                    }
                 }
             } catch (exc: Exception) {
                 runOnUiIfCurrent(token) {
@@ -1622,8 +1672,26 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private fun isGenericDemoGuideRequest(query: String): Boolean {
+        val normalized = query.replace(" ", "")
+        if (normalized.isBlank()) {
+            return true
+        }
+        val wantsDemo = listOf("演示指引", "播放演示", "放演示", "演示视频", "看视频", "看演示").any {
+            normalized.contains(it)
+        }
+        val hasSpecificVideo = parseDemoVideoIndex(normalized) != null ||
+            listOf("操作流程", "操作视频", "原理", "小结").any { normalized.contains(it) }
+        return wantsDemo && !hasSpecificVideo
+    }
+
     private fun matchDemoVideoByText(query: String): DemoVideo? {
         val normalized = query.replace(" ", "")
+        parseDemoVideoIndex(normalized)?.let { index ->
+            if (index in demoVideos.indices) {
+                return demoVideos[index]
+            }
+        }
         return demoVideos.firstOrNull { video ->
             val label = video.label.replace(" ", "")
             normalized.contains(label) ||
@@ -1633,6 +1701,52 @@ class MainActivity : AppCompatActivity() {
                 (normalized.contains("原理") && label.contains("原理")) ||
                 (normalized.contains("小结") && label.contains("小结"))
         }
+    }
+
+    private fun parseDemoVideoIndex(text: String): Int? {
+        Regex("(?:第)?([0-9]{1,2})(?:个|段|号|部|集|条)?").find(text)?.let { match ->
+            val value = match.groupValues[1].toIntOrNull()
+            if (value != null && value in 1..20) {
+                return value - 1
+            }
+        }
+
+        val numerals = listOf(
+            "二十" to 20,
+            "十九" to 19,
+            "十八" to 18,
+            "十七" to 17,
+            "十六" to 16,
+            "十五" to 15,
+            "十四" to 14,
+            "十三" to 13,
+            "十二" to 12,
+            "十一" to 11,
+            "十" to 10,
+            "九" to 9,
+            "八" to 8,
+            "七" to 7,
+            "六" to 6,
+            "五" to 5,
+            "四" to 4,
+            "三" to 3,
+            "两" to 2,
+            "二" to 2,
+            "一" to 1,
+        )
+        for ((word, value) in numerals) {
+            if (
+                text == word ||
+                text.contains("第${word}") ||
+                text.contains("${word}号") ||
+                text.contains("${word}个") ||
+                text.contains("${word}段") ||
+                text.contains("${word}部")
+            ) {
+                return value - 1
+            }
+        }
+        return null
     }
 
     private fun playDemoVideo(video: DemoVideo) {
