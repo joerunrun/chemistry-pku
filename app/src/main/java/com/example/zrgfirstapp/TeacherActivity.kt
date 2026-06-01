@@ -16,8 +16,12 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.view.GestureDetector
+import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -26,72 +30,34 @@ import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.max
-import kotlin.math.sqrt
 
 class TeacherActivity : AppCompatActivity() {
-    private data class EyePanel(
-        val titleText: TextView,
-        val subtitleText: TextView,
-        val optionsRow: LinearLayout,
-        val primaryButton: Button,
-        val secondaryButton: Button,
-        val detectionPreview: ImageView,
-        val demoVideoView: VideoView,
-        val progress: ProgressBar,
-        val thinkingText: TextView,
-        val statusText: TextView,
-        val resultText: TextView,
-    )
+    private lateinit var gestureDetector: GestureDetector
 
-    private lateinit var mainRoot: View
-    private lateinit var leftPanel: EyePanel
-    private lateinit var rightPanel: EyePanel
-    private val panels: List<EyePanel>
-        get() = listOf(leftPanel, rightPanel)
+    @Volatile
+    private var continuousRecording = false
+    private var continuousRecorder: AudioRecord? = null
+    private var continuousFile: File? = null
+    private var continuousTotalSamples = 0
 
-    private val sampleRate = 16_000
-    private val threshold = 0.5
-    private val silenceStopMs = 2_000L
-    private val verifyDurationMs = 2_500L
-    private val enrollDurationMs = 5_000L
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var running = false
-    private var activeRecorder: AudioRecord? = null
     private var activePlayer: MediaPlayer? = null
-
-    private val connectionMode: String by lazy {
-        getString(R.string.glasses_connection_mode).trim().lowercase()
-    }
-    private val baseUrl: String by lazy {
-        val urlRes = if (connectionMode == "network") {
-            R.string.glasses_service_base_url_network
-        } else {
-            R.string.glasses_service_base_url_usb
-        }
-        getString(urlRes).trim().trimEnd('/')
-    }
 
     private val requestAudioPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
-            startTeacherFlow()
+            startContinuousRecording()
         } else {
-            render("教师版助手", "麦克风未授权", "无法录入教师声纹", "请在系统设置里允许麦克风权限。", false)
+            setResultAndFinish("麦克风未授权", "请在系统设置里允许麦克风权限。")
         }
     }
 
@@ -99,254 +65,107 @@ class TeacherActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
-        mainRoot = findViewById(R.id.main)
-        mainRoot.setBackgroundColor(Color.TRANSPARENT)
-        leftPanel = bindPanel(findViewById(R.id.left_eye_panel))
-        rightPanel = bindPanel(findViewById(R.id.right_eye_panel))
-        running = true
+        findViewById<View>(R.id.main).setBackgroundColor(Color.TRANSPARENT)
+
+        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                finish()
+                return true
+            }
+        })
+
+        hideAllViews()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED
         ) {
-            startTeacherFlow()
+            startContinuousRecording()
         } else {
-            render("教师版助手", "请求麦克风权限", "请允许麦克风", "", false)
             requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
-    private fun bindPanel(root: View): EyePanel {
-        return EyePanel(
-            titleText = root.findViewById(R.id.title_text),
-            subtitleText = root.findViewById(R.id.subtitle_text),
-            optionsRow = root.findViewById(R.id.options_row),
-            primaryButton = root.findViewById(R.id.primary_button),
-            secondaryButton = root.findViewById(R.id.secondary_button),
-            detectionPreview = root.findViewById(R.id.detection_preview),
-            demoVideoView = root.findViewById(R.id.demo_video_view),
-            progress = root.findViewById(R.id.progress),
-            thinkingText = root.findViewById(R.id.thinking_text),
-            statusText = root.findViewById(R.id.status_text),
-            resultText = root.findViewById(R.id.result_text),
-        )
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (gestureDetector.onTouchEvent(event)) return true
+        return super.onTouchEvent(event)
     }
 
-    private fun startTeacherFlow() {
-        render("教师版助手", "连接电脑服务", "正在连接", "服务地址：$baseUrl", true)
-        Thread {
-            try {
-                getJson("$baseUrl/api/glasses/health")
-                runOnUiThread {
-                    render(
-                        "助手就绪",
-                        "录入教师声纹",
-                        "请教师说一句话",
-                        "例如：我要开始指导学生学习实验。",
-                        false,
-                    )
-                    playPrompt("assistant_ready")
-                }
-                mainHandler.postDelayed({ enrollTeacherReference() }, 900L)
-            } catch (exc: Exception) {
-                runOnUiThread {
-                    render("教师版助手", "连接失败", "电脑服务未连接", exc.message ?: "连接失败", false)
-                }
-            }
-        }.start()
-    }
-
-    private fun enrollTeacherReference() {
-        if (!running) return
-        Thread {
-            try {
-                runOnUiThread {
-                    render("教师版助手", "录入教师声纹", "请保持正常音量说 5 秒", "正在录音...", true)
-                }
-                val file = recordFixedWav(enrollDurationMs, "teacher_enroll")
-                try {
-                    val json = postMultipart(
-                        "$baseUrl/api/glasses/teacher/enroll",
-                        emptyMap(),
-                        "audio",
-                        file,
-                    )
-                    if (!json.optBoolean("ok", false)) {
-                        throw IOException(json.optString("error", "教师声纹录入失败"))
-                    }
-                    runOnUiThread {
-                        render("助手就绪", "教师版", "声纹已录入", "开始持续监听教师声音。", false)
-                    }
-                    mainHandler.postDelayed({ verifyLoop() }, 700L)
-                } finally {
-                    file.delete()
-                }
-            } catch (exc: Exception) {
-                runOnUiThread {
-                    render("教师版助手", "录入失败", "请重新进入教师版", exc.message ?: "录入失败", false)
-                }
-            }
-        }.start()
-    }
-
-    private fun verifyLoop() {
-        if (!running || isFinishing) return
-        Thread {
-            try {
-                runOnUiThread {
-                    render("助手就绪", "教师版", "正在判断是否为教师说话", "", true)
-                }
-                val file = recordFixedWav(verifyDurationMs, "teacher_verify")
-                try {
-                    val json = postMultipart(
-                        "$baseUrl/api/glasses/teacher/verify",
-                        mapOf("threshold" to threshold.toString()),
-                        "audio",
-                        file,
-                    )
-                    val match = json.optBoolean("match", false)
-                    val score = json.optDouble("score", 0.0)
-                    val decision = json.optString("decision", "")
-                    if (match) {
-                        runOnUiThread {
-                            render(
-                                "教师版助手",
-                                "已匹配教师",
-                                "开始录音",
-                                "声纹分数：${"%.2f".format(score)}",
-                                true,
-                            )
-                        }
-                        recordTeacherUtterance()
-                    } else {
-                        runOnUiThread {
-                            render(
-                                "助手就绪",
-                                "教师版",
-                                "继续监听",
-                                "最近判断：$decision  分数：${"%.2f".format(score)}",
-                                false,
-                            )
-                        }
-                        mainHandler.postDelayed({ verifyLoop() }, 350L)
-                    }
-                } finally {
-                    file.delete()
-                }
-            } catch (exc: Exception) {
-                runOnUiThread {
-                    render("教师版助手", "验证异常", "稍后重试", exc.message ?: "验证失败", false)
-                }
-                mainHandler.postDelayed({ verifyLoop() }, 1_500L)
-            }
-        }.start()
-    }
-
-    private fun recordTeacherUtterance() {
-        try {
-            val tempFile = recordUntilSilence("teacher_record")
-            val savedName = copyRecordingToMediaStore(tempFile)
-            tempFile.delete()
-            runOnUiThread {
-                render("助手就绪", "录音已保存", "静音 2 秒，自动停止", savedName, false)
-            }
-        } catch (exc: Exception) {
-            runOnUiThread {
-                render("教师版助手", "录音失败", "回到监听", exc.message ?: "录音失败", false)
-            }
-        } finally {
-            mainHandler.postDelayed({ verifyLoop() }, 900L)
-        }
-    }
-
-    private fun render(title: String, subtitle: String, status: String, result: String, running: Boolean) {
-        panels.forEach { panel ->
-            panel.titleText.textSize = 24f
-            panel.titleText.text = title
-            panel.subtitleText.text = subtitle
-            panel.optionsRow.visibility = View.GONE
-            panel.detectionPreview.visibility = View.GONE
-            panel.demoVideoView.visibility = View.GONE
-            panel.progress.visibility = if (running) View.VISIBLE else View.GONE
-            panel.thinkingText.visibility = View.GONE
-            panel.statusText.text = status
-            panel.resultText.visibility = View.VISIBLE
-            panel.resultText.text = result
+    private fun hideAllViews() {
+        val leftPanel = findViewById<View>(R.id.left_eye_panel)
+        val rightPanel = findViewById<View>(R.id.right_eye_panel)
+        listOf(leftPanel, rightPanel).forEach { panel ->
+            panel?.findViewById<TextView>(R.id.title_text)?.visibility = View.GONE
+            panel?.findViewById<TextView>(R.id.subtitle_text)?.visibility = View.GONE
+            panel?.findViewById<LinearLayout>(R.id.options_row)?.visibility = View.GONE
+            panel?.findViewById<ImageView>(R.id.detection_preview)?.visibility = View.GONE
+            panel?.findViewById<FrameLayout>(R.id.detection_overlay_container)?.visibility = View.GONE
+            panel?.findViewById<VideoView>(R.id.demo_video_view)?.visibility = View.GONE
+            panel?.findViewById<ProgressBar>(R.id.progress)?.visibility = View.GONE
+            panel?.findViewById<TextView>(R.id.thinking_text)?.visibility = View.GONE
+            panel?.findViewById<TextView>(R.id.status_text)?.visibility = View.GONE
+            panel?.findViewById<TextView>(R.id.result_text)?.visibility = View.GONE
         }
     }
 
     @Suppress("MissingPermission")
-    private fun recordFixedWav(durationMs: Long, prefix: String): File {
+    private fun startContinuousRecording() {
+        if (continuousRecording) return
+        continuousRecording = true
+        val file = File(cacheDir, "teacher_cont_${System.currentTimeMillis()}.wav")
+        continuousFile = file
+        continuousTotalSamples = 0
         val recorder = createRecorder()
-        val file = File(cacheDir, "${prefix}_${System.currentTimeMillis()}.wav")
-        val buffer = ShortArray(max(AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT), 3200) / 2)
-        val deadline = System.currentTimeMillis() + durationMs
-        FileOutputStream(file).use { output ->
-            writeWavHeader(output, 0)
-            var totalSamples = 0
-            activeRecorder = recorder
-            recorder.startRecording()
-            while (running && System.currentTimeMillis() < deadline) {
-                val read = recorder.read(buffer, 0, buffer.size)
-                if (read > 0) {
-                    writePcm16(output, buffer, read)
-                    totalSamples += read
+        continuousRecorder = recorder
+        Thread {
+            try {
+                FileOutputStream(file).use { output ->
+                    writeWavHeader(output, 0)
+                    val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
+                    val buffer = ShortArray(max(minBuf, 3200) / 2)
+                    recorder.startRecording()
+                    while (continuousRecording) {
+                        val read = recorder.read(buffer, 0, buffer.size)
+                        if (read > 0) {
+                            writePcm16(output, buffer, read)
+                            continuousTotalSamples += read
+                        }
+                    }
+                    recorder.stop()
+                    rewriteWavHeader(file, continuousTotalSamples)
                 }
+            } catch (_: Exception) {
+            } finally {
+                recorder.release()
+                if (continuousRecorder === recorder) continuousRecorder = null
             }
-            recorder.stop()
-            rewriteWavHeader(file, totalSamples)
-        }
-        recorder.release()
-        activeRecorder = null
-        return file
+        }.start()
     }
 
-    @Suppress("MissingPermission")
-    private fun recordUntilSilence(prefix: String): File {
-        val recorder = createRecorder()
-        val file = File(cacheDir, "${prefix}_${System.currentTimeMillis()}.wav")
-        val buffer = ShortArray(max(AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT), 3200) / 2)
-        val maxDeadline = System.currentTimeMillis() + 120_000L
-        var silenceMs = 0L
-        var totalSamples = 0
-        var hasSpeech = false
-        FileOutputStream(file).use { output ->
-            writeWavHeader(output, 0)
-            activeRecorder = recorder
-            recorder.startRecording()
-            while (running && System.currentTimeMillis() < maxDeadline) {
-                val read = recorder.read(buffer, 0, buffer.size)
-                if (read <= 0) continue
-                writePcm16(output, buffer, read)
-                totalSamples += read
-                val rms = shortRms(buffer, read)
-                val chunkMs = read * 1000L / sampleRate
-                if (rms >= SPEECH_RMS_THRESHOLD) {
-                    hasSpeech = true
-                    silenceMs = 0L
-                } else if (hasSpeech) {
-                    silenceMs += chunkMs
-                }
-                if (hasSpeech && silenceMs >= silenceStopMs) {
-                    break
-                }
-            }
-            recorder.stop()
-            rewriteWavHeader(file, totalSamples)
+    private fun stopContinuousRecording() {
+        continuousRecording = false
+        continuousRecorder?.let {
+            try { it.stop() } catch (_: Exception) {}
         }
-        recorder.release()
-        activeRecorder = null
-        return file
+        try { Thread.sleep(300) } catch (_: Exception) {}
+        val file = continuousFile
+        if (file != null && file.exists() && file.length() > 44) {
+            saveRecordingToMediaStore(file)
+        }
+        continuousFile?.delete()
+        continuousFile = null
+        continuousRecorder = null
     }
 
     @Suppress("MissingPermission")
     private fun createRecorder(): AudioRecord {
-        val minBuffer = AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT)
+        val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
         if (minBuffer <= 0) {
             throw IOException("麦克风初始化失败")
         }
         val recorder = AudioRecord(
             MediaRecorder.AudioSource.MIC,
-            sampleRate,
+            SAMPLE_RATE,
             CHANNEL_CONFIG,
             AUDIO_FORMAT,
             max(minBuffer, 6400),
@@ -358,7 +177,7 @@ class TeacherActivity : AppCompatActivity() {
         return recorder
     }
 
-    private fun copyRecordingToMediaStore(file: File): String {
+    private fun saveRecordingToMediaStore(file: File) {
         val name = "teacher_record_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.wav"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
@@ -368,14 +187,14 @@ class TeacherActivity : AppCompatActivity() {
                 put(MediaStore.Audio.Media.IS_PENDING, 1)
             }
             val uri = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
-                ?: throw IOException("无法创建录音文件")
+                ?: return
             contentResolver.openOutputStream(uri)?.use { output ->
                 FileInputStream(file).use { input -> input.copyTo(output) }
-            } ?: throw IOException("无法写入录音文件")
+            }
             values.clear()
             values.put(MediaStore.Audio.Media.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
-            return "已保存：Music/ChemTeacherRecords/$name"
+            return
         }
 
         val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "ChemTeacherRecords")
@@ -384,62 +203,10 @@ class TeacherActivity : AppCompatActivity() {
         FileInputStream(file).use { input ->
             FileOutputStream(target).use { output -> input.copyTo(output) }
         }
-        return "已保存：${target.absolutePath}"
     }
 
-    private fun postMultipart(
-        urlText: String,
-        fields: Map<String, String>,
-        fileField: String,
-        file: File,
-    ): JSONObject {
-        val boundary = "----TeacherBoundary${System.currentTimeMillis()}"
-        val connection = (URL(urlText).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            connectTimeout = 10_000
-            readTimeout = 60_000
-            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        }
-        DataOutputStream(connection.outputStream).use { out ->
-            fields.forEach { (name, value) ->
-                out.writeBytes("--$boundary\r\n")
-                out.writeBytes("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
-                out.write(value.toByteArray(Charsets.UTF_8))
-                out.writeBytes("\r\n")
-            }
-            out.writeBytes("--$boundary\r\n")
-            out.writeBytes("Content-Disposition: form-data; name=\"$fileField\"; filename=\"${file.name}\"\r\n")
-            out.writeBytes("Content-Type: audio/wav\r\n\r\n")
-            FileInputStream(file).use { input -> input.copyTo(out) }
-            out.writeBytes("\r\n--$boundary--\r\n")
-            out.flush()
-        }
-        return readJsonResponse(connection)
-    }
-
-    private fun getJson(urlText: String): JSONObject {
-        val connection = (URL(urlText).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 8_000
-            readTimeout = 20_000
-        }
-        return readJsonResponse(connection)
-    }
-
-    private fun readJsonResponse(connection: HttpURLConnection): JSONObject {
-        val code = connection.responseCode
-        val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-        val body = stream?.use { readAll(it) }.orEmpty()
-        connection.disconnect()
-        if (code !in 200..299) {
-            throw IOException(if (body.isBlank()) "HTTP $code" else "HTTP $code: $body")
-        }
-        return JSONObject(body)
-    }
-
-    private fun readAll(input: InputStream): String {
-        return BufferedReader(input.reader(Charsets.UTF_8)).use { it.readText() }
+    private fun setResultAndFinish(status: String, result: String) {
+        finish()
     }
 
     private fun playPrompt(name: String) {
@@ -462,30 +229,16 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        running = false
-        activeRecorder?.let {
-            runCatching { it.stop() }
-            it.release()
-        }
-        activeRecorder = null
+        stopContinuousRecording()
         activePlayer?.release()
         activePlayer = null
         super.onDestroy()
     }
 
     companion object {
+        private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val SPEECH_RMS_THRESHOLD = 600.0
-
-        private fun shortRms(buffer: ShortArray, count: Int): Double {
-            var sum = 0.0
-            for (i in 0 until count) {
-                val v = buffer[i].toDouble()
-                sum += v * v
-            }
-            return sqrt(sum / max(1, count))
-        }
 
         private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int) {
             val bytes = ByteArray(count * 2)
@@ -509,7 +262,7 @@ class TeacherActivity : AppCompatActivity() {
         }
 
         private fun buildWavHeader(samples: Int): ByteArray {
-            val byteRate = 16_000 * 2
+            val byteRate = SAMPLE_RATE * 2
             val dataSize = samples * 2
             val totalSize = dataSize + 36
             return ByteArray(44).also { h ->
@@ -533,7 +286,7 @@ class TeacherActivity : AppCompatActivity() {
                 le32(16, 16)
                 le16(20, 1)
                 le16(22, 1)
-                le32(24, 16_000)
+                le32(24, SAMPLE_RATE)
                 le32(28, byteRate)
                 le16(32, 2)
                 le16(34, 16)

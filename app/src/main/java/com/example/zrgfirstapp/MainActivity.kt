@@ -100,6 +100,18 @@ class MainActivity : AppCompatActivity() {
         VOICE_CONTROL,
     }
 
+    private enum class VoiceMode {
+        SLEEP,  // 沉睡模式：只检测唤醒词"小北"
+        AWAKE,  // 苏醒模式：识别完整指令
+    }
+
+    private enum class PassiveListenMode {
+        NONE,
+        DEMO_STOP,
+        RECORD_STOP,
+        DEMO_SELECT,
+    }
+
     private data class EyePanel(
         val root: View,
         val titleText: TextView,
@@ -143,12 +155,16 @@ class MainActivity : AppCompatActivity() {
     private val qaSampleRate = 16_000
     private val qaRecordDurationMs = 7_000L
     private val voiceIntentRecordDurationMs = 3_500L
-    private val voiceIntentMinRms = 450.0
+    private val voiceIntentMinRms = 50.0
     private val voiceIntentMinSpeechChunks = 3
     private val actionMenuTimeoutMs = 8_000L
     private val captureCountdownMs = 2_500L
+    private val awakeTimeoutMs = 15_000L
 
     private var screenState = ScreenState.WELCOME
+    private var voiceMode = VoiceMode.SLEEP
+    private var passiveListenMode = PassiveListenMode.NONE
+    private var awakeDeadlineMs = 0L
     private var focusIndex = 0
     private var selectedMode = Mode.EXPERIMENT
     private var selectedExperimentType = ExperimentType.DISTILLATION
@@ -182,7 +198,6 @@ class MainActivity : AppCompatActivity() {
     )
     private var demoVideos: List<DemoVideo> = emptyList()
     private var activeDemoVideo: DemoVideo? = null
-    private var voiceReturnState = ScreenState.LIVE_MINIMAL
     private val resultReturnRunnable = Runnable {
         if (screenState == ScreenState.RESULT) {
             enterLiveMinimal()
@@ -439,7 +454,7 @@ class MainActivity : AppCompatActivity() {
                 subtitle = "请选择视频",
                 status = lastStatusText,
                 result = lastResultText,
-                running = true,
+                running = false,
             )
 
             ScreenState.DEMO_PLAYING -> renderDemoPlayingScreen()
@@ -771,6 +786,8 @@ class MainActivity : AppCompatActivity() {
         focusIndex = 0
         clearTaskOutput()
         voiceControlPausedUntilMs = 0L
+        voiceMode = VoiceMode.SLEEP  // 重置为沉睡模式
+        awakeDeadlineMs = 0L
         screenState = ScreenState.LIVE_MINIMAL
         renderScreen()
         mainHandler.post { startVoiceIntentLoop() }
@@ -1145,10 +1162,22 @@ class MainActivity : AppCompatActivity() {
         if (!screenState.allowsVoiceIntent() || isVoiceIntentRecording) {
             return
         }
+        // 苏醒模式超时检查
+        if (voiceMode == VoiceMode.AWAKE && System.currentTimeMillis() > awakeDeadlineMs) {
+            playPrompt("sleep_timeout")
+            returnToSleep()
+            return
+        }
         val token = operationToken
         val returnState = screenState
-        val stopOnlyMode = recordingRequested
-        voiceReturnState = returnState
+        val capturedPassiveMode = passiveListenMode
+        val capturedIsSleepMode = voiceMode == VoiceMode.SLEEP && capturedPassiveMode == PassiveListenMode.NONE
+        val capturedContext = when (capturedPassiveMode) {
+            PassiveListenMode.DEMO_STOP -> "demo_playing"
+            PassiveListenMode.RECORD_STOP -> "recording_stop_only"
+            PassiveListenMode.DEMO_SELECT -> "demo_select"
+            PassiveListenMode.NONE -> if (capturedIsSleepMode) "sleep" else voiceContextValue()
+        }
         val minBufferSize = AudioRecord.getMinBufferSize(
             qaSampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -1185,7 +1214,7 @@ class MainActivity : AppCompatActivity() {
                 FileOutputStream(outputFile).use { output ->
                     recorder.startRecording()
                     val buffer = ByteArray(bufferSize)
-                        val deadline = System.currentTimeMillis() + voiceIntentRecordDurationMs
+                    val deadline = System.currentTimeMillis() + voiceIntentRecordDurationMs
                     while (
                         token == operationToken &&
                         screenState == returnState &&
@@ -1206,21 +1235,25 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 val averageRms = if (rmsCount > 0) rmsSum / rmsCount else 0.0
+                // 沉睡模式降低阈值，更容易触发唤醒词检测
+                val minChunks = if (capturedIsSleepMode) 1 else voiceIntentMinSpeechChunks
+                val minAvgRms = if (capturedIsSleepMode) voiceIntentMinRms * 0.20 else voiceIntentMinRms * 0.45
                 val hasSpeech = bytesWritten > 0 &&
-                    speechChunks >= voiceIntentMinSpeechChunks &&
-                    averageRms >= voiceIntentMinRms * 0.45
+                    speechChunks >= minChunks &&
+                    averageRms >= minAvgRms
                 if (token == operationToken && hasSpeech) {
                     submitted = true
-                    if (!stopOnlyMode) {
+                    // 苏醒模式下显示识别状态
+                    if (!capturedIsSleepMode && capturedPassiveMode == PassiveListenMode.NONE) {
                         runOnUiIfCurrent(token) {
-                            activeTaskTitle = "Voice control"
-                            lastStatusText = "Understanding command"
+                            activeTaskTitle = "语音控制"
+                            lastStatusText = "正在识别指令"
                             lastResultText = ""
                             screenState = ScreenState.VOICE_LISTENING
                             renderScreen()
                         }
                     }
-                    submitVoiceIntent(outputFile, token, stopOnlyMode)
+                    submitVoiceIntent(outputFile, token, capturedIsSleepMode, capturedContext, capturedPassiveMode)
                 } else if (token == operationToken) {
                     mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
                 }
@@ -1275,33 +1308,35 @@ class MainActivity : AppCompatActivity() {
         return if (count > 0) Math.sqrt(sum / count.toDouble()) else 0.0
     }
 
-    private fun submitVoiceIntent(file: File, token: Int, stopOnlyMode: Boolean = false) {
+    private fun submitVoiceIntent(file: File, token: Int, isSleepMode: Boolean, context: String, passiveMode: PassiveListenMode) {
         Thread {
             try {
                 val json = postMultipart(
                     "$baseUrl/api/glasses/voice/intent",
                     mapOf(
-                        "model" to "qwen3.5-omni-plus-realtime",
-                        "context" to if (stopOnlyMode) "recording_stop_only" else voiceContextValue(),
+                        "model" to "qwen3.5-omni-flash-realtime",
+                        "context" to context,
                     ),
                     "audio",
                     file,
                     "application/octet-stream",
                 )
                 runOnUiIfCurrent(token) {
-                    if (stopOnlyMode) {
-                        handleRecordingStopIntent(json)
+                    if (isSleepMode) {
+                        handleWakeResponse(json)
                     } else {
-                        handleVoiceIntent(json)
+                        handleAwakeIntent(json, context, passiveMode)
                     }
                 }
             } catch (_: Exception) {
                 runOnUiIfCurrent(token) {
-                    if (stopOnlyMode) {
+                    if (isSleepMode) {
                         mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
+                    } else if (isPassiveListenMode(passiveMode)) {
+                        resumePassiveStopOnlyListening(passiveMode)
                     } else {
                         playPrompt("unclear")
-                        enterLiveMinimal()
+                        returnToSleep()
                     }
                 }
             } finally {
@@ -1310,28 +1345,100 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun handleRecordingStopIntent(json: JSONObject) {
-        val intent = json.optString("intent", "unclear")
-        if (intent == "stop_recording") {
-            stopRecordingService()
-            enterLiveMinimal()
-        } else if (screenState.allowsVoiceIntent()) {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
+    private fun handleWakeResponse(json: JSONObject) {
+        val wake = json.optBoolean("wake", false)
+        if (wake) {
+            enterAwakeMode()
+        } else {
+            mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
         }
     }
 
-    private fun handleVoiceIntent(json: JSONObject) {
+    private fun enterAwakeMode() {
+        voiceMode = VoiceMode.AWAKE
+        awakeDeadlineMs = System.currentTimeMillis() + awakeTimeoutMs
+        playPrompt("wake_response") {
+            startVoiceIntentLoop()
+        }
+    }
+
+    private fun enterAwakeModeNoTimeout() {
+        voiceMode = VoiceMode.AWAKE
+        awakeDeadlineMs = Long.MAX_VALUE
+    }
+
+    private fun returnToSleep() {
+        passiveListenMode = PassiveListenMode.NONE
+        voiceMode = VoiceMode.SLEEP
+        awakeDeadlineMs = 0L
+        mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
+    }
+
+    private fun voiceContextValue(): String {
+        return when {
+            recordingRequested -> "recording_stop_only"
+            screenState == ScreenState.DEMO_SELECT -> "demo_select"
+            screenState == ScreenState.DEMO_PLAYING -> "demo_playing"
+            selectedMode == Mode.QA -> "qa"
+            selectedMode == Mode.SAFETY -> "safety"
+            selectedMode == Mode.OVERLAY_TEST -> "overlay_test"
+            selectedMode == Mode.EXPERIMENT -> "experiment_${selectedExperimentTypeValue()}"
+            else -> "VOICE_IDLE"
+        }
+    }
+
+    private fun isPassiveListenMode(mode: PassiveListenMode): Boolean {
+        return mode != PassiveListenMode.NONE
+    }
+
+    private fun resumePassiveStopOnlyListening(mode: PassiveListenMode) {
+        if (!isPassiveListenMode(mode)) {
+            mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
+            return
+        }
+        passiveListenMode = mode
+        enterAwakeModeNoTimeout()
+        when (mode) {
+            PassiveListenMode.DEMO_STOP -> {
+                if (activeDemoVideo != null) {
+                    activeTaskTitle = "演示指引"
+                    lastStatusText = "正在播放"
+                    lastResultText = ""
+                    screenState = ScreenState.DEMO_PLAYING
+                    renderScreen()
+                }
+            }
+            PassiveListenMode.DEMO_SELECT -> {
+                screenState = ScreenState.DEMO_SELECT
+                renderScreen()
+            }
+            PassiveListenMode.RECORD_STOP -> {
+                focusIndex = 0
+                clearTaskOutput()
+                screenState = ScreenState.LIVE_MINIMAL
+                renderScreen()
+            }
+            PassiveListenMode.NONE -> Unit
+        }
+        mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
+    }
+
+    private fun finishPassiveVoiceControl(delayMs: Long = 800L) {
+        mainHandler.postDelayed({ enterLiveMinimal() }, delayMs)
+    }
+
+    private fun handleAwakeIntent(json: JSONObject, context: String, passiveMode: PassiveListenMode) {
         val intent = json.optString("intent", "unclear")
         val slots = json.optJSONObject("slots")
         val experimentType = slots?.optString("experiment_type", "") ?: ""
         when (intent) {
             "start_recording" -> {
+                enterAwakeModeNoTimeout()
                 ensureRecordingPermissions()
-                enterLiveMinimal()
             }
             "stop_recording" -> {
                 stopRecordingService()
-                enterLiveMinimal()
+                finishPassiveVoiceControl(1_000L)
             }
             "capture_photo" -> {
                 startCaptureCountdown()
@@ -1346,7 +1453,8 @@ class MainActivity : AppCompatActivity() {
             "experiment_check" -> {
                 selectedMode = Mode.EXPERIMENT
                 playPrompt("ask_experiment")
-                enterLiveMinimal()
+                // 保持苏醒等待用户说实验类型
+                mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
             }
             "select_experiment" -> {
                 selectedMode = Mode.EXPERIMENT
@@ -1376,20 +1484,27 @@ class MainActivity : AppCompatActivity() {
             }
             "stop_demo_video" -> {
                 stopDemoPlayback()
-                enterLiveMinimal()
+                finishPassiveVoiceControl()
             }
             "cancel" -> {
                 stopDemoPlayback()
-                enterLiveMinimal()
+                finishPassiveVoiceControl()
+            }
+            "unclear", "unknown" -> {
+                if (isPassiveListenMode(passiveMode)) {
+                    resumePassiveStopOnlyListening(passiveMode)
+                } else {
+                    playPrompt("unclear")
+                    // 保持苏醒继续等待（不重置计时）
+                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
+                }
             }
             else -> {
-                playPrompt("unclear")
-                if (voiceReturnState == ScreenState.DEMO_SELECT) {
-                    enterDemoSelect()
-                } else if (voiceReturnState == ScreenState.DEMO_PLAYING) {
-                    resumeDemoPlaybackListening()
+                if (isPassiveListenMode(passiveMode)) {
+                    resumePassiveStopOnlyListening(passiveMode)
                 } else {
-                    enterLiveMinimal()
+                    playPrompt("unclear")
+                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
                 }
             }
         }
@@ -1398,15 +1513,8 @@ class MainActivity : AppCompatActivity() {
     private fun ScreenState.allowsVoiceIntent(): Boolean {
         return this == ScreenState.LIVE_MINIMAL ||
             this == ScreenState.DEMO_SELECT ||
-            this == ScreenState.DEMO_PLAYING
-    }
-
-    private fun voiceContextValue(): String {
-        return when (voiceReturnState) {
-            ScreenState.DEMO_SELECT -> "demo_select"
-            ScreenState.DEMO_PLAYING -> "demo_playing"
-            else -> selectedModeValue()
-        }
+            this == ScreenState.DEMO_PLAYING ||
+            this == ScreenState.VOICE_LISTENING
     }
 
     private fun startDemoGuide() {
@@ -1447,16 +1555,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun enterDemoSelect() {
         operationToken += 1
+        passiveListenMode = PassiveListenMode.DEMO_SELECT
+        enterAwakeModeNoTimeout()  // 选择视频期间保持苏醒
         activeTaskTitle = "演示指引"
         val options = demoVideos.mapIndexed { index, video -> "${index + 1}. ${video.label}" }
         lastStatusText = "请说视频序号或名称"
         lastResultText = options.joinToString("\n")
         screenState = ScreenState.DEMO_SELECT
         renderScreen()
-        val prompt = "可以选择：" + demoVideos.mapIndexed { index, video ->
-            "${index + 1}，${video.label}"
-        }.joinToString("；")
-        playDynamicPrompt(prompt) {
+        playPrompt("demo_select") {
             if (screenState == ScreenState.DEMO_SELECT) {
                 startVoiceIntentLoop()
             }
@@ -1477,11 +1584,8 @@ class MainActivity : AppCompatActivity() {
             lastResultText = "请说视频序号或名称。\n" + demoVideos.mapIndexed { i, item -> "${i + 1}. ${item.label}" }.joinToString("\n")
             screenState = ScreenState.DEMO_SELECT
             renderScreen()
-            playPrompt("unclear") {
-                if (screenState == ScreenState.DEMO_SELECT) {
-                    startVoiceIntentLoop()
-                }
-            }
+            passiveListenMode = PassiveListenMode.DEMO_SELECT
+            mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
             return
         }
         playDemoVideo(video)
@@ -1534,6 +1638,8 @@ class MainActivity : AppCompatActivity() {
     private fun playDemoVideo(video: DemoVideo) {
         stopAssistantAudio()
         stopVoiceIntentRecording()
+        passiveListenMode = PassiveListenMode.DEMO_STOP
+        enterAwakeModeNoTimeout()  // 视频播放期间保持苏醒
         activeDemoVideo = video
         activeTaskTitle = "演示指引"
         lastStatusText = "视频加载中"
@@ -1565,26 +1671,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun resumeDemoPlaybackListening() {
-        if (activeDemoVideo == null) {
-            enterLiveMinimal()
-            return
-        }
-        screenState = ScreenState.DEMO_PLAYING
-        renderScreen()
-        mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
-    }
-
     private fun stopDemoPlayback() {
         panels.forEach { panel ->
             panel.demoVideoView.stopPlayback()
             panel.demoVideoView.visibility = View.GONE
         }
+        passiveListenMode = PassiveListenMode.NONE
         activeDemoVideo = null
     }
     private fun playPrompt(name: String, onDone: (() -> Unit)? = null) {
         val resId = resources.getIdentifier(name, "raw", packageName)
         if (resId == 0) {
+            onDone?.invoke()
             return
         }
         stopAssistantAudio()
@@ -1777,8 +1875,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startRecordingService() {
+        passiveListenMode = PassiveListenMode.RECORD_STOP
+        enterAwakeModeNoTimeout()  // 录像期间保持苏醒
         recordingRequested = true
         recordingStatusText = "记录准备中"
+        focusIndex = 0
+        clearTaskOutput()
+        screenState = ScreenState.LIVE_MINIMAL
         renderScreen()
         playPrompt("recording_start")
         val intent = Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_START_RECORDING)
@@ -1792,6 +1895,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopRecordingService() {
+        passiveListenMode = PassiveListenMode.NONE
         recordingRequested = false
         recordingStatusText = "未记录"
         mainHandler.removeCallbacks(recordingStatusRunnable)
@@ -2394,3 +2498,14 @@ class MainActivity : AppCompatActivity() {
         return BufferedReader(input.reader(Charsets.UTF_8)).use { it.readText() }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
