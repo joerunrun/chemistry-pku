@@ -8,7 +8,7 @@ from typing import Any, Iterator
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from openrouter_cache_client import (
+from assets.baseline_vlm.openrouter_cache_client import (
     OpenRouterCacheConfig,
     OpenRouterCacheError,
     image_bytes_to_data_url,

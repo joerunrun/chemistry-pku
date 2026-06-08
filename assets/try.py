@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from chemistry_ai import ChemistryExperimentAI
+from assets.chemistry_ai import ChemistryExperimentAI
 from openrouter_client import OpenRouterGeminiClient
 from openrouter_client import (
     OpenRouterError,

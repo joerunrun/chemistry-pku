@@ -8,7 +8,7 @@ from functools import lru_cache
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
-from chemistry_ai import ChemistryExperimentAI
+from assets.chemistry_ai import ChemistryExperimentAI
 from client_factory import create_chat_client, get_provider_model_name
 from omni_client import OmniChemistryClient
 from openrouter_client import OpenRouterError

@@ -1,39 +1,34 @@
-# 校园网服务器部署说明
+# Docker + Nginx 部署说明
 
-本文档给工程师部署后端服务使用。目标是让智能眼镜通过校园网固定地址访问后端，不依赖开发机绝对路径，也不依赖 `adb reverse`。
+目标：服务器用 Docker Compose 启动两个容器：
 
-## 1. 交付内容
+- `chemistry-api`：Python 后端，Gunicorn 监听容器内 `5080`。
+- `nginx`：对外监听服务器 `80`，反向代理到 `chemistry-api:5080`。
 
-服务器只需要两部分：
+眼镜端只访问：
 
-1. 代码目录
-   - `pipeline/`
-   - `CV_detection2/`
-   - `client_factory.py`
-   - `openrouter_client.py`
-   - `ali_client.py`
-   - `omni_client.py`
-   - `gemini_client.py`
-   - `qiniu_client.py`
-   - `requirements.txt`
-   - `.env.example`
+```text
+http://<server-ip-or-domain>
+```
 
-2. 运行资源目录
-   - `runtime_assets/`
-   - 该目录不进 git，部署时作为资源包整体放到代码根目录旁边。
+不需要写 `:5080`，也不需要 `adb reverse`。
 
-Android 工程目录不需要交给服务器。Android 只是眼镜客户端，服务器只负责 HTTP API、模型调用、图片/视频资源读取。最终给眼镜安装 APK 即可。
+## 1. 服务器目录
 
-## 2. 推荐目录结构
-
-部署目录可以是任意位置，只要保持如下相对结构：
+把代码和资源包放成这个结构：
 
 ```text
 chemistry/
+  Dockerfile
+  docker-compose.yml
+  deploy/
+    nginx/
+      chemistry.conf
   pipeline/
   CV_detection2/
   runtime_assets/
   requirements.txt
+  env.example
   .env
   client_factory.py
   openrouter_client.py
@@ -43,128 +38,199 @@ chemistry/
   qiniu_client.py
 ```
 
-`runtime_assets/` 结构：
+`runtime_assets/` 不进 git，但部署时必须放到服务器：
 
 ```text
 runtime_assets/
   reference_images/
-    distillation_correct_annotated.png
   demo_videos/
     distillation/
       *.mp4
   cv_detection2_data/
-    annotations.json
-    descriptor_db.json
-    descriptor_db.npz
-    sift_descriptor_db.json
-    sift_descriptor_db.npz
-    images/
   safety_check_data/
-    features.npz
-    metadata.json
-    images/
   electrolysis_check_data/
-    features.npz
-    metadata.json
-    images/
   speaker_models/
-    3dspeaker_speech_eres2net_base_200k_sv_zh-cn_16k-common.onnx
 ```
 
-提前录好的眼镜提示音在 Android APK 内，不是服务器资源，不需要放到服务器。
+Android 工程不需要部署到服务器。服务器只需要后端代码、`runtime_assets/`、`.env`。
 
-## 3. 安装依赖
+## 2. 配置 API Key
 
-在服务器部署目录执行：
+在服务器代码目录复制模板：
 
-```powershell
-cd <deploy-root>/chemistry
-python -m pip install -r requirements.txt
+```bash
+cp env.example .env
 ```
 
-## 4. 配置 `.env`
-
-部署时直接使用 API key。做法是复制模板：
-
-```powershell
-copy .env.example .env
-```
-
-然后编辑 `.env`，填入 key 和模型配置。
-
-最少必须配置：
+然后编辑 `.env`：
 
 ```dotenv
 QINIU_API_KEY=
 DASHSCOPE_API_KEY=
-```
 
-推荐完整配置：
-
-```dotenv
-# 图片理解：实验纠错、安全检查、电解纠错
-QINIU_API_KEY=
 QINIU_MODEL=google/gemini-3.5-flash
 QINIU_API_BASE=https://api.qnaigc.com
 
-# 语音控制、语音问答、语音合成
-DASHSCOPE_API_KEY=
 OMNI_MODEL=qwen3.5-omni-flash-realtime
 OMNI_TTS_MODEL=qwen3.5-omni-plus-realtime
 OMNI_VOICE=Ethan
 
-# 资源目录。使用相对路径即可，默认按服务启动目录解析。
 CHEM_RUNTIME_ASSETS_DIR=runtime_assets
 ```
 
 说明：
 
-- `QINIU_API_KEY`：七牛云模型服务 key。实验纠错、安全检查、电解图片分析默认走 `qiniu + google/gemini-3.5-flash`。
+- `QINIU_API_KEY`：七牛云 key。实验纠错、安全检查、电解图片分析默认用 `qiniu + google/gemini-3.5-flash`。
 - `DASHSCOPE_API_KEY`：阿里云 DashScope key。语音指令、语音问答、语音合成使用 Qwen Omni。
-- `CHEM_RUNTIME_ASSETS_DIR`：资源包目录。部署目录结构按本文档放置时，填 `runtime_assets` 即可，不需要本机绝对路径。
-- `.env` 不进 git，不放进 `runtime_assets/`。交付工程师时可以单独私密传递 `.env`，或让工程师在服务器上按 `.env.example` 填写。
+- `.env` 不要提交 git，不要放进 `runtime_assets/`。
+- Docker Compose 会读取 `.env`，并在容器里把资源目录覆盖为 `/app/runtime_assets`。
 
-## 5. 启动服务
+## 3. 构建和启动
 
-在部署目录执行：
+在服务器代码目录执行：
+
+```bash
+docker compose up -d --build
+```
+
+查看状态：
+
+```bash
+docker compose ps
+docker compose logs -f chemistry-api
+docker compose logs -f nginx
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+更新代码后重新构建：
+
+```bash
+docker compose up -d --build
+```
+
+## 4. 验证接口
+
+服务器本机验证：
+
+```bash
+curl -i http://127.0.0.1/api/glasses/health
+curl -i http://127.0.0.1/api/glasses/demo/videos?experiment_type=distillation
+```
+
+外部电脑验证：
 
 ```powershell
-python -m pipeline.web.app --host 0.0.0.0 --port 5080
+curl.exe -i http://<server-ip-or-domain>/api/glasses/health
+curl.exe -i http://<server-ip-or-domain>/api/glasses/demo/videos?experiment_type=distillation
 ```
 
-如果部署为 Windows 服务、计划任务、NSSM、Docker 或 systemd，保持同样的工作目录、环境变量和启动命令即可。
-
-## 6. 校园网访问
-
-服务器需要提供固定访问地址：
+正确结果应为：
 
 ```text
-http://<server-ip-or-domain>:5080
+HTTP/1.1 200 OK
+Content-Type: application/json
+...
+"status":"ok"
 ```
 
-需要确认：
+如果返回 `302` 并跳到 `its.pku.edu.cn`，说明访问设备没有完成校园网认证，不是后端问题。
 
-- 防火墙允许 TCP 5080 入站。
-- 校园网策略允许眼镜所在网络访问该服务器和端口。
-- 校园网部署后，眼镜不需要 `adb reverse`。
+## 5. Nginx 配置
 
-健康检查：
+当前配置文件：
 
 ```text
-http://<server-ip-or-domain>:5080/api/glasses/health
+deploy/nginx/chemistry.conf
 ```
 
-应返回 JSON，且 `status` 为 `ok`。
+核心逻辑：
 
-## 7. 演示视频管理
+```nginx
+server {
+    listen 80;
+    server_name _;
 
-演示视频不进 APK，也不进 git。全部放服务器资源目录：
+    client_max_body_size 100m;
+    proxy_read_timeout 300s;
+
+    location / {
+        proxy_pass http://chemistry-api:5080;
+    }
+}
+```
+
+它会把所有请求转发到后端容器。后端容器不直接暴露公网端口，只在 Docker 网络内提供 `5080`。
+
+如果以后要用域名和 HTTPS，可以在 Nginx 这一层加证书，不需要改 Python 后端。
+
+## 6. 防火墙和云主机安全组
+
+服务器需要开放：
+
+```text
+TCP 80
+```
+
+不需要开放 `5080`。
+
+Ubuntu 如果启用了 UFW：
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw reload
+sudo ufw status
+```
+
+云主机控制台也要放行入站 TCP 80。
+
+## 7. 眼镜端配置
+
+Android 配置写：
+
+```xml
+<string name="glasses_connection_mode">network</string>
+<string name="glasses_service_base_url_network">http://<server-ip-or-domain></string>
+```
+
+不要写 `:5080`。
+
+重新打包安装 APK 后，眼镜会访问：
+
+```text
+http://<server-ip-or-domain>/api/glasses/health
+```
+
+校园网环境下，眼镜自己也必须完成校园网认证。可以在眼镜上执行：
+
+```bash
+/system/bin/curl -i http://<server-ip-or-domain>/api/glasses/health
+```
+
+如果看到：
+
+```text
+HTTP/1.1 302
+https://its.pku.edu.cn/?cause=unauthN
+```
+
+说明眼镜没有通过校园网认证，需要浏览器登录、MAC 白名单，或改用手机热点。
+
+## 8. 演示视频管理
+
+视频放这里：
 
 ```text
 runtime_assets/demo_videos/distillation/
 ```
 
-当前只支持 `.mp4`。新增视频时直接复制到该目录即可，不需要改代码。接口会按文件名排序，并返回编号加文件名：
+只支持 `.mp4`。新增视频后不需要重启服务，重新说“演示指引”即可看到新列表。
+
+接口按文件名排序，眼镜端用当前排序编号选择：
 
 ```text
 1. 减压蒸馏_操作流程.mp4
@@ -172,64 +238,62 @@ runtime_assets/demo_videos/distillation/
 3. 新增教学视频.mp4
 ```
 
-验证接口：
-
-```text
-http://<server-ip-or-domain>:5080/api/glasses/demo/videos?experiment_type=distillation
-```
-
-眼镜语音选择以接口返回顺序为准，支持：
+语音支持：
 
 - “第一个”
 - “第二个”
-- “第三个”
 - “播放 3 号”
 - “播放操作流程”
-- “播放原理与小结”
+- “停止播放”
 
-## 8. Android 客户端
+## 9. 常见问题
 
-Android 工程不需要部署到服务器。
+### 9.1 `ImportError: libGL.so.1`
 
-服务器部署完成后，只需要把眼镜 App 的服务地址改成校园网地址，重新打包安装 APK：
-
-```xml
-<string name="glasses_connection_mode">network</string>
-<string name="glasses_service_base_url_network">http://<server-ip-or-domain>:5080</string>
-```
-
-打包和安装在开发机执行即可。服务器不需要 Android SDK、Gradle 或 Android 工程。
-
-本地 USB 调试才需要：
-
-```powershell
-adb reverse tcp:5080 tcp:5080
-```
-
-校园网部署不需要执行这条命令。
-
-## 9. 验收
-
-服务器验收：
+服务器不要装 GUI 版 OpenCV。当前依赖已经使用：
 
 ```text
-/api/glasses/health
-/api/glasses/demo/videos?experiment_type=distillation
+opencv-python-headless
 ```
 
-眼镜验收：
+如果服务器旧环境装过 GUI 版：
 
-- 说“小北助手”可以唤醒。
-- 说“演示指引”显示当前视频列表。
-- 说“第二个”能播放对应排序的视频。
-- 播放中说“停止播放”能退出。
-- 新增 MP4 到 `runtime_assets/demo_videos/distillation/` 后，重新说“演示指引”，列表自动出现新视频。
-- 实验纠错、安全检查、电解实验能正常读取资源库。
+```bash
+python -m pip uninstall -y opencv-python opencv-python-headless
+python -m pip install -r requirements.txt
+```
 
-## 10. 常见问题
+Docker 部署一般不会遇到这个问题。
 
-- `health` 访问失败：检查服务是否启动、防火墙、校园网策略、端口是否为 5080。
-- 视频列表为空：检查 `CHEM_RUNTIME_ASSETS_DIR` 是否指向正确目录，以及 `.mp4` 是否放在 `runtime_assets/demo_videos/distillation/`。
-- 视频能列出但不能播放：用浏览器打开接口返回的 `stream_url`，检查是否能直接播放或下载。
-- 实验纠错缺参考图：检查 `runtime_assets/reference_images/distillation_correct_annotated.png` 是否存在。
-- 安全检查或电解检索失败：检查对应目录下的 `features.npz` 和 `metadata.json` 是否存在。
+### 9.2 外部电脑能访问，眼镜返回 302
+
+眼镜没有完成校园网认证。用 adb 查：
+
+```bash
+adb shell "/system/bin/curl -i http://<server-ip-or-domain>/api/glasses/health"
+```
+
+如果返回 `its.pku.edu.cn/?cause=unauthN`，需要给眼镜登录校园网或做 MAC 白名单。
+
+### 9.3 视频列表为空
+
+检查：
+
+```bash
+ls runtime_assets/demo_videos/distillation/
+docker compose exec chemistry-api ls /app/runtime_assets/demo_videos/distillation/
+```
+
+### 9.4 容器启动后接口 502
+
+查看后端日志：
+
+```bash
+docker compose logs -f chemistry-api
+```
+
+常见原因：
+
+- `.env` 没有配置 key。
+- `runtime_assets/` 没挂载。
+- Python 依赖安装失败。

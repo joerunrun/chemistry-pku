@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
-from ali_cache_client import AliCacheClient, AliCacheError
-from openrouter_cache_client import OpenRouterCacheClient, OpenRouterCacheError
+from assets.baseline_vlm.ali_cache_client import AliCacheClient, AliCacheError
+from assets.baseline_vlm.openrouter_cache_client import OpenRouterCacheClient, OpenRouterCacheError
 
 
 app = Flask(__name__, template_folder="templates", static_folder="static")

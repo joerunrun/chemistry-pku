@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request
 
-import detect
+import assets.CV_detection.detect as detect
 
 
 BBOX_PATH = Path(__file__).with_name("bbox.json")
