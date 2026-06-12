@@ -11,8 +11,15 @@ services:
       - .env
     environment:
       CHEM_RUNTIME_ASSETS_DIR: /app/runtime_assets
+      CHEM_GLASSES_JOB_WORKERS: ${CHEM_GLASSES_JOB_WORKERS:-4}
+      CHEM_GLASSES_MAX_PENDING_JOBS: ${CHEM_GLASSES_MAX_PENDING_JOBS:-50}
+      CHEM_VLM_CONCURRENCY: ${CHEM_VLM_CONCURRENCY:-4}
+      CHEM_OMNI_CONCURRENCY: ${CHEM_OMNI_CONCURRENCY:-4}
+      WEB_WORKERS: ${WEB_WORKERS:-1}
+      WEB_THREADS: ${WEB_THREADS:-8}
+      WEB_TIMEOUT: ${WEB_TIMEOUT:-300}
     volumes:
-      - ./runtime_assets:/app/runtime_assets:ro
+      - ./runtime_assets:/app/runtime_assets
     expose:
       - "5080"
 
@@ -26,3 +33,4 @@ services:
       - "80:80"
     volumes:
       - ./deploy/nginx/chemistry.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./runtime_assets/demo_videos:/data/demo_videos:ro

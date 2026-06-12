@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 5080
 
-CMD ["gunicorn", "-w", "1", "--threads", "4", "--timeout", "300", "--bind", "0.0.0.0:5080", "pipeline.web.app:app"]
+CMD ["sh", "-c", "gunicorn -w ${WEB_WORKERS:-1} --threads ${WEB_THREADS:-8} --timeout ${WEB_TIMEOUT:-300} --bind 0.0.0.0:5080 pipeline.web.app:app"]

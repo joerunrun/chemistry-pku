@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import json
+import mimetypes
 import os
+import re
+import shutil
 import sys
 import time
 import uuid
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Semaphore
 from typing import Any
 
 import cv2
@@ -34,7 +39,7 @@ from pipeline.experiments import get_experiment_config
 from pipeline.resource_paths import runtime_asset_path
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
 
 # 内存存储：session_id → detection 结果
 _detect_store: dict[str, dict] = {}
@@ -42,7 +47,8 @@ _TTL_SECONDS = 3600
 _GLASSES_JOB_TTL_SECONDS = 30 * 60
 _GLASSES_DEFAULT_PROVIDER = DEFAULT_VLM_PROVIDER
 _GLASSES_DEFAULT_MODEL = DEFAULT_VLM_MODEL
-_GLASSES_JOB_WORKERS = 2
+_GLASSES_JOB_WORKERS = int(os.environ.get("CHEM_GLASSES_JOB_WORKERS", "4"))
+_GLASSES_MAX_PENDING = int(os.environ.get("CHEM_GLASSES_MAX_PENDING_JOBS", "50"))
 _GLASSES_EXPERIMENTS = {
     "distillation": "减压蒸馏",
     "photometer": "光度计",
@@ -50,6 +56,8 @@ _GLASSES_EXPERIMENTS = {
     "other": "其它测试",
 }
 _DEMO_VIDEO_EXPERIMENTS = ("distillation",)
+_ALLOWED_DEMO_VIDEO_SUFFIXES = {".mp4"}
+_ALLOWED_RECORD_SUFFIXES = {".mp4", ".wav", ".m4a", ".aac", ".mp3"}
 _TEACHER_SPEAKER_THRESHOLD = 0.5
 _TEACHER_SPEAKER_MIN_SPEECH_MS = 200
 _TEACHER_DEFAULT_EMBEDDING_MODEL = runtime_asset_path(
@@ -65,6 +73,8 @@ _glasses_executor = ThreadPoolExecutor(
 )
 _glasses_jobs: dict[str, dict[str, Any]] = {}
 _glasses_lock = Lock()
+_vlm_semaphore = Semaphore(int(os.environ.get("CHEM_VLM_CONCURRENCY", "4")))
+_omni_semaphore = Semaphore(int(os.environ.get("CHEM_OMNI_CONCURRENCY", "4")))
 EXPERIMENT_UI_CONFIG_PATH = Path(__file__).resolve().parent.parent / "experiment_ui_config.json"
 
 
@@ -79,6 +89,11 @@ def _cleanup_store():
 @app.get("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/admin")
+def admin_index():
+    return render_template("admin.html")
 
 
 @app.get("/api/references")
@@ -211,19 +226,17 @@ def glasses_teacher_verify():
 
 @app.get("/api/glasses/demo/videos")
 def glasses_demo_videos():
-    experiment_type = request.args.get("experiment_type", "distillation").strip() or "distillation"
     try:
-        videos = _list_demo_videos(experiment_type)
+        videos = _list_demo_videos()
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({
-        "experiment_type": experiment_type,
         "videos": [
             {
                 "id": item["id"],
                 "label": item["label"],
                 "filename": item["filename"],
-                "stream_url": url_for("glasses_demo_video_stream", video_id=item["id"]),
+                "stream_url": f"/static-videos/{item['relative_path']}",
             }
             for item in videos
         ],
@@ -236,6 +249,172 @@ def glasses_demo_video_stream(video_id: str):
     if video_path is None:
         return jsonify({"error": "video not found"}), 404
     return send_file(video_path, mimetype="video/mp4", conditional=True)
+
+
+@app.get("/admin/api/demo/videos")
+def admin_demo_videos():
+    try:
+        return jsonify({"videos": _list_demo_videos()})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/admin/api/demo/videos")
+def admin_upload_demo_video():
+    uploaded = request.files.get("video")
+    if uploaded is None or not uploaded.filename:
+        return jsonify({"error": "missing video file"}), 400
+
+    original_name = _safe_upload_filename(uploaded.filename)
+    if Path(original_name).suffix.lower() not in _ALLOWED_DEMO_VIDEO_SUFFIXES:
+        return jsonify({"error": "only .mp4 demo videos are supported"}), 400
+
+    target_dir = _demo_video_root()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = _unique_path(target_dir / original_name)
+    uploaded.save(target_path)
+
+    videos = _list_demo_videos()
+    created = next((item for item in videos if Path(item["path"]) == target_path), None)
+    return jsonify({"status": "ok", "video": created}), 201
+
+
+@app.get("/admin/api/demo/videos/<video_id>/download")
+def admin_download_demo_video(video_id: str):
+    video_path = _resolve_demo_video(video_id)
+    if video_path is None:
+        return jsonify({"error": "video not found"}), 404
+    return send_file(video_path, mimetype="video/mp4", as_attachment=True, download_name=video_path.name)
+
+
+@app.delete("/admin/api/demo/videos/<video_id>")
+def admin_delete_demo_video(video_id: str):
+    video_path = _resolve_demo_video(video_id)
+    if video_path is None:
+        return jsonify({"error": "video not found"}), 404
+    try:
+        video_path.unlink()
+    except PermissionError:
+        return jsonify({"error": "video is currently in use"}), 409
+    return jsonify({"status": "ok"})
+
+
+@app.post("/api/glasses/records/upload")
+def glasses_upload_record():
+    video_file = request.files.get("video")
+    audio_file = request.files.get("audio")
+    if (video_file is None or not video_file.filename) and (audio_file is None or not audio_file.filename):
+        return jsonify({"error": "missing record file"}), 400
+
+    now = datetime.now(timezone.utc)
+    device_id = _safe_text_field(request.form.get("device_id"), "unknown_device")
+    experiment_type = _safe_text_field(request.form.get("experiment_type"), "unknown_experiment")
+    record_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    record_dir = _record_root() / now.strftime("%Y%m%d") / record_id
+    record_dir.mkdir(parents=True, exist_ok=True)
+
+    files: list[dict[str, Any]] = []
+    try:
+        if video_file is not None and video_file.filename:
+            files.append(_save_record_upload(video_file, record_dir, "record_video"))
+        if audio_file is not None and audio_file.filename:
+            files.append(_save_record_upload(audio_file, record_dir, "record_audio"))
+    except ValueError as exc:
+        shutil.rmtree(record_dir, ignore_errors=True)
+        return jsonify({"error": str(exc)}), 400
+
+    client_metadata = _parse_metadata_field(request.form.get("metadata"))
+    metadata = {
+        "record_id": record_id,
+        "device_id": device_id,
+        "experiment_type": experiment_type,
+        "started_at": request.form.get("started_at", ""),
+        "ended_at": request.form.get("ended_at", ""),
+        "created_at": now.isoformat(),
+        "files": files,
+        "metadata": client_metadata,
+    }
+    (record_dir / "record.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return jsonify({"status": "ok", "record": _record_summary(record_dir)}), 201
+
+
+@app.get("/admin/api/records")
+def admin_records():
+    return jsonify({"records": _list_records()})
+
+
+@app.get("/admin/api/records/<record_id>/files/<filename>")
+def admin_download_record_file(record_id: str, filename: str):
+    record_dir = _resolve_record_dir(record_id)
+    if record_dir is None:
+        return jsonify({"error": "record not found"}), 404
+    safe_name = Path(filename).name
+    file_path = record_dir / safe_name
+    if not file_path.exists() or not file_path.is_file():
+        return jsonify({"error": "file not found"}), 404
+    mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    return send_file(file_path, mimetype=mime, as_attachment=True, download_name=file_path.name)
+
+
+@app.delete("/admin/api/records/<record_id>")
+def admin_delete_record(record_id: str):
+    record_dir = _resolve_record_dir(record_id)
+    if record_dir is None:
+        return jsonify({"error": "record not found"}), 404
+    try:
+        shutil.rmtree(record_dir)
+    except PermissionError:
+        return jsonify({"error": "record is currently in use"}), 409
+    return jsonify({"status": "ok"})
+
+
+@app.get("/admin/api/feedback")
+def admin_feedback():
+    return jsonify({"feedback": _list_feedback()})
+
+
+@app.post("/admin/api/feedback")
+def admin_create_feedback():
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title", "")).strip()
+    content = str(payload.get("content", "")).strip()
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+    if len(title) > 120:
+        return jsonify({"error": "title is too long"}), 400
+    if len(content) > 5000:
+        return jsonify({"error": "content is too long"}), 400
+
+    now = datetime.now(timezone.utc)
+    feedback_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    item = {
+        "feedback_id": feedback_id,
+        "title": title,
+        "content": content,
+        "created_at": now.isoformat(),
+    }
+    root = _feedback_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{feedback_id}.json").write_text(
+        json.dumps(item, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return jsonify({"status": "ok", "feedback": item}), 201
+
+
+@app.delete("/admin/api/feedback/<feedback_id>")
+def admin_delete_feedback(feedback_id: str):
+    feedback_path = _resolve_feedback_path(feedback_id)
+    if feedback_path is None:
+        return jsonify({"error": "feedback not found"}), 404
+    try:
+        feedback_path.unlink()
+    except PermissionError:
+        return jsonify({"error": "feedback is currently in use"}), 409
+    return jsonify({"status": "ok"})
 
 
 @app.post("/api/glasses/qa")
@@ -252,11 +431,16 @@ def glasses_qa():
 
         from pipeline.qa.llm_qa import answer_question
 
-        answer, vlm_ms = answer_question(
-            question,
-            provider=provider,
-            model=model,
-        )
+        if not _vlm_semaphore.acquire(timeout=30):
+            return jsonify({"error": "Server busy, try again."}), 503
+        try:
+            answer, vlm_ms = answer_question(
+                question,
+                provider=provider,
+                model=model,
+            )
+        finally:
+            _vlm_semaphore.release()
         return jsonify({
             "question": question,
             "answer": answer,
@@ -287,11 +471,16 @@ def glasses_qa_audio():
 
         from pipeline.qa.omni_audio_qa import answer_audio_question
 
-        result = answer_audio_question(
-            audio_bytes,
-            model=model or None,
-            timeout_seconds=timeout_seconds,
-        )
+        if not _omni_semaphore.acquire(timeout=30):
+            return jsonify({"error": "Server busy, try again."}), 503
+        try:
+            result = answer_audio_question(
+                audio_bytes,
+                model=model or None,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            _omni_semaphore.release()
         timings = dict(result.get("timings", {}))
         timings["total_http"] = round((time.perf_counter() - started) * 1000, 1)
         return jsonify({
@@ -319,11 +508,16 @@ def glasses_tts():
 
         from pipeline.qa.omni_tts import synthesize_text_to_audio
 
-        result = synthesize_text_to_audio(
-            text,
-            model=model,
-            timeout_seconds=timeout_seconds,
-        )
+        if not _omni_semaphore.acquire(timeout=30):
+            return jsonify({"error": "Server busy, try again."}), 503
+        try:
+            result = synthesize_text_to_audio(
+                text,
+                model=model,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            _omni_semaphore.release()
         timings = dict(result.get("timings", {}))
         timings["total_http"] = round((time.perf_counter() - started) * 1000, 1)
         return jsonify({
@@ -355,13 +549,18 @@ def glasses_voice_intent():
 
         from pipeline.voice_control.intent_omni import classify_audio_intent
 
-        result = classify_audio_intent(
-            audio_bytes,
-            context=context,
-            demo_options=demo_options,
-            model=model or None,
-            timeout_seconds=timeout_seconds,
-        )
+        if not _omni_semaphore.acquire(timeout=30):
+            return jsonify({"error": "Server busy, try again."}), 503
+        try:
+            result = classify_audio_intent(
+                audio_bytes,
+                context=context,
+                demo_options=demo_options,
+                model=model or None,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            _omni_semaphore.release()
         timings = dict(result.get("timings", {}))
         timings["total_http"] = round((time.perf_counter() - started) * 1000, 1)
         result["timings"] = timings
@@ -828,6 +1027,10 @@ def _submit_glasses_job(
     provider: str,
     model: str,
 ) -> str:
+    with _glasses_lock:
+        pending = sum(1 for j in _glasses_jobs.values() if j.get("status") in ("queued", "running"))
+        if pending >= _GLASSES_MAX_PENDING:
+            raise RuntimeError(f"Too many pending jobs ({pending}), try again later.")
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     with _glasses_lock:
@@ -1282,31 +1485,53 @@ def _list_experiment_references(cfg):
     return refs
 
 
-def _list_demo_videos(experiment_type: str) -> list[dict[str, str]]:
-    if experiment_type not in _DEMO_VIDEO_EXPERIMENTS:
-        return []
-    video_dir = runtime_asset_path("demo_videos", experiment_type)
-    if not video_dir.exists():
-        raise ValueError(f"演示视频目录不存在: {video_dir}")
+def _demo_video_root() -> Path:
+    return runtime_asset_path("demo_videos")
+
+
+def _record_root() -> Path:
+    return runtime_asset_path("user_records")
+
+
+def _feedback_root() -> Path:
+    return runtime_asset_path("feedback")
+
+
+def _list_demo_videos() -> list[dict[str, str]]:
+    video_dir = _demo_video_root()
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = [
+        path for path in video_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in _ALLOWED_DEMO_VIDEO_SUFFIXES
+    ]
+    paths.sort(key=lambda item: item.relative_to(video_dir).as_posix().lower())
 
     videos = []
-    for index, path in enumerate(sorted(video_dir.glob("*.mp4"), key=lambda item: item.name.lower()), start=1):
+    for index, path in enumerate(paths, start=1):
         videos.append({
-            "id": _demo_video_id(experiment_type, path),
+            "id": _demo_video_id(path),
             "label": _demo_video_label(index, path),
             "filename": path.name,
+            "relative_path": path.relative_to(video_dir).as_posix(),
             "path": str(path),
+            "size": path.stat().st_size,
         })
     return videos
 
 
 def _resolve_demo_video(video_id: str) -> Path | None:
-    for experiment_type in _DEMO_VIDEO_EXPERIMENTS:
-        for item in _list_demo_videos(experiment_type):
-            if item["id"] == video_id:
-                path = Path(item["path"])
-                return path if path.exists() and path.suffix.lower() == ".mp4" else None
-    return None
+    try:
+        rel = _decode_urlsafe_id(video_id)
+    except ValueError:
+        return None
+    path = (_demo_video_root() / rel).resolve()
+    root = _demo_video_root().resolve()
+    if not _is_relative_to(path, root):
+        return None
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in _ALLOWED_DEMO_VIDEO_SUFFIXES:
+        return None
+    return path
 
 
 def _teacher_embedding_model_path() -> Path:
@@ -1320,14 +1545,167 @@ def _teacher_embedding_model_path() -> Path:
     return path
 
 
-def _demo_video_id(experiment_type: str, path: Path) -> str:
-    import base64
-    raw = f"{experiment_type}:{path.stem}".encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+def _demo_video_id(path: Path) -> str:
+    rel = path.relative_to(_demo_video_root()).as_posix()
+    return _encode_urlsafe_id(rel)
 
 
 def _demo_video_label(index: int, path: Path) -> str:
     return f"{index}. {path.name}"
+
+
+def _encode_urlsafe_id(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_urlsafe_id(value: str) -> str:
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.urlsafe_b64decode((value + padding).encode("ascii")).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("invalid id") from exc
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_upload_filename(filename: str) -> str:
+    raw = Path(filename).name.strip()
+    raw = re.sub(r"[\x00-\x1f\x7f]+", "", raw)
+    raw = re.sub(r'[<>:"/\\|?*]+', "_", raw)
+    raw = raw.strip(" .")
+    return raw or f"upload_{uuid.uuid4().hex[:8]}"
+
+
+def _safe_text_field(value: str | None, fallback: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r"[\x00-\x1f\x7f]+", "", text)
+    text = re.sub(r'[<>:"/\\|?*]+', "_", text)
+    return text[:80] or fallback
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return path.with_name(f"{path.stem}_{timestamp}_{uuid.uuid4().hex[:6]}{path.suffix}")
+
+
+def _parse_metadata_field(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw": raw}
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _save_record_upload(uploaded, record_dir: Path, prefix: str) -> dict[str, Any]:
+    original_name = _safe_upload_filename(uploaded.filename)
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in _ALLOWED_RECORD_SUFFIXES:
+        raise ValueError(f"unsupported record file type: {suffix}")
+    target = _unique_path(record_dir / f"{prefix}{suffix}")
+    uploaded.save(target)
+    return {
+        "filename": target.name,
+        "original_filename": original_name,
+        "size": target.stat().st_size,
+        "content_type": uploaded.mimetype or mimetypes.guess_type(target.name)[0] or "",
+    }
+
+
+def _list_records() -> list[dict[str, Any]]:
+    root = _record_root()
+    root.mkdir(parents=True, exist_ok=True)
+    records = []
+    for metadata_path in root.rglob("record.json"):
+        record_dir = metadata_path.parent
+        try:
+            records.append(_record_summary(record_dir))
+        except Exception:
+            continue
+    records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return records
+
+
+def _record_summary(record_dir: Path) -> dict[str, Any]:
+    metadata_path = record_dir / "record.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    files = []
+    for file_path in sorted(record_dir.iterdir(), key=lambda item: item.name.lower()):
+        if not file_path.is_file() or file_path.name == "record.json":
+            continue
+        files.append({
+            "filename": file_path.name,
+            "size": file_path.stat().st_size,
+            "download_url": url_for(
+                "admin_download_record_file",
+                record_id=record_dir.name,
+                filename=file_path.name,
+            ),
+        })
+    return {
+        "record_id": record_dir.name,
+        "device_id": metadata.get("device_id", ""),
+        "experiment_type": metadata.get("experiment_type", ""),
+        "created_at": metadata.get("created_at", ""),
+        "started_at": metadata.get("started_at", ""),
+        "ended_at": metadata.get("ended_at", ""),
+        "files": files,
+        "path": str(record_dir),
+    }
+
+
+def _resolve_record_dir(record_id: str) -> Path | None:
+    safe_id = _safe_text_field(record_id, "")
+    if not safe_id or safe_id != record_id:
+        return None
+    root = _record_root().resolve()
+    for metadata_path in root.rglob("record.json"):
+        record_dir = metadata_path.parent.resolve()
+        if record_dir.name == record_id and _is_relative_to(record_dir, root):
+            return record_dir
+    return None
+
+
+def _list_feedback() -> list[dict[str, Any]]:
+    root = _feedback_root()
+    root.mkdir(parents=True, exist_ok=True)
+    items = []
+    for path in root.glob("*.json"):
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        item.setdefault("feedback_id", path.stem)
+        item.setdefault("title", "")
+        item.setdefault("content", "")
+        item.setdefault("created_at", "")
+        items.append(item)
+    items.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return items
+
+
+def _resolve_feedback_path(feedback_id: str) -> Path | None:
+    safe_id = _safe_text_field(feedback_id, "")
+    if not safe_id or safe_id != feedback_id:
+        return None
+    root = _feedback_root().resolve()
+    path = (root / f"{feedback_id}.json").resolve()
+    if not _is_relative_to(path, root):
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+    return path
 
 
 def _build_label_summary_from_results(correct_result, wrong_result, components):
