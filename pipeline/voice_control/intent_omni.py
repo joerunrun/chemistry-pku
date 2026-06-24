@@ -21,8 +21,7 @@ from omni_client import load_omni_config
 SUPPORTED_INTENTS = {
     "start_recording",
     "stop_recording",
-
-    "overlay_test",
+    "capture_photo",
     "experiment_check",
     "safety_check",
     "select_experiment",
@@ -30,11 +29,25 @@ SUPPORTED_INTENTS = {
     "select_demo_video",
     "stop_demo_video",
     "qa",
-
     "unclear",
-    "unknown",
 }
-SUPPORTED_EXPERIMENTS = {"distillation", "photometer", "electrolysis"}
+MAIN_INTENTS = {
+    "start_recording",
+    "capture_photo",
+    "experiment_check",
+    "safety_check",
+    "demo_guide",
+    "qa",
+    "unclear",
+}
+# 教师版：唤醒后只支持拍照和录像两类需求，不含纠错/安全检查/演示/问答。
+TEACHER_INTENTS = {
+    "capture_photo",
+    "start_recording",
+    "unclear",
+}
+SUPPORTED_EXPERIMENTS = {"distillation", "photometer", "electrolysis", "tlc"}
+# select_experiment 只用于启动阶段的 experiment_setup 上下文；苏醒模式不切换实验。
 
 # 沉睡模式：精简 prompt，只检测唤醒词
 SLEEP_MODE_PROMPT = """你是唤醒词检测器。判断用户是否说了“小北助手”。
@@ -42,49 +55,96 @@ SLEEP_MODE_PROMPT = """你是唤醒词检测器。判断用户是否说了“小
 规则: 只要明确听到“小北助手”就返回 true；其它内容、环境噪声、听不清都返回 false。
 """
 
-# 苏醒模式：完整指令识别（不含 wake）
-AWAKE_MODE_PROMPT = """你是智能眼镜的语音指令解析器。
-你的任务是把用户语音转写并映射到固定 intent。
-只能输出 JSON，不要输出 Markdown，不要解释。
+# 苏醒模式：自然语言理解 → 分类到固定 action（不含 wake）
+AWAKE_MODE_PROMPT = """你是一个自然语言理解分类器。
+眼镜用户正在做化学实验，随时会用**自然语言**（口语、随意、不固定句式）表达当下的需求。
+你的任务是**理解用户语义意图**，把它归类到下面某个 action。用户不会背诵固定口令，请根据含义判断，而不是字面匹配。
 
-支持的 intent:
-- start_recording: 用户要求开始记录、开始录像、开始录制实验过程
-- stop_recording: 用户要求结束记录、结束录像、停止录制并保存
-- overlay_test: 用户要求投影测试、框测试、透明框叠加测试、检测框投到实物上
-- experiment_check: 用户要求实验纠错、检查实验装置、装置检测，但还没有明确实验类型
-- safety_check: 用户要求安全检查、检查安全问题、检查安全隐患
-- select_experiment: 用户选择实验类型
-- demo_guide: 用户要求演示指引、播放演示、看操作视频，但还没有明确选择哪个视频
-- select_demo_video: 用户选择演示视频，例如第一个、第二个、操作流程、原理小结
-- stop_demo_video: 用户要求停止播放、退出播放、暂停演示
-- qa: 用户要提问、问答，或直接问了一个化学实验问题
-- unclear: 语音里有人说话，但转写不完整或听不清，不能可靠判断命令
-- unknown: 听清了，但不是支持命令
+可分类的 action（按语义场景）:
+- start_recording: 用户想记录、留存、保存当前的实验过程或画面，比如“把这一段录下来”“帮我存一下现在的过程”“我想留个档”“实验记录”。
+- capture_photo: 用户只想拍摄并保存一张照片，不要求分析，也不要求开始录像，比如“拍张照片”“帮我拍一下”“把现在这个画面拍下来”。
+- experiment_check: 用户对当前实验装置/操作有疑问，想检查装置对不对、纠错、纠正操作，比如“这样搭对吗”“装置好像不太对”“帮我看看有没有装错”“这里是不是不对”。
+- safety_check: 用户关心安全、担心隐患、想排查危险，比如“这样安全吗”“有没有什么问题”“会不会有问题”“检查一下安全”。
+- demo_guide: 用户想看演示/操作流程/原理视频指引，但还没明确选哪一个，比如“给我看看演示”“有操作视频吗”“放一下流程”。
+- qa: 用户在提问、求知、想知道原理/原因/做法，或者直接抛出一个化学问题，比如“为什么会这样”“这个原理是什么”“我想问一下”“帮我解释一下”。
+- unclear: 无法可靠映射到上述动作，包括听不清、内容不完整或内容与支持动作无关。
 
-支持的实验类型 slots.experiment_type:
+判断原则:
+1. 先把语音转写到 transcript。
+2. 理解用户**当下想做的一件事**，归类到最贴近的 action。口语化、省略主语、近义词、比喻都应该正确归类，不要苛求字面。
+3. 无法映射到支持动作时统一输出 unclear，不要输出 unknown。
+4. 苏醒模式不负责停止记录、选择视频、停止视频，也不负责投影测试。
+5. 如果用户只说实验名称而没有表达其它需求，intent=unclear。
+
+输出严格 JSON，不要 Markdown，不要解释:
+{
+  "transcript": "用户语音转写",
+  "intent": "上面的某个 action 名",
+  "slots": {"experiment_type": null, "video_index": null, "video_query": null},
+  "reply_text": "给眼镜用户看的简短中文确认或追问",
+  "confidence": 0.8
+}
+"""
+
+EXPERIMENT_SETUP_PROMPT = """你是智能眼镜启动时的实验名称选择器。
+用户正在选择今天要做的实验。
+
+你只能把语音映射到以下四个实验之一：
 - distillation: 减压蒸馏、蒸馏
 - photometer: 光度计、光度实验
 - electrolysis: 电解、电解实验
+- tlc: TLC、薄层色谱、薄层层析
 
-输出 JSON 格式:
+如果明确听到支持的实验名称，只输出严格 JSON：
+{"transcript":"用户语音转写","intent":"select_experiment","slots":{"experiment_type":"distillation|photometer|electrolysis|tlc","video_index":null,"video_query":null},"reply_text":"已选择该实验。","confidence":0.9}
+
+如果用户说的是无关内容、环境噪声，或听不清，只输出严格 JSON：
+{"transcript":"用户语音转写","intent":"unclear","slots":{"experiment_type":null,"video_index":null,"video_query":null},"reply_text":"请选择今天的实验。","confidence":0.5}
+"""
+
+# 教师版唤醒后：自然语言理解 → 只分类到拍照 / 开始录像
+TEACHER_AWAKE_PROMPT = """你是教师版智能眼镜的自然语言理解分类器。
+教师用**自然语言**（口语、随意、不固定句式）表达当下的需求，你只负责理解语义意图，归类到下面某个 action。根据含义判断，不要字面匹配。
+
+可分类的 action（只有这两个）:
+- capture_photo: 教师只想拍一张照片保存当前画面，比如"拍张照片""帮我拍一下""把现在这个画面拍下来""截个图"。
+- start_recording: 教师想开始录像、留存一段实验过程，比如"开始记录""录一段""把这一段录下来""开始录像""帮我存一下过程"。
+- unclear: 听不清、内容不完整、或不是拍照/录像需求（比如问问题、讨论、说与拍照录像无关的话）。
+
+判断原则:
+1. 先把语音转写到 transcript。
+2. 理解教师当下想做的一件事，归类到最贴近的 action。
+3. 无法映射到上述两个动作时统一输出 unclear。
+4. 不要输出 stop_recording、纠错、安全检查、演示、问答等其它意图。
+
+输出严格 JSON，不要 Markdown，不要解释:
 {
   "transcript": "用户语音转写",
-  "intent": "固定 intent",
+  "intent": "capture_photo|start_recording|unclear",
   "slots": {"experiment_type": null, "video_index": null, "video_query": null},
-  "reply_text": "给眼镜用户看的简短中文确认或追问",
-  "confidence": 0.0
+  "reply_text": "给教师看的简短中文确认",
+  "confidence": 0.8
 }
+"""
 
-规则:
-1. intent 必须来自支持列表。
-2. 如果没听清，intent=unclear，reply_text=我没有听清，请再说一遍。
-3. 如果听清但不是支持命令，intent=unknown。
-4. 如果用户说“实验纠错”但没说实验名称，intent=experiment_check，experiment_type=null。
-5. 如果用户说“实验纠错，减压蒸馏”，intent=select_experiment，experiment_type=distillation。
-6. 如果用户只说“减压蒸馏/光度计/电解”，也返回 select_experiment。
-7. 如果当前状态是 demo_select 或 demo_playing，优先判断演示视频选择或停止播放。
-8. 如果当前状态是 recording_stop_only，只识别停止记录；其它内容返回 unknown。
-9. 不要猜测低置信度命令；不确定就 unclear。
+# 教师版录像中：窄域，只识别停止录像
+TEACHER_RECORDING_STOP_PROMPT = """你是教师版眼镜的录像停止识别器。
+教师正在录像，你只判断教师是否要结束/保存这段录像。
+
+理解自然语言要宽松：任何表达完成/够了/停/保存的话都算 stop_recording，例如
+结束录像 / 停止录像 / 保存录像 / 录好了 / 可以了 / 差不多了 / 先停一下 / 别录了 / 结束吧 / 存一下。
+
+只有真正无关的内容（提问、聊天、环境噪声）才返回 unclear。
+允许的 action 只有 stop_recording 或 unclear。
+
+输出严格 JSON，slots 全部为 null:
+{
+  "transcript": "用户语音转写",
+  "intent": "stop_recording|unclear",
+  "slots": {"experiment_type": null, "video_index": null, "video_query": null},
+  "reply_text": "简短中文确认",
+  "confidence": 0.8
+}
 """
 
 
@@ -140,7 +200,8 @@ def classify_audio_intent(
 ) -> dict[str, Any]:
     ctx = (context or "").strip()
     is_sleep_mode = ctx == "sleep"
-    mode_name = "SLEEP" if is_sleep_mode else "AWAKE"
+    is_experiment_setup = ctx == "experiment_setup"
+    mode_name = "SLEEP" if is_sleep_mode else "EXPERIMENT_SETUP" if is_experiment_setup else "AWAKE"
 
     print(f"\n[voice_intent] === 开始处理 === mode={mode_name}, audio_size={len(audio_bytes)} bytes")
 
@@ -165,11 +226,15 @@ def classify_audio_intent(
     # intents such as qa while a video is playing.
     if is_sleep_mode:
         system_prompt = SLEEP_MODE_PROMPT
-    elif ctx in {"demo_playing", "recording_stop_only", "demo_select"}:
+    elif ctx == "teacher_awake":
+        system_prompt = TEACHER_AWAKE_PROMPT
+    elif ctx == "teacher_recording":
+        system_prompt = TEACHER_RECORDING_STOP_PROMPT
+    elif ctx in {"demo_playing", "recording_stop_only", "demo_select", "experiment_setup"}:
         system_prompt = _build_response_instruction(ctx, demo_options=demo_options)
     else:
         system_prompt = AWAKE_MODE_PROMPT
-    print(f"[voice_intent] 使用 prompt: {mode_name}_MODE_PROMPT")
+    print(f"[voice_intent] 使用 prompt: {mode_name}_MODE_PROMPT, context={ctx}")
 
     dashscope.api_key = config.api_key
     callback = OmniIntentCallback(complete_on_transcript=is_sleep_mode)
@@ -240,21 +305,81 @@ def classify_audio_intent(
             result = _parse_wake_json(callback.answer_text, callback.transcript)
             print(f"[voice_intent] 解析结果: wake={result.get('wake')}, transcript={result.get('transcript')!r}")
         else:
-            result = _parse_intent_json(callback.answer_text, callback.transcript)
+            result = _parse_intent_json(callback.answer_text, callback.transcript, context=ctx)
+            if ctx == "experiment_setup":
+                transcript = str(result.get("transcript") or callback.transcript or "").strip()
+                slots = result.get("slots") if isinstance(result.get("slots"), dict) else {}
+                experiment_type = slots.get("experiment_type") or _match_experiment_type(transcript)
+                if experiment_type in SUPPORTED_EXPERIMENTS:
+                    result = _safe_intent(
+                        transcript,
+                        "select_experiment",
+                        _default_reply("select_experiment", {"experiment_type": experiment_type}),
+                        0.7,
+                        experiment_type=experiment_type,
+                    )
+                else:
+                    result = _safe_intent(
+                        transcript,
+                        "unclear",
+                        "请选择今天的实验。",
+                        0.5,
+                    )
+            elif result.get("intent") == "select_experiment":
+                result = _safe_intent(
+                    str(result.get("transcript") or callback.transcript or ""),
+                    "unclear",
+                    "请先在启动阶段选择实验。当前可以说：实验纠错、安全检查、演示指引、开始记录或我要提问。",
+                    0.5,
+                )
             if ctx == "demo_playing" and result.get("intent") != "stop_demo_video":
                 result = _safe_intent(
                     str(result.get("transcript") or callback.transcript or ""),
-                    "unknown",
+                    "unclear",
                     "",
                     0.5,
                 )
             if ctx == "recording_stop_only" and result.get("intent") != "stop_recording":
                 result = _safe_intent(
                     str(result.get("transcript") or callback.transcript or ""),
-                    "unknown",
+                    "unclear",
                     "",
                     0.5,
                 )
+            if ctx == "demo_select" and result.get("intent") != "select_demo_video":
+                result = _safe_intent(
+                    str(result.get("transcript") or callback.transcript or ""),
+                    "unclear",
+                    "",
+                    0.5,
+                )
+            # 教师版唤醒后：只允许拍照/开始录像，其它一律 unclear
+            if ctx == "teacher_awake" and result.get("intent") not in {"capture_photo", "start_recording"}:
+                result = _safe_intent(
+                    str(result.get("transcript") or callback.transcript or ""),
+                    "unclear",
+                    "教师版只支持拍照和开始录像，请再说一遍。",
+                    0.5,
+                )
+            # 教师版录像中：只允许停止录像
+            if ctx == "teacher_recording" and result.get("intent") != "stop_recording":
+                result = _safe_intent(
+                    str(result.get("transcript") or callback.transcript or ""),
+                    "unclear",
+                    "",
+                    0.5,
+                )
+            if ctx not in {
+                "experiment_setup", "demo_playing", "recording_stop_only", "demo_select",
+                "teacher_awake", "teacher_recording",
+            }:
+                if result.get("intent") not in MAIN_INTENTS:
+                    result = _safe_intent(
+                        str(result.get("transcript") or callback.transcript or ""),
+                        "unclear",
+                        "我没有听清，请再说一遍。",
+                        0.5,
+                    )
             print(f"[voice_intent] 解析结果: intent={result.get('intent')}, transcript={result.get('transcript')!r}")
         
         result["timings"] = timings
@@ -286,19 +411,25 @@ def _build_response_instruction(
     if context_text == "demo_playing":
         return (
             "The glasses are currently playing a demo video. Your only task is to decide whether "
-            "the user asks to stop playback. Allowed intents: stop_demo_video or unknown. "
+            "the user asks to stop playback. Allowed intents: stop_demo_video or unclear. "
             "If the user says stop playback / exit playback / stop demo / pause demo / cancel, "
             "return stop_demo_video. For noise, questions, video selection, unclear speech, or any "
-            "other content, return unknown. Output strict JSON with slots all null."
+            "other content, return unclear. Output strict JSON with slots all null."
         )
+
+    if context_text == "experiment_setup":
+        return EXPERIMENT_SETUP_PROMPT
 
     if context_text == "recording_stop_only":
         return (
             "The glasses are currently recording an experiment. Your only task is to decide whether "
-            "the user asks to stop recording. Allowed intents: stop_recording or unknown. "
-            "If the user says end recording / stop recording / save recording, return stop_recording. "
-            "For noise, questions, unclear speech, or any other content, return unknown. "
-            "Output strict JSON with slots all null."
+            "the user wants to end or save the recording. Understand natural language generously: "
+            "treat any expression of finishing/done/enough/stopping/saving as stop_recording, e.g. "
+            "end recording / stop recording / save recording / I'm done / that's enough / "
+            "可以了 / 差不多行了 / 先停一下 / 别录了 / 录好了 / 保存一下 / 结束吧. "
+            "Only return unclear for genuinely unrelated content (asking questions, discussing "
+            "something else, environmental noise, or unrelated chitchat). "
+            "Allowed intents: stop_recording or unclear. Output strict JSON with slots all null."
         )
 
     if context_text == "demo_select":
@@ -311,17 +442,25 @@ def _build_response_instruction(
                 "When the user says filename keywords, output video_query as the original phrase.\n"
             )
         return (
-            "The glasses are on the demo-video selection page. Only decide which video the user selected, "
-            "or whether the user cancelled. Allowed intents: select_demo_video, cancel, unknown. "
-            "Do not output qa, demo_guide, or other intents. "
+            "The glasses are on the demo-video selection page. Only decide which video the user selected. "
+            "Allowed intents: select_demo_video or unclear. "
+            "Do not output qa, demo_guide, cancel, or other intents. "
             f"{extra}"
             "Output strict JSON. slots.video_index must be 0-based."
         )
 
+    if context_text == "teacher_awake":
+        return TEACHER_AWAKE_PROMPT
+
+    if context_text == "teacher_recording":
+        return TEACHER_RECORDING_STOP_PROMPT
+
     return (
         f"Current glasses state: {context_text}\n"
-        "Map the user's Chinese speech to one supported intent and output strict JSON. "
-        "Use unclear when confidence is below 0.65."
+        "Understand the user's natural, spoken Chinese and classify it to the single most fitting "
+        "action. Spoken, casual, or paraphrased expressions should be mapped correctly by meaning, "
+        "not by literal keywords. Use unclear whenever the speech cannot be mapped to a supported "
+        "main action. Output strict JSON."
     )
 
 def _parse_wake_json(text: str, fallback_transcript: str) -> dict[str, Any]:
@@ -339,15 +478,22 @@ def _parse_wake_json(text: str, fallback_transcript: str) -> dict[str, Any]:
     return {"wake": wake, "transcript": transcript}
 
 
-def _parse_intent_json(text: str, fallback_transcript: str) -> dict[str, Any]:
+def _parse_intent_json(
+    text: str,
+    fallback_transcript: str,
+    *,
+    context: str | None = None,
+) -> dict[str, Any]:
     payload = _extract_json(text)
     if payload is None:
-        return _fallback_from_transcript(fallback_transcript)
+        return _fallback_from_transcript(fallback_transcript, context=context)
 
     transcript = str(payload.get("transcript") or fallback_transcript or "").strip()
     intent = str(payload.get("intent") or "unclear").strip()
+    if intent == "unknown":
+        intent = "unclear"
     if intent not in SUPPORTED_INTENTS:
-        intent = "unknown"
+        intent = "unclear"
 
     raw_slots = payload.get("slots")
     slots = raw_slots if isinstance(raw_slots, dict) else {}
@@ -379,15 +525,15 @@ def _parse_intent_json(text: str, fallback_transcript: str) -> dict[str, Any]:
 
     raw_confidence = payload.get("confidence")
     confidence = _coerce_confidence(raw_confidence)
-    if raw_confidence is None and intent not in {"unknown", "unclear"}:
+    if raw_confidence is None and intent != "unclear":
         # Qwen Omni sometimes returns a minimal but valid JSON such as
         # {"intent": "select_demo_video", "slots": {"video_index": 1}}.
         # Treat that as usable instead of downgrading it to unclear only
         # because the optional confidence field is missing.
         confidence = 0.7
-    if confidence < 0.65 and intent not in {"unknown", "unclear"}:
-        intent = "unclear"
-        slots = {"experiment_type": None, "video_index": None, "video_query": None}
+    # 信任 omni 的分类结果，不再用置信度阈值降级 intent。
+    # confidence 字段仍然透传，仅用于日志/调试。
+    # omni 判定映射不到时自己会输出 unknown，作为兜底。
 
     reply_text = str(payload.get("reply_text") or "").strip()
     if not reply_text:
@@ -419,69 +565,97 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _fallback_from_transcript(transcript: str) -> dict[str, Any]:
-    """苏醒模式的关键词兜底匹配。"""
+def _fallback_from_transcript(
+    transcript: str,
+    *,
+    context: str | None = None,
+) -> dict[str, Any]:
+    """Context-aware keyword fallback when Omni does not return valid JSON."""
     normalized = transcript.strip()
     if not normalized:
         return _safe_intent("", "unclear", "我没有听清，请再说一遍。", 0.0)
 
+    ctx = (context or "").strip()
+    if ctx == "recording_stop_only":
+        if any(word in normalized for word in (
+            "结束记录", "停止记录", "结束录像", "停止录像", "保存录像",
+            "录好了", "可以停了", "别录了", "先停一下", "结束吧",
+        )):
+            return _safe_intent(normalized, "stop_recording", "结束记录。", 0.7)
+        return _safe_intent(normalized, "unclear", "", 0.5)
+
+    if ctx == "demo_playing":
+        if any(word in normalized for word in (
+            "停止播放", "退出播放", "暂停演示", "停止演示", "别放了",
+        )):
+            return _safe_intent(normalized, "stop_demo_video", "已停止播放。", 0.7)
+        return _safe_intent(normalized, "unclear", "", 0.5)
+
+    if ctx == "demo_select":
+        video_index = _match_demo_video_index(normalized)
+        if video_index is not None or any(
+            word in normalized for word in ("操作流程", "操作视频", "原理", "小结")
+        ):
+            return _safe_intent(
+                normalized,
+                "select_demo_video",
+                "开始播放演示视频。",
+                0.7,
+                video_index=video_index,
+                video_query=normalized,
+            )
+        return _safe_intent(normalized, "unclear", "", 0.5)
+
+    if ctx == "experiment_setup":
+        experiment_type = _match_experiment_type(normalized)
+        if experiment_type:
+            return _safe_intent(
+                normalized,
+                "select_experiment",
+                _default_reply("select_experiment", {"experiment_type": experiment_type}),
+                0.7,
+                experiment_type=experiment_type,
+            )
+        return _safe_intent(normalized, "unclear", "请选择今天的实验。", 0.5)
+
+    # 教师版录像中：只识别停止录像
+    if ctx == "teacher_recording":
+        if any(word in normalized for word in (
+            "结束录像", "停止录像", "保存录像", "结束记录", "停止记录",
+            "录好了", "可以了", "差不多了", "别录了", "先停一下", "结束吧", "存一下",
+        )):
+            return _safe_intent(normalized, "stop_recording", "结束记录。", 0.7)
+        return _safe_intent(normalized, "unclear", "", 0.5)
+
+    # 教师版唤醒后：只识别拍照 / 开始录像
+    if ctx == "teacher_awake":
+        if any(word in normalized for word in (
+            "拍张照片", "拍一张", "拍照", "帮我拍", "拍下来", "截个图", "保存照片",
+        )):
+            return _safe_intent(normalized, "capture_photo", "开始拍照。", 0.7)
+        if any(word in normalized for word in (
+            "开始记录", "开始录像", "开始录制", "录一段", "录一下", "录下来", "帮我存",
+        )):
+            return _safe_intent(normalized, "start_recording", "开始记录。", 0.7)
+        return _safe_intent(normalized, "unclear", "教师版只支持拍照和开始录像。", 0.5)
+
     lower = normalized.lower()
-    if any(word in normalized for word in ("停止播放", "退出播放", "暂停演示", "停止演示")):
-        return _safe_intent(normalized, "stop_demo_video", "已停止播放。", 0.7)
-    if any(word in normalized for word in ("停止播放", "退出播放", "暂停演示", "停止演示")):
-        return _safe_intent(normalized, "stop_demo_video", "已停止播放。", 0.7)
-    video_index = _match_demo_video_index(normalized)
-    if video_index is not None or any(word in normalized for word in ("操作流程", "操作视频", "原理", "小结")):
-        return _safe_intent(
-            normalized,
-            "select_demo_video",
-            "开始播放演示视频。",
-            0.7,
-            video_index=video_index,
-            video_query=normalized,
-        )
-    if video_index is not None or any(word in normalized for word in ("操作流程", "操作视频", "原理", "小结")):
-        return _safe_intent(
-            normalized,
-            "select_demo_video",
-            "开始播放演示视频。",
-            0.7,
-            video_index=video_index,
-            video_query=normalized,
-        )
     if any(word in normalized for word in ("演示指引", "播放演示", "看演示", "看视频", "演示视频")):
         return _safe_intent(normalized, "demo_guide", "进入演示指引。", 0.7)
-    if any(word in normalized for word in ("演示指引", "播放演示", "看演示", "看视频", "操作视频")):
-        return _safe_intent(normalized, "demo_guide", "进入演示指引。", 0.7)
-    if any(word in normalized for word in ("投影测试", "框测试", "叠加测试", "检测框测试", "实物叠加", "透明框")):
-        return _safe_intent(normalized, "overlay_test", "开始投影测试，请保持目标在视野中央。", 0.7)
     if any(word in normalized for word in ("开始记录", "开始录像", "开始录制")):
         return _safe_intent(normalized, "start_recording", "开始记录。", 0.7)
-    if any(word in normalized for word in ("结束记录", "停止记录", "结束录像", "停止录像", "保存录像")):
-        return _safe_intent(normalized, "stop_recording", "结束记录。", 0.7)
     if any(word in normalized for word in ("开始拍照", "拍一张", "拍照", "保存照片")):
         return _safe_intent(normalized, "capture_photo", "开始拍照。", 0.7)
     if "安全" in normalized:
         return _safe_intent(normalized, "safety_check", "开始安全检查，请保持现场在视野中央。", 0.7)
     if any(word in normalized for word in ("实验纠错", "装置检测", "检查实验装置")):
-        return _safe_intent(normalized, "experiment_check", "开始实验纠错，请说实验名称。", 0.7)
-    experiment_type = _match_experiment_type(normalized)
-    if experiment_type:
-        return _safe_intent(
-            normalized,
-            "select_experiment",
-            _default_reply("select_experiment", {"experiment_type": experiment_type}),
-            0.7,
-            experiment_type=experiment_type,
-        )
+        return _safe_intent(normalized, "experiment_check", "开始实验纠错，请保持画面稳定。", 0.7)
     if any(
         word in normalized
         for word in ("提问", "我要问", "问一个", "请问", "问答", "解释一下", "为什么", "怎么")
     ) or "?" in lower:
         return _safe_intent(normalized, "qa", "请说你的问题。", 0.7)
-    if any(word in normalized for word in ("取消", "退出")):
-        return _safe_intent(normalized, "cancel", "已取消。", 0.7)
-    return _safe_intent(normalized, "unknown", "这个指令暂不支持。你可以说：演示指引、开始记录、安全检查、实验纠错或我要提问。", 0.5)
+    return _safe_intent(normalized, "unclear", "我没有听清，请再说一遍。", 0.5)
 
 
 def _looks_like_demo_guide_request(text: str) -> bool:
@@ -503,6 +677,8 @@ def _match_experiment_type(text: str) -> str | None:
         return "photometer"
     if "电解" in text:
         return "electrolysis"
+    if "TLC" in text.upper() or "薄层色谱" in text or "薄层层析" in text:
+        return "tlc"
     return None
 
 
@@ -562,7 +738,7 @@ def _safe_intent(
 ) -> dict[str, Any]:
     return {
         "transcript": transcript,
-        "intent": intent if intent in SUPPORTED_INTENTS else "unknown",
+        "intent": intent if intent in SUPPORTED_INTENTS else "unclear",
         "slots": {
             "experiment_type": experiment_type if experiment_type in SUPPORTED_EXPERIMENTS else None,
             "video_index": video_index,
@@ -598,19 +774,21 @@ def _default_reply(intent: str, slots: dict[str, Any]) -> str:
         "start_recording": "开始记录。",
         "stop_recording": "结束记录。",
         "capture_photo": "开始拍照。",
-        "overlay_test": "开始投影测试，请保持目标在视野中央。",
-        "experiment_check": "开始实验纠错，请说实验名称。",
+        "experiment_check": "开始实验纠错，请保持画面稳定。",
         "safety_check": "开始安全检查，请保持现场在视野中央。",
         "demo_guide": "进入演示指引。",
         "select_demo_video": "开始播放演示视频。",
         "stop_demo_video": "已停止播放。",
         "qa": "请说你的问题。",
-        "cancel": "已取消。",
-        "repeat": "请重复上一条提示。",
-        "unknown": "这个指令暂不支持。你可以说：演示指引、开始记录、安全检查、实验纠错或我要提问。",
+        "unclear": "我没有听清，请再说一遍。",
     }
     if intent == "select_experiment":
-        names = {"distillation": "减压蒸馏", "photometer": "光度计", "electrolysis": "电解"}
+        names = {
+            "distillation": "减压蒸馏",
+            "photometer": "光度计",
+            "electrolysis": "电解",
+            "tlc": "TLC",
+        }
         name = names.get(slots.get("experiment_type"), "该实验")
         return f"已选择{name}，请保持装置在视野中央。"
     return replies.get(intent, "我没有听清，请再说一遍。")

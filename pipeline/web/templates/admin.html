@@ -42,7 +42,7 @@
       align-items: center;
       flex-wrap: wrap;
     }
-    input[type="file"], input[type="text"], textarea {
+    input[type="file"], input[type="text"], select, textarea {
       min-width: 280px;
       padding: 8px;
       border: 1px solid var(--line);
@@ -100,11 +100,19 @@
   <section class="panel">
     <h2>演示视频</h2>
     <form id="videoForm" class="row">
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        实验：
+        <select id="videoExperiment" name="experiment_type" required>
+          <option value="distillation">减压蒸馏</option>
+          <option value="photometer">光度计</option>
+          <option value="electrolysis">电解实验</option>
+        </select>
+      </label>
       <input id="videoFile" name="video" type="file" accept="video/mp4" required>
       <button type="submit">上传视频</button>
       <button type="button" class="secondary" id="refreshVideos">刷新</button>
     </form>
-    <div style="margin-top:6px;font-size:13px;color:var(--muted);">支持 mp4 格式，单文件最大 100MB</div>
+    <div style="margin-top:6px;font-size:13px;color:var(--muted);">支持 mp4 格式，单文件最大 100MB；上传后保存到所选实验的视频目录。</div>
     <div id="videoStatus" class="status"></div>
     <div id="videoList"></div>
     <div id="videoPlayer" hidden style="margin-top:16px;">
@@ -177,20 +185,22 @@ async function fetchJson(url, options = {}) {
 }
 
 async function loadVideos() {
+  const experiment = document.getElementById('videoExperiment').value;
   setStatus(videoStatus, '正在加载视频...');
   try {
-    const data = await fetchJson('/admin/api/demo/videos');
+    const data = await fetchJson(`/admin/api/demo/videos?experiment_type=${encodeURIComponent(experiment)}`);
     const videos = data.videos || [];
     if (!videos.length) {
       document.getElementById('videoList').innerHTML = '<div class="empty">还没有演示视频。</div>';
     } else {
       document.getElementById('videoList').innerHTML = `
         <table>
-          <thead><tr><th>视频</th><th>大小</th><th>操作</th></tr></thead>
+          <thead><tr><th>视频</th><th>实验</th><th>大小</th><th>操作</th></tr></thead>
           <tbody>
             ${videos.map(video => `
               <tr>
                 <td>${escapeHtml(video.label || video.filename)}</td>
+                <td>${escapeHtml(video.experiment_label || video.experiment_type || '')}</td>
                 <td>${formatSize(video.size)}</td>
                 <td>
                   <div class="actions">
@@ -204,7 +214,8 @@ async function loadVideos() {
           </tbody>
         </table>`;
     }
-    setStatus(videoStatus, `共 ${videos.length} 个视频。`);
+    const experimentLabel = document.getElementById('videoExperiment').selectedOptions[0]?.textContent || '';
+    setStatus(videoStatus, `${experimentLabel}：共 ${videos.length} 个视频。`);
   } catch (error) {
     setStatus(videoStatus, error.message, true);
   }
@@ -296,6 +307,7 @@ document.getElementById('videoForm').addEventListener('submit', async (event) =>
   const fileInput = document.getElementById('videoFile');
   if (!fileInput.files.length) return;
   const formData = new FormData();
+  formData.append('experiment_type', document.getElementById('videoExperiment').value);
   formData.append('video', fileInput.files[0]);
   setStatus(videoStatus, '正在上传视频...');
   try {
@@ -382,6 +394,7 @@ document.addEventListener('click', async (event) => {
 });
 
 document.getElementById('refreshVideos').addEventListener('click', loadVideos);
+document.getElementById('videoExperiment').addEventListener('change', loadVideos);
 document.getElementById('refreshRecords').addEventListener('click', loadRecords);
 document.getElementById('recordDateFilter').addEventListener('change', renderRecords);
 document.getElementById('refreshFeedback').addEventListener('click', loadFeedback);

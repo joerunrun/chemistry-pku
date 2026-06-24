@@ -53,9 +53,15 @@ _GLASSES_EXPERIMENTS = {
     "distillation": "减压蒸馏",
     "photometer": "光度计",
     "electrolysis": "电解实验",
+    "tlc": "TLC",
     "other": "其它测试",
 }
-_DEMO_VIDEO_EXPERIMENTS = ("distillation",)
+_DEMO_VIDEO_EXPERIMENTS = {
+    "distillation": "减压蒸馏",
+    "photometer": "光度计",
+    "electrolysis": "电解实验",
+    "tlc": "TLC",
+}
 _ALLOWED_DEMO_VIDEO_SUFFIXES = {".mp4"}
 _ALLOWED_RECORD_SUFFIXES = {".mp4", ".wav", ".m4a", ".aac", ".mp3"}
 _TEACHER_SPEAKER_THRESHOLD = 0.5
@@ -227,7 +233,10 @@ def glasses_teacher_verify():
 @app.get("/api/glasses/demo/videos")
 def glasses_demo_videos():
     try:
-        videos = _list_demo_videos()
+        experiment_type = _normalize_demo_experiment_type(
+            request.args.get("experiment_type", "distillation")
+        )
+        videos = _list_demo_videos(experiment_type)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({
@@ -236,7 +245,8 @@ def glasses_demo_videos():
                 "id": item["id"],
                 "label": item["label"],
                 "filename": item["filename"],
-                "stream_url": f"/static-videos/{item['relative_path']}",
+                "experiment_type": item["experiment_type"],
+                "stream_url": f"/api/glasses/demo/videos/{item['id']}/stream",
             }
             for item in videos
         ],
@@ -254,7 +264,15 @@ def glasses_demo_video_stream(video_id: str):
 @app.get("/admin/api/demo/videos")
 def admin_demo_videos():
     try:
-        return jsonify({"videos": _list_demo_videos()})
+        experiment_type = request.args.get("experiment_type", "").strip()
+        videos = _list_demo_videos(_normalize_demo_experiment_type(experiment_type) if experiment_type else None)
+        return jsonify({
+            "experiments": [
+                {"value": key, "label": label}
+                for key, label in _DEMO_VIDEO_EXPERIMENTS.items()
+            ],
+            "videos": videos,
+        })
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -264,17 +282,21 @@ def admin_upload_demo_video():
     uploaded = request.files.get("video")
     if uploaded is None or not uploaded.filename:
         return jsonify({"error": "missing video file"}), 400
+    try:
+        experiment_type = _normalize_demo_experiment_type(request.form.get("experiment_type", ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     original_name = _safe_upload_filename(uploaded.filename)
     if Path(original_name).suffix.lower() not in _ALLOWED_DEMO_VIDEO_SUFFIXES:
         return jsonify({"error": "only .mp4 demo videos are supported"}), 400
 
-    target_dir = _demo_video_root()
+    target_dir = _demo_video_dir(experiment_type)
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = _unique_path(target_dir / original_name)
     uploaded.save(target_path)
 
-    videos = _list_demo_videos()
+    videos = _list_demo_videos(experiment_type)
     created = next((item for item in videos if Path(item["path"]) == target_path), None)
     return jsonify({"status": "ok", "video": created}), 201
 
@@ -633,7 +655,11 @@ def create_glasses_job():
             return jsonify({"error": "mode must be experiment or safety."}), 400
 
         experiment_type = request.form.get("experiment_type", "distillation").strip() or "distillation"
-        if mode == "experiment" and experiment_type != "electrolysis" and get_experiment_config(experiment_type) is None:
+        if (
+            mode == "experiment"
+            and experiment_type not in {"electrolysis", "tlc"}
+            and get_experiment_config(experiment_type) is None
+        ):
             return jsonify({"error": f"Unknown experiment_type: {experiment_type}"}), 400
 
         provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
@@ -1123,6 +1149,13 @@ def _run_glasses_job(
                 provider=provider,
                 model=model,
             )
+        elif experiment_type == "tlc":
+            result = _run_glasses_tlc_job(
+                job_id=job_id,
+                image_bytes=image_bytes,
+                provider=provider,
+                model=model,
+            )
         else:
             result = _run_glasses_experiment_job(
                 job_id=job_id,
@@ -1252,6 +1285,33 @@ def _run_glasses_electrolysis_job(
         "experiment_type": "electrolysis",
         "retrieved": _summarize_electrolysis_retrieval(retrieved),
         "timings": timings,
+    }
+
+
+def _run_glasses_tlc_job(
+    *,
+    job_id: str,
+    image_bytes: bytes,
+    provider: str,
+    model: str,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    from pipeline.tlc_check.vlm_check import analyze
+
+    _update_glasses_job(job_id, stage="vlm", message="Analyzing TLC image.")
+    analysis_text, vlm_ms = analyze(
+        image_bytes,
+        provider=provider,
+        model=model,
+    )
+    return {
+        "analysis_text": analysis_text,
+        "mode": "experiment",
+        "experiment_type": "tlc",
+        "timings": {
+            "vlm": vlm_ms,
+            "total": round((time.perf_counter() - started) * 1000, 1),
+        },
     }
 
 
@@ -1489,6 +1549,10 @@ def _demo_video_root() -> Path:
     return runtime_asset_path("demo_videos")
 
 
+def _demo_video_dir(experiment_type: str) -> Path:
+    return _demo_video_root() / experiment_type
+
+
 def _record_root() -> Path:
     return runtime_asset_path("user_records")
 
@@ -1497,7 +1561,22 @@ def _feedback_root() -> Path:
     return runtime_asset_path("feedback")
 
 
-def _list_demo_videos() -> list[dict[str, str]]:
+def _normalize_demo_experiment_type(value: str | None) -> str:
+    experiment_type = (value or "").strip()
+    if experiment_type not in _DEMO_VIDEO_EXPERIMENTS:
+        raise ValueError(f"未知演示视频实验类型: {experiment_type or '(empty)'}")
+    return experiment_type
+
+
+def _path_demo_experiment_type(path: Path, root: Path) -> str:
+    rel_parts = path.relative_to(root).parts
+    if rel_parts and rel_parts[0] in _DEMO_VIDEO_EXPERIMENTS:
+        return rel_parts[0]
+    # 兼容旧资源：之前直接放在 demo_videos/ 根目录的视频默认按减压蒸馏处理。
+    return "distillation"
+
+
+def _list_demo_videos(experiment_type: str | None = None) -> list[dict[str, str]]:
     video_dir = _demo_video_root()
     video_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1505,14 +1584,22 @@ def _list_demo_videos() -> list[dict[str, str]]:
         path for path in video_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in _ALLOWED_DEMO_VIDEO_SUFFIXES
     ]
+    if experiment_type is not None:
+        paths = [
+            path for path in paths
+            if _path_demo_experiment_type(path, video_dir) == experiment_type
+        ]
     paths.sort(key=lambda item: item.relative_to(video_dir).as_posix().lower())
 
     videos = []
     for index, path in enumerate(paths, start=1):
+        item_experiment_type = _path_demo_experiment_type(path, video_dir)
         videos.append({
             "id": _demo_video_id(path),
-            "label": _demo_video_label(index, path),
+            "label": _demo_video_label(index, path, item_experiment_type, include_experiment=experiment_type is None),
             "filename": path.name,
+            "experiment_type": item_experiment_type,
+            "experiment_label": _DEMO_VIDEO_EXPERIMENTS.get(item_experiment_type, item_experiment_type),
             "relative_path": path.relative_to(video_dir).as_posix(),
             "path": str(path),
             "size": path.stat().st_size,
@@ -1550,7 +1637,15 @@ def _demo_video_id(path: Path) -> str:
     return _encode_urlsafe_id(rel)
 
 
-def _demo_video_label(index: int, path: Path) -> str:
+def _demo_video_label(
+    index: int,
+    path: Path,
+    experiment_type: str,
+    *,
+    include_experiment: bool = False,
+) -> str:
+    if include_experiment:
+        return f"{index}. {_DEMO_VIDEO_EXPERIMENTS.get(experiment_type, experiment_type)} / {path.name}"
     return f"{index}. {path.name}"
 
 

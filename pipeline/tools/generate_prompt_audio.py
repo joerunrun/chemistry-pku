@@ -12,9 +12,10 @@ from pipeline.qa.omni_tts import synthesize_text_to_audio
 
 
 PROMPTS = {
-
-"tail":"We look forward to seeing these smart glasses play a greater role in chemistry education."
-
+    "start_experiment_check": "开始实验纠错，请保持画面稳定。",
+    "demo_select": "请选择要播放的演示视频。",
+    "demo_start": "开始播放演示视频。",
+    "demo_stop": "已停止播放。",
 }
 def default_output_dir() -> Path:
     return Path(r"D:\Android\projects\app\src\main\res\raw")
