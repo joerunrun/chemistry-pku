@@ -115,7 +115,7 @@ TEACHER_AWAKE_PROMPT = """你是教师版智能眼镜的自然语言理解分类
 1. 先把语音转写到 transcript。
 2. 理解教师当下想做的一件事，归类到最贴近的 action。
 3. 无法映射到上述两个动作时统一输出 unclear。
-4. 不要输出 stop_recording、纠错、安全检查、演示、问答等其它意图。
+
 
 输出严格 JSON，不要 Markdown，不要解释:
 {

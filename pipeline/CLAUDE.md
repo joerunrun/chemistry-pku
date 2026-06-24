@@ -37,20 +37,38 @@ AR 眼镜 + 校园网服务器的化学实验辅助系统。眼镜端通过 HTTP
 
 ### 流程
 
-1. 进入后播 `assistant_ready` 打招呼，开始单路持续录音（16kHz mono wav）
-2. 持续录音同时维护"最近 4 秒 PCM"环形缓冲，每 3 秒切最近 3 秒发服务端 `context=sleep` 做唤醒词检测
-3. 检测到"小北助手"→ 播 `wake_response` → 进入指令捕获
-4. 停持续录音，录 3.5 秒短片段发服务端 `context=teacher_awake`（走主控 AWAKE_PROMPT）做指令识别
-5. 教师只说拍照/录像，映射到 `capture_photo`/`start_recording`/`stop_recording`，复用 `RecordingService`
-6. 处理完回到持续录音 + 唤醒检测
-7. 双击或退出时，持续录音 wav 上传到 `/api/glasses/records/upload`（experiment_type=teacher）
+教师端有独立状态机（4 态），每个状态用独立的服务端 prompt 和允许的 action：
+
+```
+LISTENING（默认）
+  持续录音 + 每 3s 切最近 3s 发 context=sleep 检测"小北助手"
+  wake=true → AWAKE
+
+AWAKE → INSTRUCTION
+  停持续录音，录 3.5s 短片段发 context=teacher_awake
+  服务端用 TEACHER_AWAKE_PROMPT，只允许 capture_photo/start_recording
+  capture_photo → 拍照 → 回 LISTENING
+  start_recording → 录像 → RECORDING
+  unclear → 提示 → 回 LISTENING
+
+RECORDING（录像中，独立状态）
+  持续录音继续，每 3s 切最近 3s 发 context=teacher_recording
+  服务端用 TEACHER_RECORDING_STOP_PROMPT，只允许 stop_recording
+  stop_recording → 停录像+上传 → 回 LISTENING
+  没听清 → 继续 RECORDING 监听
+```
+
+退出/双击：停录像（若在录）+ 停持续录音 + 上传 wav。
 
 ### 关键设计
 
-- **单路 AudioRecord 双职责**：持续录音和唤醒检测共用一路 MIC，避免 Android 双 AudioRecord 抢占冲突。唤醒检测从环形缓冲取片段，不另开录音
-- **复用服务端**：`sleep` context 做唤醒，主控 AWAKE_PROMPT 做指令，不改 intent_omni.py
-- **复用 RecordingService**：拍照 `captureStillImage()`、录像 `startRecording()`/`stopRecording()`/`getRecordedFiles()`
-- **指令窄化在客户端**：教师端 `handleInstructionIntent` 只处理 capture_photo/start_recording/stop_recording，其它一律 unclear，即使服务端返回纠错/安全检查也不执行
+- **教师专用 prompt（服务端 intent_omni.py）**：
+  - `TEACHER_AWAKE_PROMPT` — 只分类 capture_photo/start_recording/unclear，不识别纠错/安全检查/演示/问答
+  - `TEACHER_RECORDING_STOP_PROMPT` — 只识别 stop_recording/unclear
+  - 两个 context（`teacher_awake`/`teacher_recording`）有代码层强约束：非允许 action 一律降级 unclear
+- **录像作为独立状态**：录像时持续录音不停（CameraX 录像音频和 AudioRecord 可共存，学生端也是这么做的），唤醒检测自动从"检测唤醒词"切到"检测停止录像"
+- **单路 AudioRecord 双职责**：持续录音和检测共用一路 MIC，检测从环形缓冲取片段，不另开录音
+- **复用 RecordingService**：拍照/录像直接 bind 调用，不改 RecordingService
 
 ## 部署方式
 
@@ -121,7 +139,9 @@ pipeline/
 | `experiment_setup` | `select_experiment` | 启动阶段选实验，用 `EXPERIMENT_SETUP_PROMPT`，支持 distillation/photometer/electrolysis/tlc |
 | `demo_select` | `select_demo_video` | 演示视频选择页，解析 video_index（0-based）或 video_query |
 | `demo_playing` | `stop_demo_video` | 视频播放中，只识别"停止/退出/别放了"，其它一律 unclear |
-| `recording_stop_only` | `stop_recording` | 录像中，只识别"结束/保存/可以了/别录了"等停止表达 |
+| `recording_stop_only` | `stop_recording` | 学生录像中，只识别"结束/保存/可以了/别录了"等停止表达 |
+| `teacher_awake` | `capture_photo` / `start_recording` | 教师唤醒后，用 `TEACHER_AWAKE_PROMPT`，只识别拍照/开始录像 |
+| `teacher_recording` | `stop_recording` | 教师录像中，用 `TEACHER_RECORDING_STOP_PROMPT`，只识别停止录像 |
 
 ### 专项状态的强约束逻辑
 
