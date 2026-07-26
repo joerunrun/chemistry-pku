@@ -1,0 +1,9 @@
+{
+  "id": "tlc",
+  "name": "TLC",
+  "strategy": "vlm_only",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析助手。",
+  "prompt": "请观察这张TLC实验图片，简要指出画面中最明显的操作问题并给出修改建议。\n\n输出格式：\n问题：...\n意见：...",
+  "test_images_dir": "test_images/tlc"
+}

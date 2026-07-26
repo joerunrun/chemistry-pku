@@ -1,0 +1,19 @@
+{
+  "id": "other",
+  "name": "其它测试",
+  "strategy": "cv_reference",
+  "system_prompt": "你是检测框覆盖测试助手，只判断检测框是否覆盖目标物体。",
+  "components": [
+    {"label": "object_d", "name": "测试物体D", "color": "#ffc000"}
+  ],
+  "color_legend": "色框对应关系：\n- 黄色框: 测试物体D (object_d)",
+  "prompt_a": "这是其它场景的检测框叠加测试。请根据图像简短说明图B中的检测框是否大致覆盖目标物体。\n\n{color_legend}\n\nCV检测概况：\n{cv_summary}\n\n输出格式：\n问题：...\n意见：...",
+  "experiment_requirements": "检测框应覆盖被标注的测试物体。",
+  "reference_db": true,
+  "require_reference_labels": true,
+  "reference": {
+    "source": "database"
+  },
+  "expose_in_glasses": false,
+  "expose_in_experiment_lab": false
+}

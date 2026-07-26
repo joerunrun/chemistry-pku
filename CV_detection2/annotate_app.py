@@ -5,7 +5,10 @@ import json
 
 from flask import Flask, jsonify, render_template_string, request
 
-import core
+try:
+    from . import core
+except ImportError:
+    import core
 
 
 app = Flask(__name__)

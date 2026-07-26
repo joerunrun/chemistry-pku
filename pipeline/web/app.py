@@ -18,7 +18,6 @@ from threading import Lock, Semaphore
 from typing import Any
 
 import cv2
-import numpy as np
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if PROJECT_ROOT not in sys.path:
@@ -35,7 +34,9 @@ from pipeline.common.cv_wrapper import (
 )
 from pipeline.common.timing import StepTimer, TimingRecord
 from pipeline.common.vlm_client import DEFAULT_VLM_MODEL, DEFAULT_VLM_PROVIDER, PROVIDER_MODELS
-from pipeline.experiments import get_experiment_config
+from pipeline.experiments import get_experiment_config, list_specs, resolve_experiment_spec
+from pipeline.experiments.spec_loader import SPECS_DIR
+from pipeline.media_analysis import MediaAnalysisQueue
 from pipeline.resource_paths import runtime_asset_path
 
 app = Flask(__name__)
@@ -49,21 +50,14 @@ _GLASSES_DEFAULT_PROVIDER = DEFAULT_VLM_PROVIDER
 _GLASSES_DEFAULT_MODEL = DEFAULT_VLM_MODEL
 _GLASSES_JOB_WORKERS = int(os.environ.get("CHEM_GLASSES_JOB_WORKERS", "4"))
 _GLASSES_MAX_PENDING = int(os.environ.get("CHEM_GLASSES_MAX_PENDING_JOBS", "50"))
-_GLASSES_EXPERIMENTS = {
-    "distillation": "减压蒸馏",
-    "photometer": "光度计",
-    "electrolysis": "电解实验",
-    "tlc": "TLC",
-    "other": "其它测试",
-}
 _DEMO_VIDEO_EXPERIMENTS = {
-    "distillation": "减压蒸馏",
-    "photometer": "光度计",
-    "electrolysis": "电解实验",
-    "tlc": "TLC",
+    spec["id"]: spec["name"]
+    for spec in list_specs()
+    if spec.get("supports_demo", False)
 }
 _ALLOWED_DEMO_VIDEO_SUFFIXES = {".mp4"}
 _ALLOWED_RECORD_SUFFIXES = {".mp4", ".wav", ".m4a", ".aac", ".mp3"}
+_ALLOWED_PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png"}
 _TEACHER_SPEAKER_THRESHOLD = 0.5
 _TEACHER_SPEAKER_MIN_SPEECH_MS = 200
 _TEACHER_DEFAULT_EMBEDDING_MODEL = runtime_asset_path(
@@ -81,7 +75,7 @@ _glasses_jobs: dict[str, dict[str, Any]] = {}
 _glasses_lock = Lock()
 _vlm_semaphore = Semaphore(int(os.environ.get("CHEM_VLM_CONCURRENCY", "4")))
 _omni_semaphore = Semaphore(int(os.environ.get("CHEM_OMNI_CONCURRENCY", "4")))
-EXPERIMENT_UI_CONFIG_PATH = Path(__file__).resolve().parent.parent / "experiment_ui_config.json"
+_media_analysis_queue = MediaAnalysisQueue()
 
 
 def _cleanup_store():
@@ -99,7 +93,68 @@ def index():
 
 @app.get("/admin")
 def admin_index():
-    return render_template("admin.html")
+    return render_template(
+        "admin.html",
+        portal_title="化学实验资源管理",
+        record_api_prefix="/admin/api",
+    )
+
+
+@app.get("/teacher-admin")
+def teacher_admin_index():
+    return render_template(
+        "admin.html",
+        portal_title="化学实验教师资源管理",
+        record_api_prefix="/teacher-admin/api",
+    )
+
+
+@app.before_request
+def start_media_analysis_queue():
+    _media_analysis_queue.start()
+
+
+@app.get("/experiment-lab")
+def experiment_lab():
+    return render_template("experiment_lab.html")
+
+
+@app.get("/api/experiment-lab/specs")
+def experiment_lab_specs():
+    specs = [
+        spec
+        for spec in list_specs()
+        if spec.get("expose_in_experiment_lab", True)
+    ]
+    return jsonify({"experiments": [
+        {
+            "id": s["id"],
+            "name": s.get("name", s["id"]),
+            "strategy": s.get("strategy", "vlm_only"),
+            "has_components": bool(s.get("components")),
+        }
+        for s in specs
+    ]})
+
+
+@app.post("/api/experiment-lab/run")
+def experiment_lab_run():
+    try:
+        uploaded = request.files.get("image")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "请上传图片。"}), 400
+        experiment_id = request.form.get("experiment_id", "").strip()
+        if resolve_experiment_spec(experiment_id) is None:
+            return jsonify({"error": f"未知实验: {experiment_id}"}), 400
+        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
+        model = request.form.get("model", "").strip() or None
+        image_bytes = uploaded.read()
+
+        from pipeline.experiments.runner import run_experiment_check
+        result = run_experiment_check(experiment_id, image_bytes, provider=provider, model=model)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": f"实验纠错失败: {exc}"}), 500
 
 
 @app.get("/api/references")
@@ -109,7 +164,7 @@ def references():
         cfg = get_experiment_config(experiment_type)
         if cfg is None:
             return jsonify({"error": f"未知实验类型: {experiment_type}"}), 400
-        if not getattr(cfg, "HAS_REFERENCE_DB", True):
+        if not cfg.get("reference_db", False):
             return jsonify({"references": []})
         return jsonify({"references": _list_experiment_references(cfg)})
     except Exception as exc:
@@ -139,8 +194,9 @@ def glasses_health():
             "teacher_speaker_verify",
         ],
         "experiments": [
-            {"value": key, "label": label}
-            for key, label in _GLASSES_EXPERIMENTS.items()
+            {"value": spec["id"], "label": spec["name"]}
+            for spec in list_specs()
+            if spec["id"] != "safety" and spec.get("expose_in_glasses", True)
         ],
     })
 
@@ -323,6 +379,15 @@ def admin_delete_demo_video(video_id: str):
 
 @app.post("/api/glasses/records/upload")
 def glasses_upload_record():
+    return _store_uploaded_record(_record_root(), record_role="student")
+
+
+@app.post("/api/glasses/teacher/records/upload")
+def glasses_upload_teacher_record():
+    return _store_uploaded_record(_teacher_record_root(), record_role="teacher")
+
+
+def _store_uploaded_record(record_root: Path, *, record_role: str):
     video_file = request.files.get("video")
     audio_file = request.files.get("audio")
     if (video_file is None or not video_file.filename) and (audio_file is None or not audio_file.filename):
@@ -332,7 +397,7 @@ def glasses_upload_record():
     device_id = _safe_text_field(request.form.get("device_id"), "unknown_device")
     experiment_type = _safe_text_field(request.form.get("experiment_type"), "unknown_experiment")
     record_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    record_dir = _record_root() / now.strftime("%Y%m%d") / record_id
+    record_dir = record_root / now.strftime("%Y%m%d") / record_id
     record_dir.mkdir(parents=True, exist_ok=True)
 
     files: list[dict[str, Any]] = []
@@ -348,6 +413,7 @@ def glasses_upload_record():
     client_metadata = _parse_metadata_field(request.form.get("metadata"))
     metadata = {
         "record_id": record_id,
+        "record_role": record_role,
         "device_id": device_id,
         "experiment_type": experiment_type,
         "started_at": request.form.get("started_at", ""),
@@ -357,18 +423,22 @@ def glasses_upload_record():
         "metadata": client_metadata,
     }
     (record_dir / "record.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    for file_info in files:
+        file_path = record_dir / file_info["filename"]
+        if file_path.suffix.lower() in {".wav", ".m4a", ".aac", ".mp3"}:
+            _media_analysis_queue.enqueue(record_dir, file_path)
 
     return jsonify({"status": "ok", "record": _record_summary(record_dir)}), 201
 
 
 @app.get("/admin/api/records")
 def admin_records():
-    return jsonify({"records": _list_records()})
+    return jsonify({"records": _list_records(_record_root(), "admin_download_record_file")})
 
 
 @app.get("/admin/api/records/<record_id>/files/<filename>")
 def admin_download_record_file(record_id: str, filename: str):
-    record_dir = _resolve_record_dir(record_id)
+    record_dir = _resolve_record_dir(_record_root(), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
     safe_name = Path(filename).name
@@ -381,13 +451,158 @@ def admin_download_record_file(record_id: str, filename: str):
 
 @app.delete("/admin/api/records/<record_id>")
 def admin_delete_record(record_id: str):
-    record_dir = _resolve_record_dir(record_id)
+    record_dir = _resolve_record_dir(_record_root(), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
     try:
         shutil.rmtree(record_dir)
     except PermissionError:
         return jsonify({"error": "record is currently in use"}), 409
+    return jsonify({"status": "ok"})
+
+
+@app.get("/teacher-admin/api/records")
+def teacher_admin_records():
+    return jsonify({"records": _list_records(_teacher_record_root(), "teacher_admin_download_record_file")})
+
+
+@app.get("/teacher-admin/api/records/<record_id>/files/<filename>")
+def teacher_admin_download_record_file(record_id: str, filename: str):
+    record_dir = _resolve_record_dir(_teacher_record_root(), record_id)
+    if record_dir is None:
+        return jsonify({"error": "record not found"}), 404
+    safe_name = Path(filename).name
+    file_path = record_dir / safe_name
+    if not file_path.exists() or not file_path.is_file():
+        return jsonify({"error": "file not found"}), 404
+    mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    return send_file(file_path, mimetype=mime, as_attachment=True, download_name=file_path.name)
+
+
+@app.delete("/teacher-admin/api/records/<record_id>")
+def teacher_admin_delete_record(record_id: str):
+    record_dir = _resolve_record_dir(_teacher_record_root(), record_id)
+    if record_dir is None:
+        return jsonify({"error": "record not found"}), 404
+    try:
+        shutil.rmtree(record_dir)
+    except PermissionError:
+        return jsonify({"error": "record is currently in use"}), 409
+    return jsonify({"status": "ok"})
+
+
+@app.post("/api/glasses/photos/upload")
+def glasses_upload_photo():
+    return _store_uploaded_photo(_photo_root(), record_role="student")
+
+
+@app.post("/api/glasses/teacher/photos/upload")
+def glasses_upload_teacher_photo():
+    return _store_uploaded_photo(_teacher_photo_root(), record_role="teacher")
+
+
+def _store_uploaded_photo(photo_root: Path, *, record_role: str):
+    photo_file = request.files.get("photo")
+    if photo_file is None or not photo_file.filename:
+        return jsonify({"error": "missing photo file"}), 400
+
+    original_name = _safe_upload_filename(photo_file.filename)
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in _ALLOWED_PHOTO_SUFFIXES:
+        return jsonify({"error": f"unsupported photo file type: {suffix}"}), 400
+
+    now = datetime.now(timezone.utc)
+    photo_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    photo_dir = photo_root / now.strftime("%Y%m%d") / photo_id
+    photo_dir.mkdir(parents=True, exist_ok=True)
+    photo_path = photo_dir / f"photo{suffix}"
+    try:
+        photo_file.save(photo_path)
+    except Exception:
+        shutil.rmtree(photo_dir, ignore_errors=True)
+        raise
+
+    metadata = {
+        "photo_id": photo_id,
+        "record_role": record_role,
+        "device_id": _safe_text_field(request.form.get("device_id"), "unknown_device"),
+        "experiment_type": _safe_text_field(
+            request.form.get("experiment_type"),
+            "unknown_experiment",
+        ),
+        "captured_at": request.form.get("captured_at", ""),
+        "created_at": now.isoformat(),
+        "filename": photo_path.name,
+        "original_filename": original_name,
+        "size": photo_path.stat().st_size,
+    }
+    (photo_dir / "photo.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _media_analysis_queue.enqueue(photo_dir, photo_path)
+    return jsonify({"status": "ok", "photo": _photo_summary(photo_dir)}), 201
+
+
+@app.get("/admin/api/photos")
+def admin_photos():
+    return jsonify({"photos": _list_photos(_photo_root(), "admin_photo_file")})
+
+
+@app.get("/admin/api/photos/<photo_id>/file")
+def admin_photo_file(photo_id: str):
+    photo_dir = _resolve_photo_dir(_photo_root(), photo_id)
+    if photo_dir is None:
+        return jsonify({"error": "photo not found"}), 404
+    photo_path = next(
+        (
+            path
+            for path in photo_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _ALLOWED_PHOTO_SUFFIXES
+        ),
+        None,
+    )
+    if photo_path is None:
+        return jsonify({"error": "photo file not found"}), 404
+    return send_file(
+        photo_path,
+        mimetype=mimetypes.guess_type(photo_path.name)[0] or "image/jpeg",
+        as_attachment=request.args.get("download") == "1",
+        download_name=photo_path.name,
+    )
+
+
+@app.delete("/admin/api/photos/<photo_id>")
+def admin_delete_photo(photo_id: str):
+    photo_dir = _resolve_photo_dir(_photo_root(), photo_id)
+    if photo_dir is None:
+        return jsonify({"error": "photo not found"}), 404
+    try:
+        shutil.rmtree(photo_dir)
+    except PermissionError:
+        return jsonify({"error": "photo is currently in use"}), 409
+    return jsonify({"status": "ok"})
+
+
+@app.get("/teacher-admin/api/photos")
+def teacher_admin_photos():
+    return jsonify({"photos": _list_photos(_teacher_photo_root(), "teacher_admin_photo_file")})
+
+
+@app.get("/teacher-admin/api/photos/<photo_id>/file")
+def teacher_admin_photo_file(photo_id: str):
+    return _send_photo_file(_teacher_photo_root(), photo_id)
+
+
+@app.delete("/teacher-admin/api/photos/<photo_id>")
+def teacher_admin_delete_photo(photo_id: str):
+    photo_dir = _resolve_photo_dir(_teacher_photo_root(), photo_id)
+    if photo_dir is None:
+        return jsonify({"error": "photo not found"}), 404
+    try:
+        shutil.rmtree(photo_dir)
+    except PermissionError:
+        return jsonify({"error": "photo is currently in use"}), 409
     return jsonify({"status": "ok"})
 
 
@@ -607,32 +822,54 @@ def glasses_overlay_test():
         if cfg is None:
             return jsonify({"error": f"Unknown experiment_type: {experiment_type}"}), 400
 
-        component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
-        components = list(getattr(cfg, "COMPONENTS", []))
+        component_labels = [
+            item["label"]
+            for item in cfg.get("components", [])
+        ]
+        components = list(cfg.get("components", []))
         if not component_labels or not components:
             return jsonify({"error": f"{experiment_type} is missing component config."}), 400
 
         image = decode_image(image_bytes)
-        cv_params = CVDetectionParams(
-            max_side=1600,
-            lowe_ratio=0.75,
-            min_good_matches=3,
-            min_inliers=2,
-            min_inlier_ratio=0.08,
-            top_k_per_label=6,
-            overlap_weight=0.75,
-            feature="akaze",
-            component_labels=component_labels,
-        )
         from pipeline.common.cv_wrapper import detect_wrong_image, annotate_image, encode_annotated_image
 
-        result = detect_wrong_image(image, cv_params)
+        base_params = {
+            "max_side": 1600,
+            "lowe_ratio": 0.75,
+            "min_good_matches": 3,
+            "min_inliers": 2,
+            "min_inlier_ratio": 0.05,
+            "top_k_per_label": 6,
+            "overlap_weight": 0.75,
+            "component_labels": component_labels,
+        }
+
+        result = None
+        detection_feature = "sift"
+        last_error = None
+        for feature in ("sift", "akaze"):
+            try:
+                candidate = detect_wrong_image(image, CVDetectionParams(**base_params, feature=feature))
+            except Exception as exc:
+                last_error = exc
+                continue
+            if result is None:
+                result = candidate
+                detection_feature = feature
+            if any(candidate.get("boxes", {}).get(label) for label in component_labels):
+                result = candidate
+                detection_feature = feature
+                break
+        if result is None:
+            raise last_error or RuntimeError("CV detection failed.")
+
         image_size = {"width": int(image.shape[1]), "height": int(image.shape[0])}
         overlay_boxes = _build_overlay_boxes(result, components, image_size)
         preview_data_url = encode_annotated_image(annotate_image(image, result))
 
         return jsonify({
             "experiment_type": experiment_type,
+            "detection_feature": detection_feature,
             "overlay_image_size": image_size,
             "overlay_boxes": overlay_boxes,
             "preview_data_url": preview_data_url,
@@ -655,11 +892,7 @@ def create_glasses_job():
             return jsonify({"error": "mode must be experiment or safety."}), 400
 
         experiment_type = request.form.get("experiment_type", "distillation").strip() or "distillation"
-        if (
-            mode == "experiment"
-            and experiment_type not in {"electrolysis", "tlc"}
-            and get_experiment_config(experiment_type) is None
-        ):
+        if mode == "experiment" and resolve_experiment_spec(experiment_type) is None:
             return jsonify({"error": f"Unknown experiment_type: {experiment_type}"}), 400
 
         provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
@@ -730,7 +963,10 @@ def config_reference_image():
         cfg = get_experiment_config(experiment_type)
         if cfg is None:
             return jsonify({"error": f"未知实验类型: {experiment_type}"}), 400
-        component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
+        component_labels = [
+            item["label"]
+            for item in cfg.get("components", [])
+        ]
         ui_config = _get_experiment_ui_config(experiment_type)
         from pipeline.common.cv_wrapper import encode_annotated_image
         if str(ui_config.get("correct_source", "")).strip() == "file":
@@ -752,59 +988,31 @@ def config_reference_image():
 
 @app.post("/api/safety/check")
 def safety_check():
-    """实验室安全检查：上传图片 → 检索相似安全案例 → VLM 分析。"""
-    request_started = time.perf_counter()
-    timings: dict[str, float] = {}
-
+    """JSON-configured safety retrieval and analysis."""
     try:
         uploaded = request.files.get("image")
         if uploaded is None or not uploaded.filename:
             return jsonify({"error": "请上传待检查图片。"}), 400
 
         image_bytes = uploaded.read()
-        top_k = int(request.form.get("top_k", "1"))
-        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip()
+        provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
         model = request.form.get("model", "").strip() or None
-
-        from pipeline.safety_check.retriever import retrieve
-        from pipeline.safety_check.vlm_check import analyze as analyze_safety
-
-        with StepTimer(timing := TimingRecord(), "检索"):
-            results = retrieve(image_bytes, top_k=top_k, include_images=False)
-        timings.update(timing.to_dict())
-
-        if not results:
-            timings["总计"] = round((time.perf_counter() - request_started) * 1000, 1)
-            return jsonify({
-                "analysis_text": "未发现明显安全问题。",
-                "timings": timings,
-            }), 200
-
-        with StepTimer(timing := TimingRecord(), "VLM分析"):
-            analysis_text, _ = analyze_safety(
+        from pipeline.experiments.runner import run_experiment_check
+        return jsonify(
+            run_experiment_check(
+                "safety",
                 image_bytes,
-                results,
                 provider=provider,
                 model=model,
             )
-        timings.update(timing.to_dict())
-        timings["总计"] = round((time.perf_counter() - request_started) * 1000, 1)
-
-        return jsonify({
-            "analysis_text": analysis_text,
-            "timings": timings,
-        })
-
+        )
     except Exception as exc:
         return jsonify({"error": f"安全检查失败: {exc}"}), 500
 
 
 @app.post("/api/electrolysis/check")
 def electrolysis_check():
-    """电解实验纠错：上传图片 -> 正误样例各取 top1 -> VLM 简洁纠错。"""
-    request_started = time.perf_counter()
-    timings: dict[str, float] = {}
-
+    """JSON-configured electrolysis retrieval and analysis."""
     try:
         uploaded = request.files.get("image") or request.files.get("wrong_image")
         if uploaded is None or not uploaded.filename:
@@ -813,30 +1021,15 @@ def electrolysis_check():
         image_bytes = uploaded.read()
         provider = request.form.get("provider", _GLASSES_DEFAULT_PROVIDER).strip() or _GLASSES_DEFAULT_PROVIDER
         model = request.form.get("model", "").strip() or _GLASSES_DEFAULT_MODEL
-
-        from pipeline.electrolysis_check.retriever import retrieve_pair
-        from pipeline.electrolysis_check.vlm_check import analyze as analyze_electrolysis
-
-        with StepTimer(timing := TimingRecord(), "检索"):
-            retrieved = retrieve_pair(image_bytes, include_images=True)
-        timings.update(timing.to_dict())
-
-        with StepTimer(timing := TimingRecord(), "VLM分析"):
-            analysis_text, _ = analyze_electrolysis(
+        from pipeline.experiments.runner import run_experiment_check
+        return jsonify(
+            run_experiment_check(
+                "electrolysis",
                 image_bytes,
-                retrieved,
                 provider=provider,
                 model=model,
             )
-        timings.update(timing.to_dict())
-        timings["总计"] = round((time.perf_counter() - request_started) * 1000, 1)
-
-        return jsonify({
-            "analysis_text": analysis_text,
-            "retrieved": _summarize_electrolysis_retrieval(retrieved),
-            "timings": timings,
-        })
-
+        )
     except Exception as exc:
         return jsonify({"error": f"电解实验纠错失败: {exc}"}), 500
 
@@ -860,22 +1053,18 @@ def detect():
         if cfg is None:
             return jsonify({"error": f"未知实验类型: {experiment_type}"}), 400
 
-        component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
-        components = list(getattr(cfg, "COMPONENTS", []))
+        component_labels = [
+            item["label"]
+            for item in cfg.get("components", [])
+        ]
+        components = list(cfg.get("components", []))
         if not component_labels or not components:
             return jsonify({"error": f"{experiment_type} 实验缺少组件配置。"}), 400
 
         ui_config = _get_experiment_ui_config(experiment_type)
-        reference_id = request.form.get("reference_id", "").strip() or str(ui_config.get("reference_id", "")).strip()
-        experiment_requirements = (
-            request.form.get("experiment_requirements", "").strip()
-            or str(ui_config.get("experiment_requirements", "")).strip()
-        )
-        correct_source = (
-            request.form.get("correct_source", "").strip()
-            or str(ui_config.get("correct_source", "database")).strip()
-            or "database"
-        )
+        reference_id = str(ui_config.get("reference_id", "")).strip()
+        experiment_requirements = str(ui_config.get("experiment_requirements", "")).strip()
+        correct_source = str(ui_config.get("correct_source", "database")).strip() or "database"
 
         cv_params = CVDetectionParams(
             max_side=int(request.form.get("max_side", "1600")),
@@ -1135,35 +1324,10 @@ def _run_glasses_job(
 ) -> None:
     _update_glasses_job(job_id, status="running", stage="upload", message="Image accepted.")
     try:
-        if mode == "safety":
-            result = _run_glasses_safety_job(
-                job_id=job_id,
-                image_bytes=image_bytes,
-                provider=provider,
-                model=model,
-            )
-        elif experiment_type == "electrolysis":
-            result = _run_glasses_electrolysis_job(
-                job_id=job_id,
-                image_bytes=image_bytes,
-                provider=provider,
-                model=model,
-            )
-        elif experiment_type == "tlc":
-            result = _run_glasses_tlc_job(
-                job_id=job_id,
-                image_bytes=image_bytes,
-                provider=provider,
-                model=model,
-            )
-        else:
-            result = _run_glasses_experiment_job(
-                job_id=job_id,
-                image_bytes=image_bytes,
-                experiment_type=experiment_type,
-                provider=provider,
-                model=model,
-            )
+        from pipeline.experiments.runner import run_experiment_check
+        exp_id = experiment_type if mode == "experiment" else "safety"
+        _update_glasses_job(job_id, stage="processing", message="Running check.")
+        result = run_experiment_check(exp_id, image_bytes, provider=provider, model=model)
         _attach_analysis_audio(job_id, result)
         _update_glasses_job(
             job_id,
@@ -1206,226 +1370,16 @@ def _attach_analysis_audio(job_id: str, result: dict[str, Any]) -> None:
             timings["tts_error"] = str(exc)
 
 
-def _run_glasses_safety_job(
-    *,
-    job_id: str,
-    image_bytes: bytes,
-    provider: str,
-    model: str,
-) -> dict[str, Any]:
-    started = time.perf_counter()
-    timings: dict[str, float] = {}
-    from pipeline.safety_check.retriever import retrieve
-    from pipeline.safety_check.vlm_check import analyze as analyze_safety
-
-    _update_glasses_job(job_id, stage="retrieval", message="Retrieving safety cases.")
-    with StepTimer(timing := TimingRecord(), "retrieval"):
-        results = retrieve(image_bytes, top_k=1, include_images=False)
-    timings.update(timing.to_dict())
-
-    if not results:
-        timings["total"] = round((time.perf_counter() - started) * 1000, 1)
-        return {
-            "analysis_text": "未发现明显安全问题。",
-            "mode": "safety",
-            "experiment_type": None,
-            "timings": timings,
-        }
-
-    _update_glasses_job(job_id, stage="vlm", message="Analyzing safety image.")
-    with StepTimer(timing := TimingRecord(), "vlm"):
-        analysis_text, _ = analyze_safety(
-            image_bytes,
-            results,
-            provider=provider,
-            model=model,
-        )
-    timings.update(timing.to_dict())
-    timings["total"] = round((time.perf_counter() - started) * 1000, 1)
-
-    return {
-        "analysis_text": analysis_text,
-        "mode": "safety",
-        "experiment_type": None,
-        "timings": timings,
-    }
-
-
-def _run_glasses_electrolysis_job(
-    *,
-    job_id: str,
-    image_bytes: bytes,
-    provider: str,
-    model: str,
-) -> dict[str, Any]:
-    started = time.perf_counter()
-    timings: dict[str, float] = {}
-    from pipeline.electrolysis_check.retriever import retrieve_pair
-    from pipeline.electrolysis_check.vlm_check import analyze as analyze_electrolysis
-
-    _update_glasses_job(job_id, stage="retrieval", message="Retrieving electrolysis references.")
-    with StepTimer(timing := TimingRecord(), "retrieval"):
-        retrieved = retrieve_pair(image_bytes, include_images=True)
-    timings.update(timing.to_dict())
-
-    _update_glasses_job(job_id, stage="vlm", message="Analyzing electrolysis image.")
-    with StepTimer(timing := TimingRecord(), "vlm"):
-        analysis_text, _ = analyze_electrolysis(
-            image_bytes,
-            retrieved,
-            provider=provider,
-            model=model,
-        )
-    timings.update(timing.to_dict())
-    timings["total"] = round((time.perf_counter() - started) * 1000, 1)
-
-    return {
-        "analysis_text": analysis_text,
-        "mode": "experiment",
-        "experiment_type": "electrolysis",
-        "retrieved": _summarize_electrolysis_retrieval(retrieved),
-        "timings": timings,
-    }
-
-
-def _run_glasses_tlc_job(
-    *,
-    job_id: str,
-    image_bytes: bytes,
-    provider: str,
-    model: str,
-) -> dict[str, Any]:
-    started = time.perf_counter()
-    from pipeline.tlc_check.vlm_check import analyze
-
-    _update_glasses_job(job_id, stage="vlm", message="Analyzing TLC image.")
-    analysis_text, vlm_ms = analyze(
-        image_bytes,
-        provider=provider,
-        model=model,
-    )
-    return {
-        "analysis_text": analysis_text,
-        "mode": "experiment",
-        "experiment_type": "tlc",
-        "timings": {
-            "vlm": vlm_ms,
-            "total": round((time.perf_counter() - started) * 1000, 1),
-        },
-    }
-
-
-def _run_glasses_experiment_job(
-    *,
-    job_id: str,
-    image_bytes: bytes,
+def _demo_video_label(
+    index: int,
+    path: Path,
     experiment_type: str,
-    provider: str,
-    model: str,
-) -> dict[str, Any]:
-    started = time.perf_counter()
-    timing = TimingRecord()
-
-    cfg = get_experiment_config(experiment_type)
-    if cfg is None:
-        raise ValueError(f"Unknown experiment_type: {experiment_type}")
-
-    component_labels = list(getattr(cfg, "COMPONENT_LABELS", []))
-    components = list(getattr(cfg, "COMPONENTS", []))
-    if not component_labels or not components:
-        raise ValueError(f"{experiment_type} is missing component config.")
-
-    ui_config = _get_experiment_ui_config(experiment_type)
-    reference_id = str(ui_config.get("reference_id", "")).strip()
-    experiment_requirements = str(ui_config.get("experiment_requirements", "")).strip()
-    correct_source = str(ui_config.get("correct_source", "database")).strip() or "database"
-
-    _update_glasses_job(job_id, stage="cv_detection", message="Running CV detection.")
-    with StepTimer(timing, "decode"):
-        wrong_image = decode_image(image_bytes)
-
-    cv_params = CVDetectionParams(
-        max_side=1600,
-        lowe_ratio=0.75,
-        min_good_matches=3,
-        min_inliers=2,
-        min_inlier_ratio=0.08,
-        top_k_per_label=6,
-        overlap_weight=0.75,
-        feature="akaze",
-        component_labels=component_labels,
-    )
-
-    from pipeline.common.cv_wrapper import detect_wrong_image
-
-    with StepTimer(timing, "cv_detection"):
-        wrong_result = detect_wrong_image(wrong_image, cv_params)
-
-    if correct_source == "file":
-        with StepTimer(timing, "load_reference"):
-            image_path = _resolve_configured_image_path(ui_config)
-            correct_annotated = decode_image(image_path.read_bytes())
-        correct_result = _build_uploaded_result(components)
-    elif correct_source == "upload":
-        raise ValueError("Glasses jobs do not support correct_source=upload.")
-    else:
-        refs = _list_experiment_references(cfg)
-        if not reference_id and refs:
-            reference_id = refs[0]["id"]
-        if not reference_id:
-            raise ValueError("No configured reference image is available.")
-        with StepTimer(timing, "load_reference"):
-            correct_image = load_reference_image(reference_id)
-            correct_result = build_reference_result(reference_id, component_labels)
-            correct_annotated = cv_core.annotate_image(correct_image, correct_result)
-
-    with StepTimer(timing, "build_vlm_images"):
-        from pipeline.common.cv_wrapper import annotate_image, encode_annotated_image
-        from pipeline.common.image_builder import build_cv_structured_summary
-
-        wrong_annotated = annotate_image(wrong_image, wrong_result)
-        preview_data_url = encode_annotated_image(wrong_annotated)
-        overlay_image_size = {
-            "width": int(wrong_image.shape[1]),
-            "height": int(wrong_image.shape[0]),
-        }
-        overlay_boxes = _build_overlay_boxes(wrong_result, components, overlay_image_size)
-        label_summary = _build_label_summary_from_results(correct_result, wrong_result, components)
-        cv_summary = build_cv_structured_summary(
-            label_summary,
-            correct_is_uploaded=(correct_source == "upload"),
-        )
-        _, c_jpg = cv2.imencode(".jpg", correct_annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        _, w_jpg = cv2.imencode(".jpg", wrong_annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-
-    _update_glasses_job(
-        job_id,
-        stage="vlm",
-        message="Analyzing experiment image.",
-        preview_data_url=preview_data_url,
-        overlay_image_size=overlay_image_size,
-        overlay_boxes=overlay_boxes,
-    )
-    from pipeline.approach_a.pipeline_a import run_pipeline_a
-    with StepTimer(timing, "vlm"):
-        a_result = run_pipeline_a(
-            experiment_requirements=experiment_requirements,
-            vlm_provider=provider,
-            vlm_model=model,
-            label_summary=label_summary,
-            cv_summary=cv_summary,
-            prebuilt_jpeg=(c_jpg.tobytes(), w_jpg.tobytes()),
-            experiment_config=cfg,
-        )
-
-    timings = timing.to_dict()
-    timings["total"] = round((time.perf_counter() - started) * 1000, 1)
-    return {
-        "analysis_text": a_result.analysis_text,
-        "mode": "experiment",
-        "experiment_type": experiment_type,
-        "timings": timings,
-    }
+    *,
+    include_experiment: bool = False,
+) -> str:
+    if include_experiment:
+        return f"{index}. {_DEMO_VIDEO_EXPERIMENTS.get(experiment_type, experiment_type)} / {path.name}"
+    return f"{index}. {path.name}"
 
 
 def _run_b_step1(*, vlm_provider, vlm_model, cv_summary, prebuilt_jpeg):
@@ -1452,23 +1406,6 @@ def _build_uploaded_result(components):
         "detections": {c["label"]: {"score": None} for c in components},
     }
 
-
-def _summarize_electrolysis_retrieval(retrieved: dict[str, Any]) -> dict[str, Any]:
-    summary: dict[str, Any] = {}
-    for label in ("correct", "wrong"):
-        item = retrieved.get(label)
-        if not item:
-            summary[label] = None
-            continue
-        summary[label] = {
-            "sample_id": item.get("sample_id"),
-            "label": item.get("label"),
-            "image_file": item.get("image_file"),
-            "description": item.get("description", ""),
-            "match_count": item.get("match_count"),
-            "score": item.get("score"),
-        }
-    return summary
 
 
 def _build_overlay_boxes(
@@ -1510,17 +1447,26 @@ def _build_overlay_boxes(
     return overlay
 
 
+
 def _load_experiment_ui_config() -> dict[str, dict]:
-    if not EXPERIMENT_UI_CONFIG_PATH.exists():
-        return {}
-    data = json.loads(EXPERIMENT_UI_CONFIG_PATH.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        return {}
-    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    configs: dict[str, dict] = {}
+    for spec in list_specs():
+        if spec.get("strategy") != "cv_reference":
+            continue
+        reference = spec.get("reference", {})
+        configs[spec["id"]] = {
+            "correct_source": reference.get("source", "database"),
+            "reference_id": reference.get("reference_id", ""),
+            "annotated_image_path": reference.get("annotated_image_path", ""),
+            "experiment_requirements": spec.get("experiment_requirements", ""),
+        }
+    return configs
+
 
 
 def _get_experiment_ui_config(experiment_type: str) -> dict:
     return _load_experiment_ui_config().get(experiment_type, {})
+
 
 
 def _resolve_configured_image_path(ui_config: dict) -> Path:
@@ -1532,33 +1478,55 @@ def _resolve_configured_image_path(ui_config: dict) -> Path:
     else:
         path = Path(raw_path)
     if not path.is_absolute():
-        path = (EXPERIMENT_UI_CONFIG_PATH.parent / path).resolve()
+        path = (SPECS_DIR / path).resolve()
     if not path.exists():
         raise FileNotFoundError(f"配置参考图不存在: {path}")
     return path
 
 
+
 def _list_experiment_references(cfg):
-    refs = list_available_references(getattr(cfg, "COMPONENT_LABELS", None))
-    if getattr(cfg, "REQUIRE_REFERENCE_LABELS", False):
+    component_labels = [
+        component["label"]
+        for component in cfg.get("components", [])
+    ]
+    refs = list_available_references(component_labels or None)
+    if cfg.get("require_reference_labels", False):
         refs = [ref for ref in refs if ref.get("annotated_labels")]
     return refs
+
 
 
 def _demo_video_root() -> Path:
     return runtime_asset_path("demo_videos")
 
 
+
 def _demo_video_dir(experiment_type: str) -> Path:
     return _demo_video_root() / experiment_type
+
 
 
 def _record_root() -> Path:
     return runtime_asset_path("user_records")
 
 
+def _teacher_record_root() -> Path:
+    return runtime_asset_path("teacher_records")
+
+
+def _photo_root() -> Path:
+    return runtime_asset_path("user_photos")
+
+
+def _teacher_photo_root() -> Path:
+    return runtime_asset_path("teacher_photos")
+
+
+
 def _feedback_root() -> Path:
     return runtime_asset_path("feedback")
+
 
 
 def _normalize_demo_experiment_type(value: str | None) -> str:
@@ -1568,12 +1536,14 @@ def _normalize_demo_experiment_type(value: str | None) -> str:
     return experiment_type
 
 
+
 def _path_demo_experiment_type(path: Path, root: Path) -> str:
     rel_parts = path.relative_to(root).parts
     if rel_parts and rel_parts[0] in _DEMO_VIDEO_EXPERIMENTS:
         return rel_parts[0]
     # 兼容旧资源：之前直接放在 demo_videos/ 根目录的视频默认按减压蒸馏处理。
     return "distillation"
+
 
 
 def _list_demo_videos(experiment_type: str | None = None) -> list[dict[str, str]]:
@@ -1607,6 +1577,7 @@ def _list_demo_videos(experiment_type: str | None = None) -> list[dict[str, str]
     return videos
 
 
+
 def _resolve_demo_video(video_id: str) -> Path | None:
     try:
         rel = _decode_urlsafe_id(video_id)
@@ -1621,6 +1592,12 @@ def _resolve_demo_video(video_id: str) -> Path | None:
     return path
 
 
+def _demo_video_id(path: Path) -> str:
+    relative_path = path.relative_to(_demo_video_root()).as_posix()
+    return _encode_urlsafe_id(relative_path)
+
+
+
 def _teacher_embedding_model_path() -> Path:
     raw = os.getenv("SPEAKER_VERIFY_EMBEDDING_MODEL", "").strip()
     path = Path(raw) if raw else _TEACHER_DEFAULT_EMBEDDING_MODEL
@@ -1632,21 +1609,36 @@ def _teacher_embedding_model_path() -> Path:
     return path
 
 
-def _demo_video_id(path: Path) -> str:
-    rel = path.relative_to(_demo_video_root()).as_posix()
-    return _encode_urlsafe_id(rel)
+
+def _build_label_summary_from_results(correct_result, wrong_result, components):
+    from pipeline.common.cv_wrapper import get_component_info
+    wrong_boxes = wrong_result.get("boxes", {})
+    wrong_detections = wrong_result.get("detections", {})
+    correct_boxes = correct_result.get("boxes", {})
+    result = {}
+    for comp in get_component_info(components):
+        label = comp["label"]
+        c_box = correct_boxes.get(label, [])
+        w_box = wrong_boxes.get(label, [])
+        sentinel = [0, 0, 1, 1]
+        result[label] = {
+            "name": comp["name"], "color": comp["color"],
+            "in_correct": bool(c_box),
+            "in_wrong": bool(w_box),
+            "correct_box": c_box if c_box != sentinel else [],
+            "wrong_box": w_box,
+            "wrong_score": wrong_detections.get(label, {}).get("score"),
+            "wrong_raw_score": wrong_detections.get(label, {}).get("raw_score"),
+            "wrong_failure_reason": wrong_detections.get(label, {}).get("failure_reason"),
+        }
+    return result
 
 
-def _demo_video_label(
-    index: int,
-    path: Path,
-    experiment_type: str,
-    *,
-    include_experiment: bool = False,
-) -> str:
-    if include_experiment:
-        return f"{index}. {_DEMO_VIDEO_EXPERIMENTS.get(experiment_type, experiment_type)} / {path.name}"
-    return f"{index}. {path.name}"
+# 延迟导入，避免循环
+import pipeline.common.cv_wrapper as cv_core
+
+
+
 
 
 def _encode_urlsafe_id(value: str) -> str:
@@ -1716,21 +1708,20 @@ def _save_record_upload(uploaded, record_dir: Path, prefix: str) -> dict[str, An
     }
 
 
-def _list_records() -> list[dict[str, Any]]:
-    root = _record_root()
+def _list_records(root: Path, download_endpoint: str) -> list[dict[str, Any]]:
     root.mkdir(parents=True, exist_ok=True)
     records = []
     for metadata_path in root.rglob("record.json"):
         record_dir = metadata_path.parent
         try:
-            records.append(_record_summary(record_dir))
+            records.append(_record_summary(record_dir, download_endpoint))
         except Exception:
             continue
     records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return records
 
 
-def _record_summary(record_dir: Path) -> dict[str, Any]:
+def _record_summary(record_dir: Path, download_endpoint: str = "admin_download_record_file") -> dict[str, Any]:
     metadata_path = record_dir / "record.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     files = []
@@ -1741,7 +1732,7 @@ def _record_summary(record_dir: Path) -> dict[str, Any]:
             "filename": file_path.name,
             "size": file_path.stat().st_size,
             "download_url": url_for(
-                "admin_download_record_file",
+                download_endpoint,
                 record_id=record_dir.name,
                 filename=file_path.name,
             ),
@@ -1754,20 +1745,105 @@ def _record_summary(record_dir: Path) -> dict[str, Any]:
         "started_at": metadata.get("started_at", ""),
         "ended_at": metadata.get("ended_at", ""),
         "files": files,
+        "analysis": _load_analysis(record_dir),
         "path": str(record_dir),
     }
 
 
-def _resolve_record_dir(record_id: str) -> Path | None:
+def _resolve_record_dir(root: Path, record_id: str) -> Path | None:
     safe_id = _safe_text_field(record_id, "")
     if not safe_id or safe_id != record_id:
         return None
-    root = _record_root().resolve()
+    root = root.resolve()
     for metadata_path in root.rglob("record.json"):
         record_dir = metadata_path.parent.resolve()
         if record_dir.name == record_id and _is_relative_to(record_dir, root):
             return record_dir
     return None
+
+
+def _list_photos(root: Path, file_endpoint: str) -> list[dict[str, Any]]:
+    root.mkdir(parents=True, exist_ok=True)
+    photos = []
+    for metadata_path in root.rglob("photo.json"):
+        try:
+            photos.append(_photo_summary(metadata_path.parent, file_endpoint))
+        except Exception:
+            continue
+    photos.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return photos
+
+
+def _photo_summary(photo_dir: Path, file_endpoint: str = "admin_photo_file") -> dict[str, Any]:
+    metadata_path = photo_dir / "photo.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    photo_path = next(
+        (
+            path
+            for path in photo_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _ALLOWED_PHOTO_SUFFIXES
+        ),
+        None,
+    )
+    if photo_path is None:
+        raise FileNotFoundError("photo file not found")
+    photo_id = str(metadata.get("photo_id") or photo_dir.name)
+    file_url = url_for(file_endpoint, photo_id=photo_id)
+    return {
+        "photo_id": photo_id,
+        "device_id": metadata.get("device_id", ""),
+        "experiment_type": metadata.get("experiment_type", ""),
+        "captured_at": metadata.get("captured_at", ""),
+        "created_at": metadata.get("created_at", ""),
+        "filename": photo_path.name,
+        "size": photo_path.stat().st_size,
+        "file_url": file_url,
+        "download_url": f"{file_url}?download=1",
+        "analysis": _load_analysis(photo_dir),
+    }
+
+
+def _resolve_photo_dir(root: Path, photo_id: str) -> Path | None:
+    safe_id = _safe_text_field(photo_id, "")
+    if not safe_id or safe_id != photo_id:
+        return None
+    root = root.resolve()
+    for metadata_path in root.rglob("photo.json"):
+        photo_dir = metadata_path.parent.resolve()
+        if photo_dir.name == photo_id and _is_relative_to(photo_dir, root):
+            return photo_dir
+    return None
+
+
+def _send_photo_file(photo_root: Path, photo_id: str):
+    photo_dir = _resolve_photo_dir(photo_root, photo_id)
+    if photo_dir is None:
+        return jsonify({"error": "photo not found"}), 404
+    photo_path = next(
+        (
+            path
+            for path in photo_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _ALLOWED_PHOTO_SUFFIXES
+        ),
+        None,
+    )
+    if photo_path is None:
+        return jsonify({"error": "photo file not found"}), 404
+    return send_file(
+        photo_path,
+        mimetype=mimetypes.guess_type(photo_path.name)[0] or "image/jpeg",
+        as_attachment=request.args.get("download") == "1",
+        download_name=photo_path.name,
+    )
+
+
+def _load_analysis(media_dir: Path) -> dict[str, Any]:
+    path = media_dir / "analysis.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {"items": {}}
+    except (OSError, json.JSONDecodeError):
+        return {"items": {}}
 
 
 def _list_feedback() -> list[dict[str, Any]]:
@@ -1801,32 +1877,6 @@ def _resolve_feedback_path(feedback_id: str) -> Path | None:
     if not path.exists() or not path.is_file():
         return None
     return path
-
-
-def _build_label_summary_from_results(correct_result, wrong_result, components):
-    from pipeline.common.cv_wrapper import get_component_info
-    wrong_boxes = wrong_result.get("boxes", {})
-    wrong_detections = wrong_result.get("detections", {})
-    correct_boxes = correct_result.get("boxes", {})
-    result = {}
-    for comp in get_component_info(components):
-        label = comp["label"]
-        c_box = correct_boxes.get(label, [])
-        w_box = wrong_boxes.get(label, [])
-        sentinel = [0, 0, 1, 1]
-        result[label] = {
-            "name": comp["name"], "color": comp["color"],
-            "in_correct": bool(c_box),
-            "in_wrong": bool(w_box),
-            "correct_box": c_box if c_box != sentinel else [],
-            "wrong_box": w_box,
-            "wrong_score": wrong_detections.get(label, {}).get("score"),
-            "wrong_raw_score": wrong_detections.get(label, {}).get("raw_score"),
-            "wrong_failure_reason": wrong_detections.get(label, {}).get("failure_reason"),
-        }
-    return result
-
-
 # 延迟导入，避免循环
 import pipeline.common.cv_wrapper as cv_core
 

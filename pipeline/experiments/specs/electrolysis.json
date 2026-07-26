@@ -1,0 +1,14 @@
+{
+  "id": "electrolysis",
+  "name": "电解实验",
+  "strategy": "retrieval",
+  "supports_demo": true,
+  "retrieval_db": "electrolysis_check_data",
+  "top_k": 1,
+  "system_prompt": "你是普通化学电解实验纠错助手。请根据图片判断学生操作是否存在错误，并给出简洁修改意见。",
+  "prompt": "请判断待检电解实验图片是否存在操作错误。\n\n参考正确操作：\n{correct_description}\n\n参考常见错误：\n{wrong_description}\n\n图片顺序如下：\n1. 待检图片\n2. 参考正确操作图片\n3. 参考常见错误图片\n\n要求：\n- 不要提“数据库”“检索”“相似图片”等来源\n- 只输出中文\n- 语言尽量简洁\n- 若基本正确，输出“问题：未发现明显错误。”并给出保持操作的意见\n- 若存在错误，指出最关键的问题和修改意见\n\n输出格式：\n问题：...\n意见：...",
+  "default_correct_description": "电源正极应接铂电极，负极接铜片；注意电流表方向和导线位置。",
+  "default_wrong_description": "常见错误包括电极接反、电流表接反、导线浸入溶液或铂电极位置错误。",
+  "empty_result_text": "问题：未发现明显错误。\n意见：请保持当前连接和电极位置。",
+  "test_images_dir": "test_images/electrolysis"
+}

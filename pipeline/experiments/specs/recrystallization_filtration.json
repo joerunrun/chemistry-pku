@@ -1,0 +1,9 @@
+{
+  "id": "recrystallization_filtration",
+  "name": "重结晶过滤实验",
+  "strategy": "vlm_only",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析助手。只根据图片中可见内容判断，不要臆测。",
+  "prompt": "请检查重结晶过滤装置。\n\n检查：\n- 建议：吸滤瓶是否用铝架固定。\n\n只报告能够明确判断的问题。\n\n输出格式：\n问题：...\n意见：...",
+  "test_images_dir": "test_images/recrystallization_filtration"
+}

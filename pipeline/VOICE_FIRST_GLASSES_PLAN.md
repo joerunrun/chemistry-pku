@@ -557,7 +557,7 @@ Qwen Omni intent prompt 重点：
 电脑端：
 
 ```powershell
-cd D:\chemistry\化小北实验测试数据\chemistry
+cd D:\chemistry\chemistry_agent\chemistry
 python -m py_compile pipeline\web\app.py pipeline\voice_control\intent_omni.py
 ```
 

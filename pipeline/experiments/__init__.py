@@ -1,15 +1,14 @@
-"""Experiment config registry."""
+"""JSON-backed experiment registry."""
 from __future__ import annotations
 
-from pipeline.experiments import distillation, other, photometer
-
-_REGISTRY = {
-    "distillation": distillation,
-    "photometer": photometer,
-    "other": other,
-}
+from pipeline.experiments.spec_loader import get_spec, list_specs, reload_specs
 
 
 def get_experiment_config(name: str):
-    """Return an experiment config module, or None when the name is unknown."""
-    return _REGISTRY.get(name)
+    """Compatibility name for callers; all configs are JSON dictionaries."""
+    return get_spec(name)
+
+
+def resolve_experiment_spec(name: str) -> dict | None:
+    """Return the spec dict for any experiment."""
+    return get_spec(name)

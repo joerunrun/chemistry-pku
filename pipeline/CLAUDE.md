@@ -81,7 +81,7 @@ Docker Compose 两个容器：
 配置文件：
 - `.env` — API Key、环境变量
 - `deploy/nginx/chemistry.conf` — Nginx 配置
-- `pipeline/experiment_ui_config.json` — 实验参数配置
+- `pipeline/experiments/specs/*.json` — 实验策略、prompt、规则和参考图配置
 
 ## 代码结构
 
@@ -109,6 +109,46 @@ pipeline/
 ├── resource_paths.py           runtime_assets 路径管理
 └── tools/                      离线工具脚本
 ```
+
+## 可扩展实验纠错（experiments/）
+
+实验纠错统一走规格文件 + 策略分发，新增实验只需放一个 JSON 规格文件。
+
+### 三种策略
+
+| 策略 | 流程 | 示例 |
+|------|------|------|
+| `cv_reference` | CV 检测组件框 → 标注图 + 参考图 + VLM prompt | 蒸馏、光度计 |
+| `retrieval` | AKAZE 检索正误样例 → VLM 带图/描述分析 | 电解、安全检查 |
+| `vlm_only` | 图片 + prompt 直给 VLM | TLC |
+
+### 规格文件
+
+`pipeline/experiments/specs/<id>.json`，启动时 `spec_loader.py` 自动扫描。字段：
+
+- `id` `name` `strategy`
+- `cv_reference`：`components`（label/name/color）、`color_legend`、`prompt_a`、`experiment_requirements`、`reference`
+  - 文件参考图：`{"source":"file","annotated_image_path":"assets://..."}`
+  - 检测库参考图：`{"source":"database","reference_id":"..."}`
+- `retrieval`：`retrieval_db`（数据目录名）、`system_prompt`、`prompt`
+- `vlm_only`：`system_prompt`、`prompt`
+
+规格文件启动时严格校验；JSON 格式错误、未知策略、字段缺失或非法 prompt 占位符都会直接报错，不再静默跳过。
+
+### 统一入口
+
+`pipeline/experiments/runner.py` 的 `run_experiment_check(experiment_id, image_bytes, provider, model)` 根据 `spec.strategy` 自动分发。`app.py` 的眼镜端 job、调试接口、实验工作台都走这个入口，无 if/elif 硬编码。
+
+### 新增实验流程
+
+1. 在 `specs/` 放一个 JSON 规格文件
+2. `retrieval` 策略需运行 `build_db.py` 建特征库；`cv_reference` 需标注参考图
+3. 重启服务 → 自动出现在眼镜端实验列表、`/experiment-lab` 下拉菜单、健康接口
+4. （可选）`voice_control/intent_omni.py` 的 `SUPPORTED_EXPERIMENTS` 加语音识别映射
+
+### 电脑端实验工作台
+
+`/experiment-lab`：选实验 → 上传图片 → 一键纠错，显示标注图、检测结果、VLM 文字、各阶段耗时。不依赖眼镜。
 
 ## 语音控制架构（voice_control/intent_omni.py）
 

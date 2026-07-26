@@ -1,0 +1,20 @@
+{
+  "id": "photometer",
+  "name": "光度计",
+  "strategy": "cv_reference",
+  "supports_demo": true,
+  "system_prompt": "你是光度计实验纠错助手，只判断光斑最亮处是否与感光元件中心对准。",
+  "components": [
+    {"label": "light_spot", "name": "光斑", "color": "#ff0000"}
+  ],
+  "color_legend": "色框对应关系：\n- 红色框: 光斑 (light_spot)",
+  "prompt_a": "请只判断图B的光斑最亮处是否与感光元件中心对准。\n\n图A是参考示范图（正确），其中光斑中心对准感光元件。图B是待纠错的学生图片。两张图都用红色矩形框标注光斑位置。\n\n{color_legend}\n\nCV检测结果说明：\n{cv_summary}\n\n判断规则：\n1. 唯一关注点是图B光斑最亮处是否偏离感光元件中心。\n2. 图A用于提供正确对准状态：光斑中心在感光元件中心。\n3. 不要评价光斑大小、清晰度、背景、拍摄角度或其他装置。\n3. 如果图B未检测到红色框，结论为“无法判断，图B未检测到光斑”。\n4. 如果图A未检测到红色框，结论为“无法判断，参考图未检测到光斑”。\n\n请按以下格式输出：\n\n结论：偏离 / 未偏离 / 无法判断\n\n理由：\n- 如果偏离，直接输出：光斑最亮处未与感光元件对准，导致信号弱。\n- 如果未偏离，输出：光斑最亮处与感光元件对准。\n- 如果无法判断，简要说明缺少哪一侧光斑框。",
+  "experiment_requirements": "光度计实验：光斑最亮处须对准感光元件中心。",
+  "reference_db": true,
+  "require_reference_labels": true,
+  "reference": {
+    "source": "database",
+    "reference_id": "250bbf02fa04"
+  },
+  "test_images_dir": "test_images/photometer"
+}

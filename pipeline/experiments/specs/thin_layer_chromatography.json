@@ -1,0 +1,19 @@
+{
+  "id": "thin_layer_chromatography",
+  "name": "薄层色谱实验",
+  "strategy": "vlm_only",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析助手。只根据图片中可见内容判断，不要臆测。",
+  "prompt": "请结合待检查图片、正确参考图和错误参考图，检查薄层色谱实验。\n\n重点检查：\n- 强制：薄层板是否被污染，例如存在与点样无关的污渍、手套或手指造成的污染痕迹。\n- 建议：点样是否过浓或样点过大。\n- 强制：是否标记展开剂前沿。\n- 建议：是否及时标记每个点样的名称。\n\n只报告图片中能够明确判断的问题；看不清时不要猜测。\n\n输出格式：\n问题：...\n意见：...",
+  "reference_images": [
+    {
+      "role": "correct",
+      "path": "assets://reference_images/thin_layer_chromatography/correct.png"
+    },
+    {
+      "role": "wrong",
+      "path": "assets://reference_images/thin_layer_chromatography/wrong.png"
+    }
+  ],
+  "test_images_dir": "test_images/thin_layer_chromatography"
+}

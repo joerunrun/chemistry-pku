@@ -1,0 +1,9 @@
+{
+  "id": "recrystallization_reflux",
+  "name": "重结晶回流实验",
+  "strategy": "vlm_only",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析助手。只根据图片中可见内容判断，不要臆测。",
+  "prompt": "请检查重结晶回流装置。\n\n检查：\n- 强制：回流装置是否用铝架双点固定，尤其冷凝管是否夹牢。\n- 强制：冷凝管上方是否敞口，避免形成密闭加热体系。\n- 建议：调压仪是否放在试剂架上，而非桌面。\n- 建议：热过滤时吸滤瓶是否用铝架固定。\n\n只报告能够明确判断的问题。\n\n输出格式：\n问题：...\n意见：...",
+  "test_images_dir": "test_images/recrystallization_reflux"
+}

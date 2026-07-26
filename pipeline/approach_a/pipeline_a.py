@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from pipeline.common.vlm_client import (
-    SYSTEM_PROMPT,
     build_image_part_from_bytes,
     build_text_part,
     call_vlm,
@@ -30,6 +29,7 @@ def build_one_step_messages(
     *,
     prompt_template: str,
     color_legend: str,
+    system_prompt: str,
 ) -> list[dict[str, Any]]:
     prompt = prompt_template.format(
         color_legend=color_legend,
@@ -37,7 +37,7 @@ def build_one_step_messages(
         requirements=experiment_requirements,
     )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": [
@@ -63,8 +63,9 @@ def run_pipeline_a(
 ) -> ApproachAResult:
     correct_jpeg_bytes, wrong_jpeg_bytes = prebuilt_jpeg  # type: ignore[misc]
 
-    import pipeline.experiments.distillation as default_cfg
-    cfg = experiment_config or default_cfg
+    if not isinstance(experiment_config, dict):
+        raise ValueError("Approach A requires a JSON experiment specification")
+    cfg = experiment_config
     client = create_vlm(vlm_provider, vlm_model)
     messages = build_one_step_messages(
         correct_jpeg_bytes,
@@ -72,8 +73,9 @@ def run_pipeline_a(
         cv_summary or "",
         experiment_requirements,
         client,
-        prompt_template=cfg.APPROACH_A_PROMPT,
-        color_legend=cfg.COLOR_LEGEND,
+        prompt_template=cfg["prompt_a"],
+        color_legend=cfg.get("color_legend", ""),
+        system_prompt=cfg["system_prompt"],
     )
     analysis_text, _ = call_vlm(client, messages)
 

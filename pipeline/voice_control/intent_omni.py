@@ -46,7 +46,17 @@ TEACHER_INTENTS = {
     "start_recording",
     "unclear",
 }
-SUPPORTED_EXPERIMENTS = {"distillation", "photometer", "electrolysis", "tlc"}
+SUPPORTED_EXPERIMENTS = {
+    "distillation",
+    "atmospheric_distillation",
+    "photometer",
+    "electrolysis",
+    "tlc",
+    "thin_layer_chromatography",
+    "column_chromatography",
+    "recrystallization_reflux",
+    "recrystallization_filtration",
+}
 # select_experiment 只用于启动阶段的 experiment_setup 上下文；苏醒模式不切换实验。
 
 # 沉睡模式：精简 prompt，只检测唤醒词
@@ -86,20 +96,10 @@ AWAKE_MODE_PROMPT = """你是一个自然语言理解分类器。
 }
 """
 
-EXPERIMENT_SETUP_PROMPT = """你是智能眼镜启动时的实验名称选择器。
-用户正在选择今天要做的实验。
-
-你只能把语音映射到以下四个实验之一：
-- distillation: 减压蒸馏、蒸馏
-- photometer: 光度计、光度实验
-- electrolysis: 电解、电解实验
-- tlc: TLC、薄层色谱、薄层层析
-
-如果明确听到支持的实验名称，只输出严格 JSON：
-{"transcript":"用户语音转写","intent":"select_experiment","slots":{"experiment_type":"distillation|photometer|electrolysis|tlc","video_index":null,"video_query":null},"reply_text":"已选择该实验。","confidence":0.9}
-
-如果用户说的是无关内容、环境噪声，或听不清，只输出严格 JSON：
-{"transcript":"用户语音转写","intent":"unclear","slots":{"experiment_type":null,"video_index":null,"video_query":null},"reply_text":"请选择今天的实验。","confidence":0.5}
+EXPERIMENT_SETUP_PROMPT = """识别用户选择的实验。
+支持：减压蒸馏、常压蒸馏、光度计、电解实验、TLC、薄层色谱实验、柱色谱实验、重结晶回流实验、重结晶过滤实验。
+只输出 JSON：
+{"transcript":"转写文本","intent":"select_experiment或unclear","slots":{"experiment_type":"对应实验ID或null"}}
 """
 
 # 教师版唤醒后：自然语言理解 → 只分类到拍照 / 开始录像
@@ -309,7 +309,11 @@ def classify_audio_intent(
             if ctx == "experiment_setup":
                 transcript = str(result.get("transcript") or callback.transcript or "").strip()
                 slots = result.get("slots") if isinstance(result.get("slots"), dict) else {}
-                experiment_type = slots.get("experiment_type") or _match_experiment_type(transcript)
+                # The transcript contains the user-facing experiment name and is
+                # less ambiguous than a model-generated enum value.
+                experiment_type = _match_experiment_type(transcript)
+                if experiment_type is None:
+                    experiment_type = slots.get("experiment_type")
                 if experiment_type in SUPPORTED_EXPERIMENTS:
                     result = _safe_intent(
                         transcript,
@@ -671,14 +675,24 @@ def _looks_like_demo_guide_request(text: str) -> bool:
 
 
 def _match_experiment_type(text: str) -> str | None:
-    if "减压" in text or "蒸馏" in text:
+    if "常压" in text:
+        return "atmospheric_distillation"
+    if "减压" in text:
         return "distillation"
     if "光度" in text:
         return "photometer"
     if "电解" in text:
         return "electrolysis"
-    if "TLC" in text.upper() or "薄层色谱" in text or "薄层层析" in text:
+    if "TLC" in text.upper():
         return "tlc"
+    if "薄层色谱" in text or "薄层层析" in text:
+        return "thin_layer_chromatography"
+    if "柱色谱" in text or "柱层析" in text:
+        return "column_chromatography"
+    if "重结晶" in text and ("回流" in text or "冷凝" in text):
+        return "recrystallization_reflux"
+    if "重结晶" in text and ("过滤" in text or "吸滤" in text):
+        return "recrystallization_filtration"
     return None
 
 
@@ -785,9 +799,14 @@ def _default_reply(intent: str, slots: dict[str, Any]) -> str:
     if intent == "select_experiment":
         names = {
             "distillation": "减压蒸馏",
+            "atmospheric_distillation": "常压蒸馏",
             "photometer": "光度计",
             "electrolysis": "电解",
             "tlc": "TLC",
+            "thin_layer_chromatography": "薄层色谱实验",
+            "column_chromatography": "柱色谱实验",
+            "recrystallization_reflux": "重结晶回流实验",
+            "recrystallization_filtration": "重结晶过滤实验",
         }
         name = names.get(slots.get("experiment_type"), "该实验")
         return f"已选择{name}，请保持装置在视野中央。"

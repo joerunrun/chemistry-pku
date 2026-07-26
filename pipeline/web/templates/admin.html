@@ -133,6 +133,18 @@
   </section>
 
   <section class="panel">
+    <h2>拍摄照片</h2>
+    <div class="row">
+      <button type="button" class="secondary" id="refreshPhotos">刷新照片</button>
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        日期筛选：<input type="date" id="photoDateFilter" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit;">
+      </label>
+    </div>
+    <div id="photoStatus" class="status"></div>
+    <div id="photoList"></div>
+  </section>
+
+  <section class="panel">
     <h2>意见反馈</h2>
     <form id="feedbackForm">
       <div class="row">
@@ -150,8 +162,12 @@
 </main>
 
 <script>
+const RECORD_API_PREFIX = {{ record_api_prefix|tojson }};
+document.title = {{ portal_title|tojson }};
+document.querySelector('main > h1').textContent = {{ portal_title|tojson }};
 const videoStatus = document.getElementById('videoStatus');
 const recordStatus = document.getElementById('recordStatus');
+const photoStatus = document.getElementById('photoStatus');
 const feedbackStatus = document.getElementById('feedbackStatus');
 
 function setStatus(el, text, isError = false) {
@@ -226,7 +242,7 @@ let allRecords = [];
 async function loadRecords() {
   setStatus(recordStatus, '正在加载记录...');
   try {
-    const data = await fetchJson('/admin/api/records');
+    const data = await fetchJson(`${RECORD_API_PREFIX}/records`);
     allRecords = data.records || [];
     renderRecords();
     setStatus(recordStatus, `共 ${allRecords.length} 条记录。`);
@@ -264,6 +280,7 @@ function renderRecords() {
                     <a class="link-button secondary" href="${escapeAttr(file.download_url)}">${escapeHtml(file.filename)} (${formatSize(file.size)})</a>
                   `).join('')}
                 </div>
+                ${renderAnalysis(record.analysis)}
               </td>
               <td><button class="danger" data-delete-record="${escapeAttr(record.record_id)}">删除</button></td>
             </tr>
@@ -271,6 +288,64 @@ function renderRecords() {
         </tbody>
       </table>`;
   }
+}
+
+let allPhotos = [];
+
+async function loadPhotos() {
+  setStatus(photoStatus, '正在加载照片...');
+  try {
+    const data = await fetchJson(`${RECORD_API_PREFIX}/photos`);
+    allPhotos = data.photos || [];
+    renderPhotos();
+    setStatus(photoStatus, `共 ${allPhotos.length} 张照片。`);
+  } catch (error) {
+    setStatus(photoStatus, error.message, true);
+  }
+}
+
+function renderPhotos() {
+  const filterDate = document.getElementById('photoDateFilter').value;
+  let photos = allPhotos;
+  if (filterDate) {
+    photos = allPhotos.filter(photo => (photo.created_at || '').startsWith(filterDate));
+  }
+  if (!photos.length) {
+    document.getElementById('photoList').innerHTML =
+      `<div class="empty">${filterDate ? '该日期没有照片。' : '还没有上传的照片。'}</div>`;
+    return;
+  }
+  document.getElementById('photoList').innerHTML = `
+    <table>
+      <thead><tr><th>预览</th><th>时间</th><th>设备/实验</th><th>操作</th></tr></thead>
+      <tbody>
+        ${photos.map(photo => `
+          <tr>
+            <td>
+              <a href="${escapeAttr(photo.file_url)}" target="_blank" rel="noopener">
+                <img src="${escapeAttr(photo.file_url)}" alt="拍摄照片"
+                     style="width:160px;max-height:100px;object-fit:contain;background:#111;border-radius:4px;">
+              </a>
+            </td>
+            <td>
+              <div>${escapeHtml(photo.created_at || '')}</div>
+              <div>${escapeHtml(photo.photo_id || '')}</div>
+            </td>
+            <td>
+              <div>${escapeHtml(photo.device_id || '')}</div>
+              <div>${escapeHtml(photo.experiment_type || '')}</div>
+              ${renderAnalysis(photo.analysis)}
+            </td>
+            <td>
+              <div class="actions">
+                <a class="link-button secondary" href="${escapeAttr(photo.download_url)}">下载</a>
+                <button class="danger" data-delete-photo="${escapeAttr(photo.photo_id)}">删除</button>
+              </div>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>`;
 }
 
 async function loadFeedback() {
@@ -375,10 +450,20 @@ document.addEventListener('click', async (event) => {
   if (recordId) {
     if (!confirm('确定删除这条记录吗？')) return;
     try {
-      await fetchJson(`/admin/api/records/${encodeURIComponent(recordId)}`, { method: 'DELETE' });
+      await fetchJson(`${RECORD_API_PREFIX}/records/${encodeURIComponent(recordId)}`, { method: 'DELETE' });
       await loadRecords();
     } catch (error) {
       setStatus(recordStatus, error.message, true);
+    }
+  }
+  const photoId = event.target.dataset && event.target.dataset.deletePhoto;
+  if (photoId) {
+    if (!confirm('确定删除这张照片吗？')) return;
+    try {
+      await fetchJson(`${RECORD_API_PREFIX}/photos/${encodeURIComponent(photoId)}`, { method: 'DELETE' });
+      await loadPhotos();
+    } catch (error) {
+      setStatus(photoStatus, error.message, true);
     }
   }
   const feedbackId = event.target.dataset && event.target.dataset.deleteFeedback;
@@ -397,6 +482,8 @@ document.getElementById('refreshVideos').addEventListener('click', loadVideos);
 document.getElementById('videoExperiment').addEventListener('change', loadVideos);
 document.getElementById('refreshRecords').addEventListener('click', loadRecords);
 document.getElementById('recordDateFilter').addEventListener('change', renderRecords);
+document.getElementById('refreshPhotos').addEventListener('click', loadPhotos);
+document.getElementById('photoDateFilter').addEventListener('change', renderPhotos);
 document.getElementById('refreshFeedback').addEventListener('click', loadFeedback);
 
 function escapeHtml(value) {
@@ -412,8 +499,24 @@ function escapeAttr(value) {
   return escapeHtml(value);
 }
 
+function renderAnalysis(analysis) {
+  const items = Object.values((analysis && analysis.items) || {});
+  if (!items.length) return '';
+  const lines = items.map(item => {
+    if (item.status === 'queued') return '分析排队中';
+    if (item.status === 'running') return '正在分析';
+    if (item.status === 'failed') return `分析失败：${item.error || '未知错误'}`;
+    if (item.transcript) return `转写：${item.transcript}`;
+    if (item.description) return `图片描述：${item.description}`;
+    return '';
+  }).filter(Boolean);
+  if (!lines.length) return '';
+  return `<div style="margin-top:8px;font-size:13px;color:var(--muted);white-space:pre-wrap;">${lines.map(escapeHtml).join('<br>')}</div>`;
+}
+
 loadVideos();
 loadRecords();
+loadPhotos();
 loadFeedback();
 </script>
 </body>

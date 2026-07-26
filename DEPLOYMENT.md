@@ -39,6 +39,8 @@ chemistry/
   runtime_assets/         ← 运行时资源（不进 git）
     ├── demo_videos/      ← 演示视频（教师通过 /admin 上传也行）
     ├── user_records/     ← 学生实验记录（自动生成）
+    ├── user_photos/      ← 眼镜拍摄照片（自动生成，与视频记录分开）
+    ├── teacher_records/  ← 教师版记录（自动生成，与学生记录分离）
     ├── reference_images/
     ├── cv_detection2_data/
     ├── safety_check_data/

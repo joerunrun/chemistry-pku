@@ -1,0 +1,9 @@
+{
+  "id": "column_chromatography",
+  "name": "柱色谱实验",
+  "strategy": "vlm_only",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析助手。只根据图片中可见内容判断，不要臆测。",
+  "prompt": "请检查柱色谱实验装置。\n\n重点检查：\n- 强制：是否用烧杯盛放有机溶剂。\n- 强制：色谱柱是否出现干裂。\n- 强制：色谱柱出液口是否与锥形瓶正确衔接，避免出液无法收集。\n- 建议：桌面是否明显杂乱。仅在杂物明显占用操作区、妨碍稳定操作或造成明显安全风险时提出；正常摆放的实验器材不算杂乱。\n\n只报告图片中能够明确判断的问题；看不清时不要猜测。\n\n输出格式：\n问题：...\n意见：...",
+  "test_images_dir": "test_images/column_chromatography"
+}

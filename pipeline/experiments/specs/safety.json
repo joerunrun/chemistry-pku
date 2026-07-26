@@ -1,0 +1,11 @@
+{
+  "id": "safety",
+  "name": "安全检查",
+  "strategy": "retrieval",
+  "retrieval_db": "safety_check_data",
+  "top_k": 1,
+  "system_prompt": "你是实验室安全检查助手。请直接判断图片中的安全问题，并给出整改意见。",
+  "prompt": "请检查待检图片中的实验室安全问题。\n\n可参考的安全检查要点：\n{top_k_descriptions}\n\n待检图片如下。\n\n要求：\n- 不要提“参考案例”“数据库”“相似图片”“检索”等来源\n- 只输出中文\n- 用最简洁的语言输出\n- 只报告确实存在的安全问题；没有发现问题就输出“未发现明显安全问题”\n- 不要描述无关背景\n\n输出格式：\n问题：...\n意见：...",
+  "empty_result_text": "问题：未发现明显安全问题。\n意见：保持当前规范操作。",
+  "test_images_dir": "test_images/safety"
+}

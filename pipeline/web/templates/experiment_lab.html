@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实验纠错工作台</title>
+  <style>
+    :root { --bg:#f6f4ef; --panel:#fff; --text:#171717; --muted:#686868; --line:#ddd3c7; --accent:#6f55d9; --danger:#b3261e; --ok:#2e7d32; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; line-height:1.5; }
+    main { width:min(1120px, calc(100% - 32px)); margin:28px auto 48px; }
+    h1 { margin:0 0 20px; font-size:28px; }
+    h2 { margin:0 0 16px; font-size:20px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:20px; margin-bottom:20px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    select, input[type=file] { padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; font:inherit; }
+    select { min-width:200px; }
+    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:9px 16px; font-size:14px; cursor:pointer; }
+    button.secondary { background:#555; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .status { margin-top:10px; min-height:22px; color:var(--muted); }
+    .error { color:var(--danger); }
+    table { width:100%; border-collapse:collapse; margin-top:12px; font-size:14px; }
+    th,td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    .image-pair { display:flex; gap:16px; flex-wrap:wrap; }
+    figure { margin:0; }
+    figcaption { font-size:13px; color:var(--muted); margin-bottom:6px; }
+    img.preview { max-width:100%; max-height:380px; border-radius:6px; border:1px solid var(--line); }
+    .result-text { white-space:pre-wrap; background:#fafafa; padding:14px; border-radius:6px; border:1px solid var(--line); font-size:14px; }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>实验纠错工作台</h1>
+
+  <section class="panel">
+    <h2>选择实验并上传图片</h2>
+    <div class="row">
+      <label>实验类型
+        <select id="experimentSelect"></select>
+      </label>
+      <label>Provider
+        <select id="providerSelect"></select>
+      </label>
+      <label>模型
+        <select id="modelSelect"><option value="">默认</option></select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <input type="file" id="imageInput" accept="image/*">
+      <button id="runButton">一键纠错</button>
+    </div>
+    <div id="status" class="status"></div>
+  </section>
+
+  <section class="panel hidden" id="resultArea">
+    <h2>纠错结果</h2>
+    <div id="imageArea" class="image-pair"></div>
+    <div id="detailsArea" class="hidden" style="margin-top:16px;">
+      <h2 style="font-size:16px;margin-bottom:8px;">检测 / 检索详情</h2>
+      <pre id="detailsText" class="result-text"></pre>
+    </div>
+    <div class="row" style="margin-top:16px;">
+      <div style="flex:1;min-width:280px;">
+        <h2 style="font-size:16px;margin-bottom:8px;">分析结果</h2>
+        <div id="resultText" class="result-text"></div>
+      </div>
+      <div style="min-width:240px;">
+        <h2 style="font-size:16px;margin-bottom:8px;">耗时</h2>
+        <table id="timingTable"><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let allSpecs = [];
+let providerModels = {};
+
+async function fetchJson(url, opts) {
+  const r = await fetch(url, opts);
+  const t = await r.text();
+  let p = {};
+  if (t) { try { p = JSON.parse(t); } catch(_) { p = {error:t}; } }
+  if (!r.ok) throw new Error(p.error || `HTTP ${r.status}`);
+  return p;
+}
+
+async function loadSpecs() {
+  const d = await fetchJson('/api/experiment-lab/specs');
+  allSpecs = d.experiments || [];
+  const sel = $('experimentSelect');
+  sel.innerHTML = allSpecs.map(s => `<option value="${s.id}">${s.name} (${s.strategy})</option>`).join('');
+}
+
+async function loadModels() {
+  const d = await fetchJson('/api/models');
+  providerModels = d.provider_models || {};
+  const sel = $('providerSelect');
+  sel.innerHTML = Object.keys(providerModels).map(p => `<option value="${p}">${p}</option>`).join('');
+  if (sel.value) fillModels();
+}
+
+function fillModels() {
+  const models = providerModels[$('providerSelect').value] || [];
+  $('modelSelect').innerHTML = '<option value="">默认</option>' + models.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+}
+
+$('providerSelect').addEventListener('change', fillModels);
+
+$('runButton').addEventListener('click', async () => {
+  const file = $('imageInput').files[0];
+  if (!file) { setStatus('请先选择图片。', true); return; }
+  const fd = new FormData();
+  fd.append('image', file);
+  fd.append('experiment_id', $('experimentSelect').value);
+  fd.append('provider', $('providerSelect').value);
+  fd.append('model', $('modelSelect').value);
+  $('runButton').disabled = true;
+  setStatus('正在纠错...');
+  $('resultArea').classList.add('hidden');
+  try {
+    const r = await fetchJson('/api/experiment-lab/run', { method:'POST', body:fd });
+    renderResult(r);
+    setStatus('完成。');
+  } catch (e) {
+    setStatus(e.message, true);
+  } finally {
+    $('runButton').disabled = false;
+  }
+});
+
+function renderResult(r) {
+  const imgs = $('imageArea');
+  imgs.innerHTML = '';
+  if (r.correct_data_url && r.wrong_data_url) {
+    imgs.innerHTML = `
+      <figure><figcaption>参考示范图</figcaption><img class="preview" src="${r.correct_data_url}"></figure>
+      <figure><figcaption>待纠错图</figcaption><img class="preview" src="${r.wrong_data_url}"></figure>`;
+  }
+  const details = r.retrieved || r.label_summary || null;
+  $('detailsArea').classList.toggle('hidden', !details);
+  $('detailsText').textContent = details ? JSON.stringify(details, null, 2) : '';
+  $('resultText').textContent = r.analysis_text || '无结果';
+  const tb = $('timingTable').querySelector('tbody');
+  const t = r.timings || {};
+  const maxMs = Math.max(...Object.values(t), 1);
+  tb.innerHTML = Object.entries(t).map(([k,v]) => {
+    const w = Math.max(2, Math.round(v/maxMs*100));
+    return `<tr><td>${k}</td><td>${Math.round(v)} ms</td></tr>`;
+  }).join('');
+  $('resultArea').classList.remove('hidden');
+}
+
+function setStatus(text, isError) {
+  const s = $('status');
+  s.textContent = text || '';
+  s.classList.toggle('error', Boolean(isError));
+}
+
+loadSpecs();
+loadModels();
+</script>
+</body>
+</html>

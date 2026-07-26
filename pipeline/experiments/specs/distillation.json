@@ -1,0 +1,24 @@
+{
+  "id": "distillation",
+  "name": "减压蒸馏",
+  "strategy": "cv_reference",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析与纠错助手。请根据参考示范图、待纠错图和实验要求给出简洁准确的判断。",
+  "components": [
+    {"label": "voltage_regulator", "name": "调压器", "color": "#fff200"},
+    {"label": "heating_unit", "name": "加热装置", "color": "#ff0000"},
+    {"label": "distillation_core", "name": "蒸馏核心", "color": "#00b050"},
+    {"label": "condenser_unit", "name": "冷凝管", "color": "#00a2e8"},
+    {"label": "receiving_assembly", "name": "接收装置", "color": "#ff7f27"}
+  ],
+  "color_legend": "色框对应关系：\n- 黄色框: 调压器 (voltage_regulator)\n- 红色框: 加热装置 (heating_unit)\n- 绿色框: 蒸馏核心 (distillation_core)\n- 蓝色框: 冷凝管 (condenser_unit)\n- 橙色框: 接收装置 (receiving_assembly)\n",
+  "prompt_a": "请对比图A和图B，判断图B中最主要的减压蒸馏装置错误。\n\n图A是正确参考图，图B是待纠错学生图。两张图上都有彩色框标注装置部件。\n\n{color_legend}\n\nCV检测概况：\n{cv_summary}\n\n实验要求：\n{requirements}\n\n要求：\n1. 只关注减压蒸馏装置是否符合实验要求。\n2. 忽略拍摄角度、光线、裁剪范围等表面差异。\n3. 如果图B的自动检测框有漏检或误检，以图像实际内容为准。\n4. 输出要简洁，只给最主要问题和整改意见。\n\n输出格式：\n问题：...\n意见：...",
+  "experiment_requirements": "减压蒸馏装置检查要点：必须使用克氏蒸馏头；接收装置应使用多尾接液管和圆底/梨形接收瓶，不能用锥形瓶；温度计液泡应位于蒸馏头侧管口中心；磨口连接处应使用磨口夹固定；冷凝管应接橡胶水管并下进上出，且用铁夹固定；尾接管侧口应连接真空泵或水泵；调压仪出现在桌面上方视为错误；烧瓶下方应有电磁搅拌器防止爆沸。",
+  "reference_db": true,
+  "require_reference_labels": false,
+  "reference": {
+    "source": "file",
+    "annotated_image_path": "assets://reference_images/distillation_correct_annotated.png"
+  },
+  "test_images_dir": "test_images/distillation"
+}

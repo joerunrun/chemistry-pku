@@ -1,0 +1,24 @@
+{
+  "id": "atmospheric_distillation",
+  "name": "常压蒸馏",
+  "strategy": "cv_reference",
+  "supports_demo": true,
+  "system_prompt": "你是化学实验图像分析与纠错助手。请根据常压蒸馏参考示范图、待纠错图和实验要求给出简洁准确的判断。",
+  "components": [
+    {"label": "voltage_regulator", "name": "调压器", "color": "#fff200"},
+    {"label": "heating_unit", "name": "加热装置", "color": "#ff0000"},
+    {"label": "distillation_core", "name": "蒸馏核心", "color": "#00b050"},
+    {"label": "condenser_unit", "name": "冷凝管", "color": "#00a2e8"},
+    {"label": "receiving_assembly", "name": "接收装置", "color": "#ff7f27"}
+  ],
+  "color_legend": "色框对应关系：\n- 黄色框: 调压器 (voltage_regulator)\n- 红色框: 加热装置 (heating_unit)\n- 绿色框: 蒸馏核心 (distillation_core)\n- 蓝色框: 冷凝管 (condenser_unit)\n- 橙色框: 接收装置 (receiving_assembly)\n",
+  "prompt_a": "请对比图A和图B，判断图B中最主要的常压蒸馏装置错误。\n\n图A是正确参考图，图B是待纠错学生图。两张图上都有彩色框标注装置部件。\n\n{color_legend}\n\nCV检测概况：\n{cv_summary}\n\n实验要求：\n{requirements}\n\n要求：\n1. 只关注常压蒸馏装置是否符合实验要求。\n2. 忽略拍摄角度、光线、裁剪范围等表面差异。\n3. 如果图B的自动检测框有漏检或误检，以图像实际内容为准。\n4. 输出要简洁，只给最主要问题和整改意见。\n\n输出格式：\n问题：...\n意见：...",
+  "experiment_requirements": "常压蒸馏装置检查要点：可使用直形或弯形蒸馏头；接收装置应使用接液管和接收瓶（可以使用锥形瓶），且悬空的接收瓶必须用磨口夹或铁夹固定；温度计液泡位置需根据蒸馏头区分（直形蒸馏头液泡上沿与侧管下沿齐平，弯形蒸馏头液泡应位于切线交汇处）；磨口连接处应使用磨口夹固定，口径不一致时必须使用大小口接头；冷凝管应接橡胶水管下进上出（出水口接橡胶导管引流），且用铁夹固定；接液管必须敞口通大气，严禁做成密闭系统加热；烧瓶底部必须与电热套紧密贴合；调压仪出现在桌面上视为错误（必须放在试剂架上）；烧瓶下方应有磁力搅拌器并放置磁子防止爆沸，且下方误放调压仪视为错误。",
+  "reference_db": true,
+  "require_reference_labels": false,
+  "reference": {
+    "source": "file",
+    "annotated_image_path": "assets://reference_images/atmospheric_distillation_correct_annotated.png"
+  },
+  "test_images_dir": "test_images/atmospheric_distillation"
+}
