@@ -47,13 +47,21 @@ class CameraSessionManager(
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
     private var cameraInitializing = false
+    private var cameraGeneration = 0L
     private var recordingDesired = false
+    // Student recordings keep the camera audio track. Teacher mode supplies
+    // its own AudioRecord stream so CameraX must not open a second mic input.
+    private var videoAudioEnabled = true
     private var currentStatus = "未记录"
     private val savedSegments = mutableListOf<File>()
     private val stopCallbacks = mutableListOf<(List<File>) -> Unit>()
 
     val statusLabel: String
         get() = currentStatus
+
+    fun setVideoAudioEnabled(enabled: Boolean) {
+        videoAudioEnabled = enabled
+    }
 
     fun ensureCamera(onReady: () -> Unit, onError: (Throwable) -> Unit) {
         val cameraReady = imageCapture != null &&
@@ -70,8 +78,12 @@ class CameraSessionManager(
         }
 
         cameraInitializing = true
+        val generation = cameraGeneration
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener({
+            if (generation != cameraGeneration) {
+                return@addListener
+            }
             try {
                 val provider = providerFuture.get()
                 cameraProvider = provider
@@ -149,6 +161,10 @@ class CameraSessionManager(
     }
 
     fun shutdown() {
+        cameraGeneration += 1
+        cameraInitializing = false
+        pendingReadyCallbacks.clear()
+        pendingErrorCallbacks.clear()
         stopRecording()
         cameraProvider?.unbindAll()
         cameraProvider = null
@@ -222,7 +238,8 @@ class CameraSessionManager(
         cleanupOldPrivateSegments()
         val output = nextPrivateFileOutputOptions()
         var pendingRecording: PendingRecording = recorder.prepareRecording(context, output.options)
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+        if (videoAudioEnabled &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED
         ) {
             pendingRecording = pendingRecording.withAudioEnabled()

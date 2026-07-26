@@ -24,6 +24,7 @@ import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -34,6 +35,9 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.sqrt
 
@@ -45,6 +49,7 @@ class TeacherActivity : AppCompatActivity() {
     // 持续录音（单路，同时承担保存 + 唤醒检测的环形缓冲来源）
     @Volatile private var continuousRunning = false
     private var continuousRecorder: AudioRecord? = null
+    @Volatile private var continuousStopLatch: CountDownLatch? = null
     private var continuousFile: File? = null
     private var continuousTotalSamples = 0
     private val ringBuffer = ByteArrayOutputStream()
@@ -56,6 +61,8 @@ class TeacherActivity : AppCompatActivity() {
     private var teacherState = TeacherState.LISTENING
     private val operationToken = java.util.concurrent.atomic.AtomicInteger(0)
     private var wakeCheckScheduled = false
+    private var continuousRestartScheduled = false
+    private var continuousRestartAttempts = 0
     private var videoRecordingActive = false
 
     // 录像服务
@@ -108,9 +115,18 @@ class TeacherActivity : AppCompatActivity() {
     private var teacherConnectionReady = false
     private var teacherConnectionCheckInProgress = false
     private var teacherSessionStarted = false
+    private var teacherExitInProgress = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep the voice-only teacher page in the foreground on RayNeo. If
+        // the display sleeps, LockScreenActivity takes input focus and the
+        // temple double-tap never reaches this Activity.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
         findViewById<View>(R.id.main).setBackgroundColor(Color.TRANSPARENT)
@@ -177,8 +193,38 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     private fun exitTeacherApp() {
-        continuousRunning = false
+        if (teacherExitInProgress) return
+        teacherExitInProgress = true
+        operationToken.incrementAndGet()
+        teacherState = TeacherState.INSTRUCTION
+        val service = recordingService
+        val hasActiveVideo = videoRecordingActive && service != null && serviceBound
+        videoRecordingActive = false
+
+        if (hasActiveVideo) {
+            val completed = AtomicBoolean(false)
+            fun finishVideoCleanup(files: List<File>) {
+                if (!completed.compareAndSet(false, true)) return
+                if (files.isNotEmpty()) uploadRecordFiles(files)
+                service.stopCaptureSessionIfIdle()
+                service.stopTeacherSession()
+            }
+            // Keep media cleanup in the background; do not hold the Activity
+            // on screen while AudioRecord/CameraX finish their callbacks.
+            stopContinuousRecording {
+                service.stopRecording { files -> finishVideoCleanup(files) }
+                mainHandler.postDelayed({ finishVideoCleanup(service.getRecordedFiles()) }, 8_000L)
+            }
+        } else {
+            stopContinuousRecording()
+            stopTeacherService()
+        }
         finishAndRemoveTask()
+    }
+
+    private fun stopTeacherService() {
+        recordingService?.stopTeacherSession()
+            ?: stopService(Intent(this, RecordingService::class.java))
     }
 
     private fun hideAllViews() {
@@ -257,6 +303,11 @@ class TeacherActivity : AppCompatActivity() {
     private fun startTeacherSession() {
         if (!teacherConnectionReady || teacherSessionStarted) return
         teacherSessionStarted = true
+        startForegroundService(
+            this,
+            Intent(this, RecordingService::class.java)
+                .setAction(RecordingService.ACTION_START_TEACHER_SESSION),
+        )
         bindService(
             Intent(this, RecordingService::class.java), serviceConnection, Context.BIND_AUTO_CREATE
         )
@@ -268,10 +319,26 @@ class TeacherActivity : AppCompatActivity() {
     // ===== 单路持续录音：写 wav + 维护最近 4 秒环形缓冲 =====
     @Suppress("MissingPermission")
     private fun startContinuousRecording() {
-        if (continuousRunning) return
+        if (teacherExitInProgress || continuousRunning) return
+        if (continuousStopLatch != null) {
+            if (!continuousRestartScheduled && continuousRestartAttempts < 40) {
+                continuousRestartAttempts += 1
+                continuousRestartScheduled = true
+                mainHandler.postDelayed({
+                    continuousRestartScheduled = false
+                    if (!teacherExitInProgress && !continuousRunning) {
+                        startContinuousRecording()
+                    }
+                }, 250L)
+            }
+            return
+        }
+        continuousRestartAttempts = 0
         continuousRunning = true
         val recorder = createRecorder()
+        val stopped = CountDownLatch(1)
         continuousRecorder = recorder
+        continuousStopLatch = stopped
         Thread {
             try {
                 val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
@@ -307,10 +374,36 @@ class TeacherActivity : AppCompatActivity() {
                 recorder.release()
                 if (continuousRecorder === recorder) {
                     continuousRecorder = null
+                    continuousRunning = false
                 }
+                if (continuousStopLatch === stopped) continuousStopLatch = null
+                stopped.countDown()
             }
         }.start()
         scheduleWakeCheck()
+    }
+
+    private fun stopContinuousRecording(onStopped: (() -> Unit)? = null) {
+        continuousRunning = false
+        val recorder = continuousRecorder
+        try {
+            recorder?.stop()
+        } catch (_: IllegalStateException) {
+            // The recording thread may already have stopped the recorder.
+        }
+        val latch = continuousStopLatch
+        if (latch == null) {
+            onStopped?.invoke()
+            return
+        }
+        Thread {
+            try {
+                latch.await(3, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            mainHandler.post { onStopped?.invoke() }
+        }.start()
     }
 
     private fun appendRing(buffer: ShortArray, count: Int) {
@@ -345,6 +438,11 @@ class TeacherActivity : AppCompatActivity() {
     private fun scheduleWakeCheck() {
         if (!continuousRunning) return
         if (teacherState != TeacherState.LISTENING && teacherState != TeacherState.RECORDING) return
+        if (continuousRecorder == null) {
+            continuousRunning = false
+            startContinuousRecording()
+            return
+        }
         if (wakeCheckScheduled) return
         wakeCheckScheduled = true
         mainHandler.postDelayed({
@@ -427,27 +525,31 @@ class TeacherActivity : AppCompatActivity() {
 
     private fun stopTeacherRecording() {
         videoRecordingActive = false
-        val service = recordingService
-        if (service != null && serviceBound) {
-            service.stopRecording { files ->
-                if (files.isNotEmpty()) uploadRecordFiles(files)
-                stopService(Intent(this, RecordingService::class.java))
+        teacherState = TeacherState.INSTRUCTION
+        val stopToken = operationToken.incrementAndGet()
+        stopContinuousRecording {
+            val service = recordingService
+            if (service != null && serviceBound) {
+                val completed = AtomicBoolean(false)
+                fun completeStop(files: List<File>) {
+                    if (!completed.compareAndSet(false, true)) return
+                    if (files.isNotEmpty()) uploadRecordFiles(files)
+                    service.stopCaptureSessionIfIdle()
+                    resumeAfterCameraSettle(stopToken, "recording_stop")
+                }
+                service.stopRecording { files -> completeStop(files) }
+                mainHandler.postDelayed({ completeStop(service.getRecordedFiles()) }, 8_000L)
+            } else {
+                resumeAfterCameraSettle(stopToken, "recording_stop")
             }
-        } else {
-            stopService(Intent(this, RecordingService::class.java))
         }
-        playPrompt("recording_stop")
-        teacherState = TeacherState.LISTENING
-        scheduleWakeCheck()
     }
 
     // 唤醒后：停持续录音，录 3.5 秒短片段做主控指令识别（复用学生端 AWAKE_PROMPT）
     @Suppress("MissingPermission")
     private fun startInstructionCapture() {
         teacherState = TeacherState.INSTRUCTION
-        continuousRunning = false
-        // The continuous recorder needs one read cycle to close its WAV segment.
-        mainHandler.postDelayed({ captureInstructionClip() }, 250L)
+        stopContinuousRecording { captureInstructionClip() }
     }
 
     @Suppress("MissingPermission")
@@ -458,6 +560,7 @@ class TeacherActivity : AppCompatActivity() {
         val bufferSize = max(minBuf, 3200)
         val recorder = createRecorder()
         Thread {
+            var captured = false
             try {
                 FileOutputStream(file).use { output ->
                     recorder.startRecording()
@@ -469,44 +572,59 @@ class TeacherActivity : AppCompatActivity() {
                     }
                     recorder.stop()
                 }
-                runOnUiIfCurrent(token) { submitVoiceIntent(file, context = "teacher_awake", isSleepMode = false) }
+                captured = true
             } catch (_: Exception) {
                 runOnUiIfCurrent(token) { resumeListening() }
             } finally {
                 recorder.release()
             }
+            if (captured) {
+                runOnUiIfCurrent(token) {
+                    submitVoiceIntent(file, context = "teacher_awake", isSleepMode = false)
+                }
+            }
         }.start()
     }
 
     private fun handleInstructionIntent(json: org.json.JSONObject) {
+        val actionToken = operationToken.incrementAndGet()
         val intent = json.optString("intent", "unclear")
         when (intent) {
             "capture_photo" -> {
+                teacherState = TeacherState.INSTRUCTION
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                     != PackageManager.PERMISSION_GRANTED
                 ) {
                     requestCameraPermission.launch(Manifest.permission.CAMERA)
-                    resumeListening(); return
+                    resumeListening(actionToken); return
                 }
                 playPrompt("start_capture")
-                withService { service ->
-                    service.captureStillImage { file, error ->
+                withService(actionToken, action = { service ->
+                    val captureCompleted = AtomicBoolean(false)
+                    fun completeCapture(file: File?, error: Throwable?) {
+                        if (!captureCompleted.compareAndSet(false, true)) return
                         if (file != null) {
                             uploadTeacherPhoto(file)
                         } else {
                             Log.w("TeacherPhoto", "capture failed: ${error?.message}")
                         }
-                        runOnUiThread { resumeListening() }
+                        service.stopCaptureSessionIfIdle()
+                        resumeAfterCameraSettle(actionToken)
                     }
-                }
+                    service.captureStillImage { file, error -> completeCapture(file, error) }
+                    mainHandler.postDelayed({
+                        completeCapture(null, IOException("拍照超时"))
+                    }, PHOTO_CAPTURE_TIMEOUT_MS)
+                })
             }
             "start_recording" -> {
                 playPrompt("recording_start") {
+                    if (teacherExitInProgress || operationToken.get() != actionToken) return@playPrompt
                     startForegroundService(
                         this, Intent(this, RecordingService::class.java)
                             .setAction(RecordingService.ACTION_START_RECORDING)
+                            .putExtra(RecordingService.EXTRA_VIDEO_AUDIO_ENABLED, false)
                     )
-                    withService { it.startRecording() }
                     // 进入录像状态：恢复持续录音，唤醒检测切到检测"停止录像"
                     videoRecordingActive = true
                     teacherState = TeacherState.RECORDING
@@ -518,21 +636,49 @@ class TeacherActivity : AppCompatActivity() {
             }
             else -> {
                 playPrompt("unclear")
-                resumeListening()
+                resumeListening(actionToken)
             }
         }
     }
 
     private fun resumeListening() {
+        resumeListening(null)
+    }
+
+    private fun resumeListening(expectedToken: Int?) {
+        if (teacherExitInProgress) return
+        if (expectedToken != null && operationToken.get() != expectedToken) return
         teacherState = TeacherState.LISTENING
         if (!continuousRunning) startContinuousRecording()
         else scheduleWakeCheck()
     }
 
-    private fun withService(action: (RecordingService) -> Unit) {
+    private fun resumeAfterCameraSettle(token: Int, prompt: String? = null) {
+        mainHandler.postDelayed({
+            runOnUiIfCurrent(token) {
+                if (prompt == null) {
+                    resumeListening(token)
+                } else {
+                    playPrompt(prompt) { resumeListening(token) }
+                }
+            }
+        }, CAMERA_SETTLE_DELAY_MS)
+    }
+
+    private fun withService(
+        token: Int,
+        action: (RecordingService) -> Unit,
+        deadline: Long = android.os.SystemClock.uptimeMillis() + SERVICE_WAIT_TIMEOUT_MS,
+    ) {
+        if (teacherExitInProgress || operationToken.get() != token) return
         val s = recordingService
         if (s != null && serviceBound) { action(s); return }
-        mainHandler.postDelayed({ withService(action) }, 200L)
+        if (android.os.SystemClock.uptimeMillis() >= deadline) {
+            Log.w("TeacherCamera", "recording service bind timed out")
+            resumeListening(token)
+            return
+        }
+        mainHandler.postDelayed({ withService(token, action, deadline) }, 200L)
     }
 
     // ===== 退出：停录音 + 上传持续录音 wav =====
@@ -600,7 +746,9 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     private fun runOnUiIfCurrent(token: Int, action: () -> Unit) {
-        mainHandler.post { if (operationToken.get() == token) action() }
+        mainHandler.post {
+            if (!teacherExitInProgress && operationToken.get() == token) action()
+        }
     }
 
     // ===== 音频播放 =====
@@ -640,12 +788,24 @@ class TeacherActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         continuousRunning = false
-        // 如果正在录像，停止并上传录像文件
-        if (videoRecordingActive) {
-            recordingService?.stopRecording { files ->
-                if (files.isNotEmpty()) uploadRecordFiles(files)
-                stopService(Intent(this, RecordingService::class.java))
-            } ?: stopService(Intent(this, RecordingService::class.java))
+        try {
+            continuousRecorder?.stop()
+        } catch (_: IllegalStateException) {
+            // Ignore an already stopped recorder during Activity teardown.
+        }
+        // exitTeacherApp owns cleanup once exit has started. Do not stop the
+        // service a second time from Activity teardown while CameraX is saving.
+        if (!teacherExitInProgress) {
+            if (videoRecordingActive) {
+                recordingService?.stopRecording { files ->
+                    if (files.isNotEmpty()) uploadRecordFiles(files)
+                    recordingService?.stopCaptureSessionIfIdle()
+                    recordingService?.stopTeacherSession()
+                    stopService(Intent(this, RecordingService::class.java))
+                } ?: stopService(Intent(this, RecordingService::class.java))
+            } else {
+                recordingService?.stopTeacherSession()
+            }
         }
         // Let the recorder loop close the current WAV header and enqueue its upload.
         try { Thread.sleep(350) } catch (_: Exception) {}
@@ -690,6 +850,9 @@ class TeacherActivity : AppCompatActivity() {
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val CONTINUOUS_SEGMENT_MS = 120_000L
+        private const val CAMERA_SETTLE_DELAY_MS = 700L
+        private const val PHOTO_CAPTURE_TIMEOUT_MS = 5_000L
+        private const val SERVICE_WAIT_TIMEOUT_MS = 5_000L
 
         private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int) {
             val bytes = ByteArray(count * 2)
