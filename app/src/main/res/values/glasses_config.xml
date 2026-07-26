@@ -3,5 +3,5 @@
     <!-- Use "usb" for adb reverse, or "network" for Wi-Fi/LAN testing. -->
     <string name="glasses_connection_mode">usb</string>
     <string name="glasses_service_base_url_usb">http://127.0.0.1:5080</string>
-    <string name="glasses_service_base_url_network">http://172.20.10.2:5080</string>
+    <string name="glasses_service_base_url_network">http://162.105.209.134</string>
 </resources>

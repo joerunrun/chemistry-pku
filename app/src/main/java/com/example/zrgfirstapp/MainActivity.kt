@@ -3,6 +3,7 @@
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
@@ -16,10 +17,13 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Base64
 import android.view.GestureDetector
 import android.view.Gravity
@@ -50,6 +54,9 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -58,10 +65,12 @@ class MainActivity : AppCompatActivity() {
         WELCOME,
         CONNECTION_CHECK,
         CONNECTION_FAILED,
+        EXPERIMENT_SETUP,
         CONSENT,
         HOME,
         EXPERIMENT_SELECT,
         MORE_EXPERIMENT_SELECT,
+        EXTRA_EXPERIMENT_SELECT,
         LIVE_MINIMAL,
         ACTION_MENU,
         CAPTURE_COUNTDOWN,
@@ -84,6 +93,7 @@ class MainActivity : AppCompatActivity() {
         DISTILLATION,
         PHOTOMETER,
         ELECTROLYSIS,
+        TLC,
         OTHER,
     }
 
@@ -177,6 +187,7 @@ class MainActivity : AppCompatActivity() {
     private var pendingCameraPermissionAction = CameraPermissionAction.NONE
     private var pendingAudioPermissionAction = AudioPermissionAction.NONE
     private var recordingRequested = false
+    private var standalonePhotoRequested = false
     private var recordingStatusText = "未记录"
     private var connectionStatusText = "未测试"
     private var qaAudioSupported = false
@@ -257,6 +268,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             if (!::leftPanel.isInitialized || screenState !in setOf(
                     ScreenState.CONNECTION_CHECK,
+                    ScreenState.EXPERIMENT_SETUP,
                     ScreenState.CAPTURE_COUNTDOWN,
                     ScreenState.DEMO_SELECT,
                     ScreenState.VOICE_LISTENING,
@@ -394,6 +406,14 @@ class MainActivity : AppCompatActivity() {
                 result = lastResultText.ifBlank { "双击可退出，继续设置后仍可稍后重试。" },
             )
 
+            ScreenState.EXPERIMENT_SETUP -> renderProcessScreen(
+                title = "实验设置",
+                subtitle = "请选择今天的实验",
+                status = lastStatusText,
+                result = lastResultText,
+                running = true,
+            )
+
             ScreenState.CONSENT -> renderChoiceScreen(
                 title = "化学实验识别",
                 subtitle = "记录许可",
@@ -425,7 +445,16 @@ class MainActivity : AppCompatActivity() {
                 title = "更多实验",
                 subtitle = "选择实验",
                 primary = "光度计",
-                secondary = "电解",
+                secondary = "更多实验",
+                status = "双击返回上一层",
+                result = liveSummary(),
+            )
+
+            ScreenState.EXTRA_EXPERIMENT_SELECT -> renderChoiceScreen(
+                title = "更多实验",
+                subtitle = "选择实验",
+                primary = "电解",
+                secondary = "TLC",
                 status = "双击返回上一层",
                 result = liveSummary(),
             )
@@ -636,6 +665,7 @@ class MainActivity : AppCompatActivity() {
                 ExperimentType.DISTILLATION -> "减压蒸馏纠错"
                 ExperimentType.PHOTOMETER -> "光度计纠错"
                 ExperimentType.ELECTROLYSIS -> "电解纠错"
+                ExperimentType.TLC -> "TLC纠错"
                 ExperimentType.OTHER -> "其它测试"
             }
         }
@@ -664,6 +694,7 @@ class MainActivity : AppCompatActivity() {
             ExperimentType.DISTILLATION -> "减压蒸馏"
             ExperimentType.PHOTOMETER -> "光度计"
             ExperimentType.ELECTROLYSIS -> "电解"
+            ExperimentType.TLC -> "TLC"
             ExperimentType.OTHER -> "其它测试"
         }
     }
@@ -688,14 +719,16 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     focusIndex = 0
                     voiceControlEnabled = voiceIntentSupported
-                    screenState = if (voiceIntentSupported) ScreenState.LIVE_MINIMAL else ScreenState.CONSENT
-                    renderScreen()
                     if (voiceIntentSupported) {
-                        playPrompt("assistant_ready")
-                        startVoiceIntentLoop()
+                        enterExperimentSetup()
+                    } else {
+                        screenState = ScreenState.CONSENT
+                        renderScreen()
                     }
                 }
             }
+
+            ScreenState.EXPERIMENT_SETUP -> Unit
 
             ScreenState.CONSENT -> {
                 if (focusIndex == 0) {
@@ -737,11 +770,23 @@ class MainActivity : AppCompatActivity() {
             }
 
             ScreenState.MORE_EXPERIMENT_SELECT -> {
+                if (focusIndex == 0) {
+                    selectedMode = Mode.EXPERIMENT
+                    selectedExperimentType = ExperimentType.PHOTOMETER
+                    enterLiveMinimal()
+                } else {
+                    focusIndex = 0
+                    screenState = ScreenState.EXTRA_EXPERIMENT_SELECT
+                    renderScreen()
+                }
+            }
+
+            ScreenState.EXTRA_EXPERIMENT_SELECT -> {
                 selectedMode = Mode.EXPERIMENT
                 selectedExperimentType = if (focusIndex == 0) {
-                    ExperimentType.PHOTOMETER
-                } else {
                     ExperimentType.ELECTROLYSIS
+                } else {
+                    ExperimentType.TLC
                 }
                 enterLiveMinimal()
             }
@@ -781,6 +826,53 @@ class MainActivity : AppCompatActivity() {
         renderScreen()
     }
 
+    private fun enterExperimentSetup() {
+        stopVoiceIntentRecording()
+        mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
+        focusIndex = 0
+        clearTaskOutput()
+        voiceControlEnabled = voiceIntentSupported
+        voiceMode = VoiceMode.AWAKE
+        awakeDeadlineMs = Long.MAX_VALUE
+        lastStatusText = "请直接说：减压蒸馏、光度计或电解实验"
+        lastResultText = "无需说小北助手。"
+        screenState = ScreenState.EXPERIMENT_SETUP
+        renderScreen()
+        playPrompt("ask_experiment") {
+            startVoiceIntentLoop()
+        }
+    }
+
+    private fun finishExperimentSetup() {
+        voiceMode = VoiceMode.SLEEP
+        awakeDeadlineMs = 0L
+        enterLiveMinimal()
+        playPrompt("assistant_ready")
+    }
+
+    private fun retryExperimentSetup() {
+        if (screenState != ScreenState.EXPERIMENT_SETUP) {
+            screenState = ScreenState.EXPERIMENT_SETUP
+        }
+        voiceMode = VoiceMode.AWAKE
+        awakeDeadlineMs = Long.MAX_VALUE
+        lastStatusText = "请选择今天的实验"
+        lastResultText = "可以说：减压蒸馏、光度计、电解实验或TLC。"
+        renderScreen()
+        playPrompt("ask_experiment") {
+            mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
+        }
+    }
+
+    private fun experimentTypeFromValue(value: String): ExperimentType {
+        return when (value) {
+            "photometer" -> ExperimentType.PHOTOMETER
+            "electrolysis" -> ExperimentType.ELECTROLYSIS
+            "tlc" -> ExperimentType.TLC
+            else -> ExperimentType.DISTILLATION
+        }
+    }
+
     private fun enterLiveMinimal() {
         mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
         focusIndex = 0
@@ -811,11 +903,12 @@ class MainActivity : AppCompatActivity() {
             ScreenState.WELCOME,
             ScreenState.CONNECTION_CHECK,
             ScreenState.CONNECTION_FAILED,
+            ScreenState.EXPERIMENT_SETUP,
             ScreenState.CONSENT,
             ScreenState.HOME,
             ScreenState.LIVE_MINIMAL -> {
                 stopRecordingService()
-                finish()
+                finishAndRemoveTask()
             }
             ScreenState.EXPERIMENT_SELECT -> {
                 focusIndex = 0
@@ -826,6 +919,12 @@ class MainActivity : AppCompatActivity() {
             ScreenState.MORE_EXPERIMENT_SELECT -> {
                 focusIndex = 1
                 screenState = ScreenState.EXPERIMENT_SELECT
+                clearTaskOutput()
+                renderScreen()
+            }
+            ScreenState.EXTRA_EXPERIMENT_SELECT -> {
+                focusIndex = 1
+                screenState = ScreenState.MORE_EXPERIMENT_SELECT
                 clearTaskOutput()
                 renderScreen()
             }
@@ -865,6 +964,7 @@ class MainActivity : AppCompatActivity() {
             this == ScreenState.HOME ||
             this == ScreenState.EXPERIMENT_SELECT ||
             this == ScreenState.MORE_EXPERIMENT_SELECT ||
+            this == ScreenState.EXTRA_EXPERIMENT_SELECT ||
             this == ScreenState.ACTION_MENU
     }
 
@@ -923,6 +1023,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    override fun onBackPressed() {
+        handleBackGesture()
     }
 
     private inner class TempleGestureListener : GestureDetector.SimpleOnGestureListener() {
@@ -1171,13 +1275,13 @@ class MainActivity : AppCompatActivity() {
         val token = operationToken
         val returnState = screenState
         val capturedPassiveMode = passiveListenMode
-        val capturedIsSleepMode = voiceMode == VoiceMode.SLEEP && capturedPassiveMode == PassiveListenMode.NONE
         val capturedContext = when (capturedPassiveMode) {
             PassiveListenMode.DEMO_STOP -> "demo_playing"
             PassiveListenMode.RECORD_STOP -> "recording_stop_only"
             PassiveListenMode.DEMO_SELECT -> "demo_select"
-            PassiveListenMode.NONE -> if (capturedIsSleepMode) "sleep" else voiceContextValue()
+            PassiveListenMode.NONE -> voiceContextValue()
         }
+        val capturedIsSleepMode = capturedContext == "sleep"
         val minBufferSize = AudioRecord.getMinBufferSize(
             qaSampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -1244,7 +1348,11 @@ class MainActivity : AppCompatActivity() {
                 if (token == operationToken && hasSpeech) {
                     submitted = true
                     // 苏醒模式下显示识别状态
-                    if (!capturedIsSleepMode && capturedPassiveMode == PassiveListenMode.NONE) {
+                    if (
+                        !capturedIsSleepMode &&
+                        capturedPassiveMode == PassiveListenMode.NONE &&
+                        capturedContext != "experiment_setup"
+                    ) {
                         runOnUiIfCurrent(token) {
                             activeTaskTitle = "语音控制"
                             lastStatusText = "正在识别指令"
@@ -1255,7 +1363,13 @@ class MainActivity : AppCompatActivity() {
                     }
                     submitVoiceIntent(outputFile, token, capturedIsSleepMode, capturedContext, capturedPassiveMode)
                 } else if (token == operationToken) {
-                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
+                    if (capturedContext == "experiment_setup") {
+                        runOnUiIfCurrent(token) {
+                            retryExperimentSetup()
+                        }
+                    } else {
+                        mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
+                    }
                 }
             } catch (_: Exception) {
                 if (token == operationToken) {
@@ -1335,6 +1449,8 @@ class MainActivity : AppCompatActivity() {
                         mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
                     } else if (isPassiveListenMode(passiveMode)) {
                         resumePassiveStopOnlyListening(passiveMode)
+                    } else if (context == "experiment_setup") {
+                        retryExperimentSetup()
                     } else {
                         playPrompt("unclear")
                         returnToSleep()
@@ -1377,9 +1493,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun voiceContextValue(): String {
         return when {
+            screenState == ScreenState.EXPERIMENT_SETUP -> "experiment_setup"
             recordingRequested -> "recording_stop_only"
             screenState == ScreenState.DEMO_SELECT -> "demo_select"
             screenState == ScreenState.DEMO_PLAYING -> "demo_playing"
+            voiceMode == VoiceMode.SLEEP -> "sleep"
             selectedMode == Mode.QA -> "qa"
             selectedMode == Mode.SAFETY -> "safety"
             selectedMode == Mode.OVERLAY_TEST -> "overlay_test"
@@ -1444,10 +1562,20 @@ class MainActivity : AppCompatActivity() {
         val slots = json.optJSONObject("slots")
         val experimentType = slots?.optString("experiment_type", "") ?: ""
 
+        if (context == "experiment_setup") {
+            if (intent == "select_experiment" && experimentType.isNotBlank()) {
+                selectedMode = Mode.EXPERIMENT
+                selectedExperimentType = experimentTypeFromValue(experimentType)
+                finishExperimentSetup()
+            } else {
+                retryExperimentSetup()
+            }
+            return
+        }
+
         if (passiveMode == PassiveListenMode.DEMO_STOP) {
-            if (intent == "stop_demo_video" || intent == "cancel") {
-                stopDemoPlayback()
-                finishPassiveVoiceControl()
+            if (intent == "stop_demo_video") {
+                stopDemoPlayback(announce = true, returnToLive = true)
             } else {
                 resumePassiveStopOnlyListening(passiveMode)
             }
@@ -1455,9 +1583,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (passiveMode == PassiveListenMode.RECORD_STOP) {
-            if (intent == "stop_recording" || intent == "cancel") {
-                stopRecordingService()
-                finishPassiveVoiceControl(1_000L)
+            if (intent == "stop_recording") {
+                stopRecordingService(announce = true, returnToLive = true)
             } else {
                 resumePassiveStopOnlyListening(passiveMode)
             }
@@ -1465,7 +1592,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (passiveMode == PassiveListenMode.DEMO_SELECT) {
-            if (intent != "select_demo_video" && intent != "demo_guide" && intent != "cancel") {
+            if (intent != "select_demo_video") {
                 resumePassiveStopOnlyListening(passiveMode)
                 return
             }
@@ -1477,14 +1604,10 @@ class MainActivity : AppCompatActivity() {
                 ensureRecordingPermissions()
             }
             "stop_recording" -> {
-                stopRecordingService()
-                finishPassiveVoiceControl(1_000L)
+                stopRecordingService(announce = true, returnToLive = true)
             }
             "capture_photo" -> {
-                startCaptureCountdown()
-            }
-            "overlay_test" -> {
-                startOverlayTestCountdown()
+                startCaptureCountdown(photoOnly = true)
             }
             "safety_check" -> {
                 selectedMode = Mode.SAFETY
@@ -1492,18 +1615,11 @@ class MainActivity : AppCompatActivity() {
             }
             "experiment_check" -> {
                 selectedMode = Mode.EXPERIMENT
-                enterAwakeModeNoTimeout()
-                playPrompt("ask_experiment")
-                // 保持苏醒等待用户说实验类型
-                mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
+                startCaptureCountdown()
             }
             "select_experiment" -> {
                 selectedMode = Mode.EXPERIMENT
-                selectedExperimentType = when (experimentType) {
-                    "photometer" -> ExperimentType.PHOTOMETER
-                    "electrolysis" -> ExperimentType.ELECTROLYSIS
-                    else -> ExperimentType.DISTILLATION
-                }
+                selectedExperimentType = experimentTypeFromValue(experimentType)
                 startCaptureCountdown()
             }
             "qa" -> {
@@ -1524,19 +1640,16 @@ class MainActivity : AppCompatActivity() {
                 selectAndPlayDemoVideo(index, query)
             }
             "stop_demo_video" -> {
-                stopDemoPlayback()
-                finishPassiveVoiceControl()
+                stopDemoPlayback(announce = true, returnToLive = true)
             }
-            "cancel" -> {
-                stopDemoPlayback()
-                finishPassiveVoiceControl()
-            }
-            "unclear", "unknown" -> {
+            "unclear" -> {
                 if (isPassiveListenMode(passiveMode)) {
                     resumePassiveStopOnlyListening(passiveMode)
                 } else {
+                    // 自然语言分类后，unknown/unclear 不应让用户过早被踢回睡眠。
+                    // 每次 unknown/unclear 都刷新 15s 苏醒窗口，只有真静默 15s 才回睡眠。
+                    awakeDeadlineMs = System.currentTimeMillis() + awakeTimeoutMs
                     playPrompt("unclear")
-                    // 保持苏醒继续等待（不重置计时）
                     mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
                 }
             }
@@ -1544,6 +1657,7 @@ class MainActivity : AppCompatActivity() {
                 if (isPassiveListenMode(passiveMode)) {
                     resumePassiveStopOnlyListening(passiveMode)
                 } else {
+                    awakeDeadlineMs = System.currentTimeMillis() + awakeTimeoutMs
                     playPrompt("unclear")
                     mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
                 }
@@ -1553,6 +1667,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun ScreenState.allowsVoiceIntent(): Boolean {
         return this == ScreenState.LIVE_MINIMAL ||
+            this == ScreenState.EXPERIMENT_SETUP ||
             this == ScreenState.DEMO_SELECT ||
             this == ScreenState.DEMO_PLAYING ||
             this == ScreenState.VOICE_LISTENING
@@ -1761,37 +1876,55 @@ class MainActivity : AppCompatActivity() {
         screenState = ScreenState.DEMO_PLAYING
         renderScreen()
 
-        panels.forEachIndexed { index, panel ->
-            panel.demoVideoView.setOnPreparedListener { player ->
-                player.isLooping = false
-                player.setVolume(if (index == 0) 1.0f else 0.0f, if (index == 0) 1.0f else 0.0f)
-                panel.demoVideoView.start()
-                lastStatusText = "正在播放"
-                renderScreen()
-                mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
+        playPrompt("demo_start") {
+            if (screenState != ScreenState.DEMO_PLAYING || activeDemoVideo != video) {
+                return@playPrompt
             }
-            panel.demoVideoView.setOnCompletionListener {
-                if (screenState == ScreenState.DEMO_PLAYING) {
-                    enterLiveMinimal()
+            panels.forEachIndexed { index, panel ->
+                panel.demoVideoView.setOnPreparedListener { player ->
+                    player.isLooping = false
+                    player.setVolume(if (index == 0) 1.0f else 0.0f, if (index == 0) 1.0f else 0.0f)
+                    panel.demoVideoView.start()
+                    lastStatusText = "正在播放"
+                    renderScreen()
+                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
                 }
-            }
-            panel.demoVideoView.setOnErrorListener { _, _, _ ->
-                if (screenState == ScreenState.DEMO_PLAYING) {
-                    showResult("视频暂时无法播放。", "演示指引失败")
+                panel.demoVideoView.setOnCompletionListener {
+                    if (screenState == ScreenState.DEMO_PLAYING) {
+                        stopDemoPlayback()
+                        enterLiveMinimal()
+                    }
                 }
-                true
+                panel.demoVideoView.setOnErrorListener { _, _, _ ->
+                    if (screenState == ScreenState.DEMO_PLAYING) {
+                        showResult("视频暂时无法播放。", "演示指引失败")
+                    }
+                    true
+                }
+                panel.demoVideoView.setVideoURI(Uri.parse(video.streamUrl))
             }
-            panel.demoVideoView.setVideoURI(Uri.parse(video.streamUrl))
         }
     }
 
-    private fun stopDemoPlayback() {
+    private fun stopDemoPlayback(
+        announce: Boolean = false,
+        returnToLive: Boolean = false,
+    ) {
         panels.forEach { panel ->
             panel.demoVideoView.stopPlayback()
             panel.demoVideoView.visibility = View.GONE
         }
         passiveListenMode = PassiveListenMode.NONE
         activeDemoVideo = null
+        if (announce) {
+            playPrompt("demo_stop") {
+                if (returnToLive) {
+                    enterLiveMinimal()
+                }
+            }
+        } else if (returnToLive) {
+            enterLiveMinimal()
+        }
     }
     private fun playPrompt(name: String, onDone: (() -> Unit)? = null) {
         val resId = resources.getIdentifier(name, "raw", packageName)
@@ -1997,30 +2130,112 @@ class MainActivity : AppCompatActivity() {
         clearTaskOutput()
         screenState = ScreenState.LIVE_MINIMAL
         renderScreen()
-        playPrompt("recording_start")
-        val intent = Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_START_RECORDING)
-        ContextCompat.startForegroundService(this, intent)
-        withRecordingService { service ->
-            service.startRecording()
-            recordingStatusText = service.recordingStatus()
-            startRecordingStatusSync()
-            renderScreen()
+        playPrompt("recording_start") {
+            if (!recordingRequested) {
+                return@playPrompt
+            }
+            val intent = Intent(this, RecordingService::class.java)
+                .setAction(RecordingService.ACTION_START_RECORDING)
+            ContextCompat.startForegroundService(this, intent)
+            withRecordingService { service ->
+                service.startRecording()
+                recordingStatusText = service.recordingStatus()
+                startRecordingStatusSync()
+                renderScreen()
+                resumePassiveStopOnlyListening(PassiveListenMode.RECORD_STOP)
+            }
         }
     }
 
-    private fun stopRecordingService() {
+    private fun stopRecordingService(
+        announce: Boolean = false,
+        returnToLive: Boolean = false,
+    ) {
         passiveListenMode = PassiveListenMode.NONE
         recordingRequested = false
         recordingStatusText = "未记录"
         mainHandler.removeCallbacks(recordingStatusRunnable)
-        recordingService?.stopRecording()
-        if (serviceBound) {
-            unbindService(serviceConnection)
-            serviceBound = false
-            recordingService = null
+        fun finishStop() {
+            if (announce) {
+                runOnUiThread {
+                    playPrompt("recording_stop") {
+                        if (returnToLive) {
+                            enterLiveMinimal()
+                        }
+                    }
+                }
+            } else if (returnToLive) {
+                runOnUiThread { enterLiveMinimal() }
+            }
         }
-        stopService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP_RECORDING))
-        playPrompt("recording_stop")
+        val service = recordingService
+        if (service == null) {
+            stopService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP_RECORDING))
+            finishStop()
+            return
+        }
+        service.stopRecording { files ->
+            if (files.isNotEmpty()) {
+                uploadRecordFiles(files)
+            } else {
+                android.util.Log.w("ChemRecord", "No finalized record files to upload")
+            }
+            if (serviceBound) {
+                unbindService(serviceConnection)
+                serviceBound = false
+                recordingService = null
+            }
+            stopService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP_RECORDING))
+            finishStop()
+        }
+    }
+
+    private fun uploadRecordFiles(files: List<File>) {
+        Thread {
+            for (file in files) {
+                try {
+                    val boundary = "----ChemRecordBoundary${System.currentTimeMillis()}"
+                    val url = URL("$baseUrl/api/glasses/records/upload")
+                    val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
+                        requestMethod = "POST"
+                        doOutput = true
+                        connectTimeout = 15_000
+                        readTimeout = 120_000
+                        setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+                    }
+                    java.io.DataOutputStream(connection.outputStream).use { out ->
+                        val fields = mapOf(
+                            "device_id" to android.os.Build.MODEL,
+                            "experiment_type" to selectedExperimentTypeValue(),
+                        )
+                        for ((name, value) in fields) {
+                            out.writeBytes("--$boundary\r\n")
+                            out.writeBytes("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
+                            out.write(value.toByteArray(Charsets.UTF_8))
+                            out.writeBytes("\r\n")
+                        }
+                        out.writeBytes("--$boundary\r\n")
+                        out.writeBytes("Content-Disposition: form-data; name=\"video\"; filename=\"${file.name}\"\r\n")
+                        out.writeBytes("Content-Type: video/mp4\r\n\r\n")
+                        java.io.FileInputStream(file).use { it.copyTo(out) }
+                        out.writeBytes("\r\n--$boundary--\r\n")
+                        out.flush()
+                    }
+                    val code = connection.responseCode
+                    connection.disconnect()
+                    if (code in 200..299) {
+                        android.util.Log.i("ChemRecord", "Uploaded ${file.name}")
+                        if (!file.delete()) {
+                            android.util.Log.w("ChemRecord", "Uploaded but could not delete ${file.name}")
+                        }
+                    } else {
+                        android.util.Log.w("ChemRecord", "Upload failed ${file.name}: HTTP $code")
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("ChemRecord", "Upload error ${file.name}: ${e.message}")
+                }
+            }
+        }.start()
     }
 
     private fun startRecordingStatusSync() {
@@ -2074,11 +2289,11 @@ class MainActivity : AppCompatActivity() {
                     lastResultText = "服务在线\n默认模型：$defaultModel"
                     focusIndex = 0
                     voiceControlEnabled = voiceIntentSupported
-                    screenState = if (voiceIntentSupported) ScreenState.LIVE_MINIMAL else ScreenState.CONSENT
-                    renderScreen()
                     if (voiceIntentSupported) {
-                        playPrompt("assistant_ready")
-                        startVoiceIntentLoop()
+                        enterExperimentSetup()
+                    } else {
+                        screenState = ScreenState.CONSENT
+                        renderScreen()
                     }
                 }
             } catch (exc: Exception) {
@@ -2094,13 +2309,20 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun startCaptureCountdown() {
+    private fun startCaptureCountdown(photoOnly: Boolean = false) {
         stopVoiceIntentRecording()
+        standalonePhotoRequested = photoOnly
         val token = operationToken + 1
         operationToken = token
         clearTaskOutput()
-        activeTaskTitle = if (selectedMode == Mode.OVERLAY_TEST) "投影测试" else "装置检测"
-        lastStatusText = if (selectedMode == Mode.OVERLAY_TEST) {
+        activeTaskTitle = when {
+            standalonePhotoRequested -> "拍照"
+            selectedMode == Mode.OVERLAY_TEST -> "投影测试"
+            else -> "装置检测"
+        }
+        lastStatusText = if (standalonePhotoRequested) {
+            "请保持画面稳定"
+        } else if (selectedMode == Mode.OVERLAY_TEST) {
             "请保持目标在视野中央"
         } else {
             "请保持装置在视野中央"
@@ -2108,12 +2330,19 @@ class MainActivity : AppCompatActivity() {
         lastResultText = "即将自动拍照"
         screenState = ScreenState.CAPTURE_COUNTDOWN
         renderScreen()
-        playPrompt(if (selectedMode == Mode.SAFETY) "start_safety" else "start_capture")
-        mainHandler.postDelayed({
-            if (token == operationToken && screenState == ScreenState.CAPTURE_COUNTDOWN) {
-                startCaptureFlow()
-            }
-        }, captureCountdownMs)
+        val promptName = when {
+            standalonePhotoRequested -> "start_capture"
+            selectedMode == Mode.SAFETY -> "start_safety"
+            selectedMode == Mode.EXPERIMENT -> "start_experiment_check"
+            else -> "start_capture"
+        }
+        playPrompt(promptName) {
+            mainHandler.postDelayed({
+                if (token == operationToken && screenState == ScreenState.CAPTURE_COUNTDOWN) {
+                    startCaptureFlow()
+                }
+            }, captureCountdownMs)
+        }
     }
 
     private fun startOverlayTestCountdown() {
@@ -2124,8 +2353,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun startCaptureFlow() {
         clearTaskOutput()
-        activeTaskTitle = if (selectedMode == Mode.OVERLAY_TEST) "投影测试" else "装置检测"
-        val status = if (selectedMode == Mode.OVERLAY_TEST) {
+        activeTaskTitle = when {
+            standalonePhotoRequested -> "拍照"
+            selectedMode == Mode.OVERLAY_TEST -> "投影测试"
+            else -> "装置检测"
+        }
+        val status = if (standalonePhotoRequested) {
+            "正在拍照，请保持稳定"
+        } else if (selectedMode == Mode.OVERLAY_TEST) {
             "正在检测投影框..."
         } else {
             "正在观察装置..."
@@ -2139,12 +2374,12 @@ class MainActivity : AppCompatActivity() {
         val captureToken = operationToken
         if (captureOnly) {
             val intent = Intent(this, RecordingService::class.java)
-                .setAction(RecordingService.ACTION_START_RECORDING)
+                .setAction(RecordingService.ACTION_START_CAPTURE_SESSION)
             ContextCompat.startForegroundService(this, intent)
         }
         withRecordingService { service ->
             if (captureOnly) {
-                service.startRecording()
+                service.startCaptureSession()
             }
             runOnUiThread {
                 lastStatusText = if (captureOnly) {
@@ -2181,23 +2416,22 @@ class MainActivity : AppCompatActivity() {
             if (!captureOnly) {
                 return
             }
-            service.stopRecording()
+            service.stopCaptureSessionIfIdle()
             if (serviceBound) {
                 unbindService(serviceConnection)
                 serviceBound = false
                 recordingService = null
             }
-            stopService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP_RECORDING))
-        playPrompt("recording_stop")
+            stopService(Intent(this, RecordingService::class.java))
         }
 
         mainHandler.postDelayed({
             if (!completed && captureToken == operationToken) {
                 completed = true
                 cleanupCaptureOnly()
-                showResult("相机抓拍超时。请重试一次，或先允许记录后再拍照。", "拍照失败")
+                showResult("相机初始化或抓拍超时，请重试一次。", "拍照失败")
             }
-        }, 12_000L)
+        }, 20_000L)
 
         service.captureStillImage { file, error ->
             runOnUiThread {
@@ -2210,7 +2444,11 @@ class MainActivity : AppCompatActivity() {
                 completed = true
                 cleanupCaptureOnly()
                 if (error != null || file == null) {
+                    standalonePhotoRequested = false
                     showResult("无法抓取当前画面：${error?.message ?: "未知错误"}", "拍照失败")
+                } else if (standalonePhotoRequested) {
+                    standalonePhotoRequested = false
+                    saveStandalonePhoto(file)
                 } else if (selectedMode == Mode.OVERLAY_TEST) {
                     submitOverlayTest(file)
                 } else {
@@ -2218,6 +2456,85 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun saveStandalonePhoto(file: File) {
+        Thread {
+            var galleryUri: Uri? = null
+            var uploadSucceeded = false
+            try {
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "CHEM_$timestamp.jpg")
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(
+                            MediaStore.Images.Media.RELATIVE_PATH,
+                            "${Environment.DIRECTORY_PICTURES}/ChemistryGlasses",
+                        )
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+                val uri = contentResolver.insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    values,
+                ) ?: throw IOException("无法创建相册文件")
+                galleryUri = uri
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    FileInputStream(file).use { input -> input.copyTo(output) }
+                } ?: throw IOException("无法写入相册文件")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    values.clear()
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                    contentResolver.update(uri, values, null, null)
+                }
+                var uploadError: String? = null
+                try {
+                    postMultipart(
+                        "$baseUrl/api/glasses/photos/upload",
+                        mapOf(
+                            "device_id" to android.os.Build.MODEL,
+                            "experiment_type" to selectedExperimentTypeValue(),
+                            "captured_at" to timestamp,
+                        ),
+                        "photo",
+                        file,
+                        "image/jpeg",
+                    )
+                    uploadSucceeded = true
+                } catch (exc: Exception) {
+                    uploadError = exc.message ?: "服务器上传失败"
+                }
+                runOnUiThread {
+                    if (uploadError == null) {
+                        showResult(
+                            "照片已上传到管理网站，眼镜本地副本已删除。",
+                            "拍照完成",
+                        )
+                    } else {
+                        showResult(
+                            "照片未上传，暂时保留在眼镜上：$uploadError",
+                            "拍照完成",
+                        )
+                    }
+                }
+            } catch (exc: Exception) {
+                runOnUiThread {
+                    showResult(exc.message ?: "照片保存失败", "拍照失败")
+                }
+            } finally {
+                if (uploadSucceeded) {
+                    galleryUri?.let { uri ->
+                        if (contentResolver.delete(uri, null, null) == 0) {
+                            android.util.Log.w("ChemPhoto", "Uploaded but could not remove gallery item: $uri")
+                        }
+                    }
+                    if (!file.delete()) {
+                        android.util.Log.w("ChemPhoto", "Uploaded but could not delete ${file.name}")
+                    }
+                }
+            }
+        }.start()
     }
 
     private fun testConnection() {
@@ -2277,6 +2594,9 @@ class MainActivity : AppCompatActivity() {
                     "image",
                     file,
                 )
+                if (!file.delete()) {
+                    android.util.Log.w("ChemCapture", "Submitted but could not delete ${file.name}")
+                }
                 pollJob(resolveUrl(json.getString("poll_url")), token)
             } catch (exc: Exception) {
                 runOnUiIfCurrent(token) {
@@ -2296,6 +2616,9 @@ class MainActivity : AppCompatActivity() {
                     "image",
                     file,
                 )
+                if (!file.delete()) {
+                    android.util.Log.w("ChemOverlay", "Submitted but could not delete ${file.name}")
+                }
                 val boxes = json.optJSONArray("overlay_boxes")
                 runOnUiIfCurrent(token) {
                     val overlayShown = showOverlayBoxes(boxes)
@@ -2309,8 +2632,6 @@ class MainActivity : AppCompatActivity() {
                 runOnUiIfCurrent(token) {
                     showResult(exc.message ?: "投影测试失败", "投影测试失败")
                 }
-            } finally {
-                file.delete()
             }
         }.start()
     }
@@ -2425,6 +2746,7 @@ class MainActivity : AppCompatActivity() {
             ExperimentType.DISTILLATION -> "distillation"
             ExperimentType.PHOTOMETER -> "photometer"
             ExperimentType.ELECTROLYSIS -> "electrolysis"
+            ExperimentType.TLC -> "tlc"
             ExperimentType.OTHER -> "other"
         }
     }

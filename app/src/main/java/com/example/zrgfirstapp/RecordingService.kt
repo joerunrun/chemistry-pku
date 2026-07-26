@@ -78,8 +78,8 @@ class RecordingService : LifecycleService() {
         )
     }
 
-    fun stopRecording() {
-        cameraSessionManager.stopRecording()
+    fun stopRecording(onStopped: ((List<File>) -> Unit)? = null) {
+        cameraSessionManager.stopRecording(onStopped)
         lastStatus = "未记录"
         if (foregroundStarted) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -95,6 +95,8 @@ class RecordingService : LifecycleService() {
     }
 
     fun recordingStatus(): String = cameraSessionManager.statusLabel.ifBlank { lastStatus }
+
+    fun getRecordedFiles(): List<File> = cameraSessionManager.getRecordedFiles()
 
     fun stopCaptureSessionIfIdle() {
         if (cameraSessionManager.isRecordingActive()) {
