@@ -446,7 +446,12 @@ def admin_download_record_file(record_id: str, filename: str):
     if not file_path.exists() or not file_path.is_file():
         return jsonify({"error": "file not found"}), 404
     mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    return send_file(file_path, mimetype=mime, as_attachment=True, download_name=file_path.name)
+    return send_file(
+        file_path,
+        mimetype=mime,
+        as_attachment=request.args.get("download", "1") != "0",
+        download_name=file_path.name,
+    )
 
 
 @app.delete("/admin/api/records/<record_id>")
@@ -476,7 +481,12 @@ def teacher_admin_download_record_file(record_id: str, filename: str):
     if not file_path.exists() or not file_path.is_file():
         return jsonify({"error": "file not found"}), 404
     mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    return send_file(file_path, mimetype=mime, as_attachment=True, download_name=file_path.name)
+    return send_file(
+        file_path,
+        mimetype=mime,
+        as_attachment=request.args.get("download", "1") != "0",
+        download_name=file_path.name,
+    )
 
 
 @app.delete("/teacher-admin/api/records/<record_id>")
@@ -1728,14 +1738,16 @@ def _record_summary(record_dir: Path, download_endpoint: str = "admin_download_r
     for file_path in sorted(record_dir.iterdir(), key=lambda item: item.name.lower()):
         if not file_path.is_file() or file_path.name == "record.json":
             continue
+        file_url = url_for(
+            download_endpoint,
+            record_id=record_dir.name,
+            filename=file_path.name,
+        )
         files.append({
             "filename": file_path.name,
             "size": file_path.stat().st_size,
-            "download_url": url_for(
-                download_endpoint,
-                record_id=record_dir.name,
-                filename=file_path.name,
-            ),
+            "file_url": f"{file_url}?download=0",
+            "download_url": f"{file_url}?download=1",
         })
     return {
         "record_id": record_dir.name,

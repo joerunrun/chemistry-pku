@@ -133,6 +133,18 @@
   </section>
 
   <section class="panel">
+    <h2>实验录像</h2>
+    <div class="row">
+      <button type="button" class="secondary" id="refreshRecordVideos">刷新录像</button>
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        日期筛选：<input type="date" id="recordVideoDateFilter" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit;">
+      </label>
+    </div>
+    <div id="recordVideoStatus" class="status"></div>
+    <div id="recordVideoList"></div>
+  </section>
+
+  <section class="panel">
     <h2>拍摄照片</h2>
     <div class="row">
       <button type="button" class="secondary" id="refreshPhotos">刷新照片</button>
@@ -167,6 +179,7 @@ document.title = {{ portal_title|tojson }};
 document.querySelector('main > h1').textContent = {{ portal_title|tojson }};
 const videoStatus = document.getElementById('videoStatus');
 const recordStatus = document.getElementById('recordStatus');
+const recordVideoStatus = document.getElementById('recordVideoStatus');
 const photoStatus = document.getElementById('photoStatus');
 const feedbackStatus = document.getElementById('feedbackStatus');
 
@@ -245,20 +258,40 @@ async function loadRecords() {
     const data = await fetchJson(`${RECORD_API_PREFIX}/records`);
     allRecords = data.records || [];
     renderRecords();
-    setStatus(recordStatus, `共 ${allRecords.length} 条记录。`);
+    renderRecordVideos();
+    const audioRecordCount = allRecords.filter(record =>
+      (record.files || []).some(file => !isRecordVideo(file))
+    ).length;
+    const videoCount = allRecords.reduce((count, record) =>
+      count + (record.files || []).filter(isRecordVideo).length, 0
+    );
+    setStatus(recordStatus, `共 ${audioRecordCount} 条音频记录；${videoCount} 个实验录像。`);
   } catch (error) {
     setStatus(recordStatus, error.message, true);
+    setStatus(recordVideoStatus, error.message, true);
   }
+}
+
+function isRecordVideo(file) {
+  return /\.mp4$/i.test((file && file.filename) || '');
+}
+
+function recordsForDate(filterId) {
+  const filterDate = document.getElementById(filterId).value;
+  if (!filterDate) return allRecords;
+  return allRecords.filter(record => (record.created_at || '').startsWith(filterDate));
 }
 
 function renderRecords() {
   const filterDate = document.getElementById('recordDateFilter').value;
-  let records = allRecords;
-  if (filterDate) {
-    records = allRecords.filter(r => (r.created_at || '').startsWith(filterDate));
-  }
+  const records = recordsForDate('recordDateFilter')
+    .map(record => ({
+      ...record,
+      files: (record.files || []).filter(file => !isRecordVideo(file)),
+    }))
+    .filter(record => record.files.length);
   if (!records.length) {
-    document.getElementById('recordList').innerHTML = `<div class="empty">${filterDate ? '该日期没有记录。' : '还没有上传的实验记录。'}</div>`;
+    document.getElementById('recordList').innerHTML = `<div class="empty">${filterDate ? '该日期没有音频记录。' : '还没有上传的音频记录。'}</div>`;
   } else {
     document.getElementById('recordList').innerHTML = `
       <table>
@@ -288,6 +321,49 @@ function renderRecords() {
         </tbody>
       </table>`;
   }
+}
+
+function renderRecordVideos() {
+  const filterDate = document.getElementById('recordVideoDateFilter').value;
+  const videos = [];
+  recordsForDate('recordVideoDateFilter').forEach(record => {
+    (record.files || []).filter(isRecordVideo).forEach(file => videos.push({ record, file }));
+  });
+  setStatus(recordVideoStatus, `${filterDate ? `${filterDate}：` : ''}共 ${videos.length} 个实验录像。`);
+  if (!videos.length) {
+    document.getElementById('recordVideoList').innerHTML =
+      `<div class="empty">${filterDate ? '该日期没有实验录像。' : '还没有上传的实验录像。'}</div>`;
+    return;
+  }
+  document.getElementById('recordVideoList').innerHTML = `
+    <table>
+      <thead><tr><th>预览</th><th>时间</th><th>设备/实验</th><th>文件</th><th>操作</th></tr></thead>
+      <tbody>
+        ${videos.map(({ record, file }) => `
+          <tr>
+            <td>
+              <video controls preload="metadata" src="${escapeAttr(file.file_url)}"
+                     style="width:240px;max-height:140px;background:#111;border-radius:4px;"></video>
+            </td>
+            <td>
+              <div>${escapeHtml(record.created_at || '')}</div>
+              <div>${escapeHtml(record.record_id || '')}</div>
+            </td>
+            <td>
+              <div>${escapeHtml(record.device_id || '')}</div>
+              <div>${escapeHtml(record.experiment_type || '')}</div>
+            </td>
+            <td>${escapeHtml(file.filename)} (${formatSize(file.size)})</td>
+            <td>
+              <div class="actions">
+                <a class="link-button secondary" href="${escapeAttr(file.download_url)}">下载</a>
+                <button class="danger" data-delete-record="${escapeAttr(record.record_id)}">删除整条记录</button>
+              </div>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>`;
 }
 
 let allPhotos = [];
@@ -482,6 +558,8 @@ document.getElementById('refreshVideos').addEventListener('click', loadVideos);
 document.getElementById('videoExperiment').addEventListener('change', loadVideos);
 document.getElementById('refreshRecords').addEventListener('click', loadRecords);
 document.getElementById('recordDateFilter').addEventListener('change', renderRecords);
+document.getElementById('refreshRecordVideos').addEventListener('click', loadRecords);
+document.getElementById('recordVideoDateFilter').addEventListener('change', renderRecordVideos);
 document.getElementById('refreshPhotos').addEventListener('click', loadPhotos);
 document.getElementById('photoDateFilter').addEventListener('change', renderPhotos);
 document.getElementById('refreshFeedback').addEventListener('click', loadFeedback);
