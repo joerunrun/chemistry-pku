@@ -45,6 +45,7 @@ class TeacherActivity : AppCompatActivity() {
     private lateinit var gestureDetector: GestureDetector
     private val mainHandler = Handler(Looper.getMainLooper())
     private var activePlayer: MediaPlayer? = null
+    private val teacherDeviceId by lazy { DeviceIdentity.teacherId(this) }
 
     // 持续录音（单路，同时承担保存 + 唤醒检测的环形缓冲来源）
     @Volatile private var continuousRunning = false
@@ -692,7 +693,7 @@ class TeacherActivity : AppCompatActivity() {
                     postMultipart(
                         "$baseUrl/api/glasses/teacher/records/upload",
                         mapOf(
-                            "device_id" to ("teacher_" + Build.MODEL),
+                            "device_id" to teacherDeviceId,
                             "experiment_type" to "teacher",
                         ),
                         field, file, mime,
@@ -713,7 +714,7 @@ class TeacherActivity : AppCompatActivity() {
                 postMultipart(
                     "$baseUrl/api/glasses/teacher/photos/upload",
                     mapOf(
-                        "device_id" to ("teacher_" + Build.MODEL),
+                        "device_id" to teacherDeviceId,
                         "experiment_type" to "teacher",
                         "captured_at" to System.currentTimeMillis().toString(),
                     ),
