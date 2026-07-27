@@ -76,6 +76,73 @@ _glasses_lock = Lock()
 _vlm_semaphore = Semaphore(int(os.environ.get("CHEM_VLM_CONCURRENCY", "4")))
 _omni_semaphore = Semaphore(int(os.environ.get("CHEM_OMNI_CONCURRENCY", "4")))
 _media_analysis_queue = MediaAnalysisQueue()
+_device_mapping_lock = Lock()
+
+
+def _device_mapping_path() -> Path:
+    return runtime_asset_path("device_mappings.json")
+
+
+def _load_device_mappings() -> dict[str, str]:
+    path = _device_mapping_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(device_id): str(label).strip()
+        for device_id, label in data.items()
+        if str(device_id).strip() and str(label).strip()
+    }
+
+
+def _save_device_mappings(mappings: dict[str, str]) -> None:
+    path = _device_mapping_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(mappings, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _teacher_device_inventory() -> list[dict[str, Any]]:
+    with _device_mapping_lock:
+        mappings = _load_device_mappings()
+    counts: dict[str, dict[str, int]] = {
+        device_id: {"record_count": 0, "photo_count": 0}
+        for device_id in mappings
+    }
+    for root, metadata_name, count_key in (
+        (_teacher_record_root(), "record.json", "record_count"),
+        (_teacher_photo_root(), "photo.json", "photo_count"),
+    ):
+        if not root.exists():
+            continue
+        for metadata_path in root.rglob(metadata_name):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            device_id = str(metadata.get("device_id", "")).strip()
+            if not device_id:
+                continue
+            counts.setdefault(device_id, {"record_count": 0, "photo_count": 0})
+            counts[device_id][count_key] += 1
+    return [
+        {
+            "device_id": device_id,
+            "label": mappings.get(device_id, ""),
+            "display_name": mappings.get(device_id, "未映射"),
+            **counts[device_id],
+        }
+        for device_id in sorted(counts)
+    ]
 
 
 def _cleanup_store():
@@ -106,7 +173,47 @@ def teacher_admin_index():
         "admin.html",
         portal_title="化学实验教师资源管理",
         record_api_prefix="/teacher-admin/api",
+        teacher_portal=True,
     )
+
+
+@app.get("/teacher-admin/api/devices")
+def teacher_admin_devices():
+    return jsonify({"devices": _teacher_device_inventory()})
+
+
+@app.put("/teacher-admin/api/devices/<device_id>")
+def teacher_admin_update_device(device_id: str):
+    device_id = _safe_text_field(device_id, "")
+    if not device_id:
+        return jsonify({"error": "invalid device_id"}), 400
+    payload = request.get_json(silent=True) or {}
+    label = str(payload.get("label", "")).strip()
+    if len(label) > 32:
+        return jsonify({"error": "device label is too long"}), 400
+
+    with _device_mapping_lock:
+        mappings = _load_device_mappings()
+        if label:
+            # A visible number belongs to one physical device at a time.
+            for other_id, other_label in list(mappings.items()):
+                if other_id != device_id and other_label == label:
+                    mappings.pop(other_id, None)
+            mappings[device_id] = label
+        else:
+            mappings.pop(device_id, None)
+        _save_device_mappings(mappings)
+    device = next(
+        (item for item in _teacher_device_inventory() if item["device_id"] == device_id),
+        {
+            "device_id": device_id,
+            "label": mappings.get(device_id, ""),
+            "display_name": mappings.get(device_id, "未映射"),
+            "record_count": 0,
+            "photo_count": 0,
+        },
+    )
+    return jsonify({"device": device})
 
 
 @app.before_request

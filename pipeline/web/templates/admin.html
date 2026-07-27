@@ -95,6 +95,22 @@
 </head>
 <body>
 <main>
+  {% if teacher_portal|default(false) %}
+  <section class="panel" id="devicePanel">
+    <h2>教师眼镜设备</h2>
+    <div class="row">
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        当前设备：
+        <select id="deviceFilter" style="min-width:180px;">
+          <option value="__all__">全部设备</option>
+        </select>
+      </label>
+      <button type="button" class="secondary" id="refreshDevices">刷新设备</button>
+    </div>
+    <div id="deviceStatus" class="status"></div>
+    <div id="deviceList"></div>
+  </section>
+  {% endif %}
   <h1>化学实验资源管理</h1>
 
   <section class="panel">
@@ -182,6 +198,12 @@ const recordStatus = document.getElementById('recordStatus');
 const recordVideoStatus = document.getElementById('recordVideoStatus');
 const photoStatus = document.getElementById('photoStatus');
 const feedbackStatus = document.getElementById('feedbackStatus');
+const teacherPortal = {{ teacher_portal|default(false)|tojson }};
+const deviceStatus = document.getElementById('deviceStatus');
+const deviceFilter = document.getElementById('deviceFilter');
+const deviceList = document.getElementById('deviceList');
+let allDevices = [];
+let deviceLabels = {};
 
 function setStatus(el, text, isError = false) {
   el.textContent = text || '';
@@ -211,6 +233,76 @@ async function fetchJson(url, options = {}) {
     throw new Error(payload.error || `HTTP ${response.status}`);
   }
   return payload;
+}
+
+const defaultDeviceLabels = ['一号', '二号', '三号', '四号', '五号', '六号', '七号', '八号', '九号', '十号'];
+
+function deviceMatches(deviceId) {
+  if (!teacherPortal || !deviceFilter || deviceFilter.value === '__all__') return true;
+  if (deviceFilter.value === '__unmapped__') return !deviceLabels[deviceId];
+  return deviceLabels[deviceId] === deviceFilter.value;
+}
+
+function deviceDisplayName(deviceId) {
+  return deviceLabels[deviceId] || '未映射';
+}
+
+function deviceLabelOptions(selected) {
+  return ['未映射', ...defaultDeviceLabels]
+    .map(label => `<option value="${escapeAttr(label === '未映射' ? '' : label)}" ${selected === label ? 'selected' : ''}>${label}</option>`)
+    .join('');
+}
+
+async function loadDevices() {
+  if (!teacherPortal) return;
+  setStatus(deviceStatus, '正在加载设备...');
+  try {
+    const data = await fetchJson(`${RECORD_API_PREFIX}/devices`);
+    allDevices = data.devices || [];
+    deviceLabels = Object.fromEntries(allDevices.filter(item => item.label).map(item => [item.device_id, item.label]));
+
+    const labels = [...new Set(allDevices.map(item => item.label).filter(Boolean))];
+    deviceFilter.innerHTML = [
+      '<option value="__all__">全部设备</option>',
+      ...labels.map(label => `<option value="${escapeAttr(label)}">${escapeHtml(label)}</option>`),
+      '<option value="__unmapped__">未映射</option>',
+    ].join('');
+    renderDeviceList();
+    renderRecords();
+    renderRecordVideos();
+    renderPhotos();
+    setStatus(deviceStatus, `共 ${allDevices.length} 台已发现设备。`);
+  } catch (error) {
+    setStatus(deviceStatus, error.message, true);
+  }
+}
+
+function renderDeviceList() {
+  if (!teacherPortal || !deviceList) return;
+  if (!allDevices.length) {
+    deviceList.innerHTML = '<div class="empty">尚未发现教师眼镜上传记录。</div>';
+    return;
+  }
+  deviceList.innerHTML = `
+    <table>
+      <thead><tr><th>设备 ID</th><th>显示名称</th><th>记录数</th><th>照片数</th><th>操作</th></tr></thead>
+      <tbody>
+        ${allDevices.map(device => `
+          <tr>
+            <td>${escapeHtml(device.device_id)}</td>
+            <td>${escapeHtml(device.display_name || '未映射')}</td>
+            <td>${Number(device.record_count || 0)}</td>
+            <td>${Number(device.photo_count || 0)}</td>
+            <td>
+              <select data-device-label="${escapeAttr(device.device_id)}" style="min-width:110px;">
+                ${deviceLabelOptions(device.label || '未映射')}
+              </select>
+              <button type="button" class="secondary" data-save-device="${escapeAttr(device.device_id)}">保存</button>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>`;
 }
 
 async function loadVideos() {
@@ -278,8 +370,10 @@ function isRecordVideo(file) {
 
 function recordsForDate(filterId) {
   const filterDate = document.getElementById(filterId).value;
-  if (!filterDate) return allRecords;
-  return allRecords.filter(record => (record.created_at || '').startsWith(filterDate));
+  return allRecords.filter(record => {
+    const dateMatches = !filterDate || (record.created_at || '').startsWith(filterDate);
+    return dateMatches && deviceMatches(record.device_id || '');
+  });
 }
 
 function renderRecords() {
@@ -304,7 +398,7 @@ function renderRecords() {
                 <div>${escapeHtml(record.created_at || '')}</div>
               </td>
               <td>
-                <div>${escapeHtml(record.device_id || '')}</div>
+                <div>${escapeHtml(deviceDisplayName(record.device_id || ''))}</div>
                 <div>${escapeHtml(record.experiment_type || '')}</div>
               </td>
               <td>
@@ -350,7 +444,7 @@ function renderRecordVideos() {
               <div>${escapeHtml(record.record_id || '')}</div>
             </td>
             <td>
-              <div>${escapeHtml(record.device_id || '')}</div>
+              <div>${escapeHtml(deviceDisplayName(record.device_id || ''))}</div>
               <div>${escapeHtml(record.experiment_type || '')}</div>
             </td>
             <td>${escapeHtml(file.filename)} (${formatSize(file.size)})</td>
@@ -386,6 +480,7 @@ function renderPhotos() {
   if (filterDate) {
     photos = allPhotos.filter(photo => (photo.created_at || '').startsWith(filterDate));
   }
+  photos = photos.filter(photo => deviceMatches(photo.device_id || ''));
   if (!photos.length) {
     document.getElementById('photoList').innerHTML =
       `<div class="empty">${filterDate ? '该日期没有照片。' : '还没有上传的照片。'}</div>`;
@@ -408,7 +503,7 @@ function renderPhotos() {
               <div>${escapeHtml(photo.photo_id || '')}</div>
             </td>
             <td>
-              <div>${escapeHtml(photo.device_id || '')}</div>
+              <div>${escapeHtml(deviceDisplayName(photo.device_id || ''))}</div>
               <div>${escapeHtml(photo.experiment_type || '')}</div>
               ${renderAnalysis(photo.analysis)}
             </td>
@@ -498,6 +593,23 @@ document.getElementById('feedbackForm').addEventListener('submit', async (event)
 });
 
 document.addEventListener('click', async (event) => {
+  const saveDeviceId = event.target.dataset && event.target.dataset.saveDevice;
+  if (saveDeviceId) {
+    const selector = [...document.querySelectorAll('select[data-device-label]')]
+      .find(item => item.dataset.deviceLabel === saveDeviceId);
+    if (!selector) return;
+    try {
+      await fetchJson(`${RECORD_API_PREFIX}/devices/${encodeURIComponent(saveDeviceId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: selector.value }),
+      });
+      await loadDevices();
+    } catch (error) {
+      setStatus(deviceStatus, error.message, true);
+    }
+    return;
+  }
   const previewId = event.target.dataset && event.target.dataset.previewVideo;
   if (previewId) {
     const player = document.getElementById('videoPlayer');
@@ -563,6 +675,14 @@ document.getElementById('recordVideoDateFilter').addEventListener('change', rend
 document.getElementById('refreshPhotos').addEventListener('click', loadPhotos);
 document.getElementById('photoDateFilter').addEventListener('change', renderPhotos);
 document.getElementById('refreshFeedback').addEventListener('click', loadFeedback);
+if (teacherPortal) {
+  document.getElementById('refreshDevices').addEventListener('click', loadDevices);
+  deviceFilter.addEventListener('change', () => {
+    renderRecords();
+    renderRecordVideos();
+    renderPhotos();
+  });
+}
 
 function escapeHtml(value) {
   return String(value || '')
@@ -595,6 +715,7 @@ function renderAnalysis(analysis) {
 loadVideos();
 loadRecords();
 loadPhotos();
+loadDevices();
 loadFeedback();
 </script>
 </body>
