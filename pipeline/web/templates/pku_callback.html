@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北大认证</title>
+  <style>
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:#07111d;color:#eaf5ff;font-family:system-ui,"Microsoft YaHei",sans-serif}
+    main{width:min(520px,calc(100% - 40px));padding:32px;border:1px solid #29445a;border-radius:18px;background:#0d1d2b;box-sizing:border-box}
+    h1{margin-top:0;color:#65e6d5;font-size:28px} p{color:#afc1d1;line-height:1.7}
+    .roles{display:flex;gap:12px;margin-top:24px}.roles form{flex:1}.roles button{width:100%;padding:13px;border:0;border-radius:10px;background:#65e6d5;color:#07111d;font-size:16px;cursor:pointer}.roles form+form button{background:#a8d8ff}
+    .error{color:#ff9b9b}
+  </style>
+</head>
+<body>
+<main>
+  {% if ok %}
+    <h1>北大认证成功</h1>
+    <p>已收到并验证北大身份凭证。</p>
+    <p>identityId：{{ identity_display }}</p>
+    {% if needs_role %}
+      <p>这是你第一次进入，请选择身份。以后登录会直接进入系统。</p>
+      <div class="roles">
+        <form action="{{ url_for('complete_role_registration') }}" method="post"><input type="hidden" name="role" value="student"><button type="submit">我是学生</button></form>
+        <form action="{{ url_for('complete_role_registration') }}" method="post"><input type="hidden" name="role" value="teacher"><button type="submit">我是教师</button></form>
+      </div>
+    {% else %}
+      <p>正在进入系统……</p>
+    {% endif %}
+  {% else %}
+    <h1 class="error">北大认证失败</h1>
+    <p>{{ error }}</p>
+    <p><a href="{{ url_for('login_page') }}" style="color:#65e6d5">返回登录页</a></p>
+  {% endif %}
+</main>
+</body>
+</html>

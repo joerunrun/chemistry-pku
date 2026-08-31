@@ -1,0 +1,73 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+#fluidCanvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+.portal-entry {
+  position: fixed;
+  z-index: 2;
+  top: 22px;
+  right: 24px;
+}
+
+.portal-entry button {
+  min-height: 38px;
+  padding: 0 16px;
+  border: 1px solid rgba(255, 255, 255, .35);
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(0, 0, 0, .28);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .22);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  font: 500 13px/1 "Microsoft YaHei", system-ui, sans-serif;
+  letter-spacing: .03em;
+  cursor: pointer;
+  transition: background .18s ease, border-color .18s ease, transform .18s ease;
+}
+
+.portal-entry button:hover {
+  border-color: rgba(255, 255, 255, .72);
+  background: rgba(0, 0, 0, .5);
+  transform: translateY(-1px);
+}
+
+.portal-entry button:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+.fluid-compat {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .portal-entry {
+    top: auto;
+    right: 50%;
+    bottom: 22px;
+    transform: translateX(50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .portal-entry button {
+    transition: none;
+  }
+}

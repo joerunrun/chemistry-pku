@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>身份与角色 · 化小北</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f6f4ef;color:#191919;font-family:system-ui,"Microsoft YaHei",sans-serif}.wrap{width:min(1180px,calc(100% - 36px));margin:36px auto}.top{display:flex;justify-content:space-between;gap:18px;align-items:center}.links{display:flex;gap:14px}.links a{color:#5d43c8;text-decoration:none}.panel{margin-top:22px;padding:22px;border:1px solid #ddd5c8;border-radius:14px;background:#fff;overflow:auto}.muted{color:#6c6963}table{width:100%;border-collapse:collapse}th,td{padding:12px 10px;border-bottom:1px solid #ece6dc;text-align:left;vertical-align:top}th{color:#6c6963}.id{font-family:ui-monospace,monospace}button{padding:8px 12px;border:0;border-radius:7px;background:#6550ce;color:#fff;cursor:pointer}.profile{max-width:460px;white-space:pre-wrap;word-break:break-all;font:12px/1.5 ui-monospace,monospace;color:#555}
+  </style>
+</head>
+<body><main class="wrap">
+  <div class="top"><div><h1>身份与角色</h1><div class="muted">查看真实门户返回字段；“重置角色”只让该身份下次重新选择学生/教师，不删除记录。</div></div><nav class="links"><a href="{{ url_for('test_login_page') }}">甲乙丙丁测试</a><a href="{{ url_for('admin_index') }}">返回管理页</a></nav></div>
+  <section class="panel"><div id="status" class="muted">正在加载……</div><div id="users"></div></section>
+</main>
+<script>
+const esc=value=>String(value??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+function masked(value){const text=String(value||'');return text.startsWith('demo-')?text:(text.length>4?`${text.slice(0,2)}***${text.slice(-2)}`:'***');}
+async function loadUsers(){const response=await fetch('/admin/api/auth/users');const data=await response.json();if(!response.ok){document.getElementById('status').textContent=data.error||'加载失败';return}const users=data.users||[];document.getElementById('status').textContent=`共 ${users.length} 个身份。`;document.getElementById('users').innerHTML=`<table><thead><tr><th>身份</th><th>角色</th><th>最近登录</th><th>门户 userInfo</th><th>操作</th></tr></thead><tbody>${users.map(user=>`<tr><td class="id">${esc(masked(user.identity_id))}</td><td>${user.role==='student'?'学生':user.role==='teacher'?'教师':'未选择'}</td><td>${esc(user.last_login_at||'')}</td><td><details><summary>${user.profile?'查看原始字段':'尚未保存'}</summary><div class="profile">${esc(user.profile?JSON.stringify(user.profile,null,2):'下一次真实门户登录后保存')}</div></details></td><td><button data-reset="${esc(user.identity_id)}">重置角色</button></td></tr>`).join('')}</tbody></table>`;}
+document.addEventListener('click',async event=>{const id=event.target.dataset&&event.target.dataset.reset;if(!id)return;if(!confirm('只重置角色，不删除该身份的记录和认领关系。继续吗？'))return;const response=await fetch(`/admin/api/auth/users/${encodeURIComponent(id)}/reset-role`,{method:'POST'});if(response.ok)loadUsers();else{const data=await response.json();alert(data.error||'重置失败')}});loadUsers();
+</script></body></html>

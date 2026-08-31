@@ -91,13 +91,36 @@
     .empty { color: var(--muted); padding: 14px 0; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .file-list { display: flex; gap: 8px; flex-wrap: wrap; }
+    .admin-nav { position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(246,244,239,.95); backdrop-filter: blur(10px); }
+    .admin-nav a { padding: 7px 10px; border-radius: 6px; color: #4f3eb1; text-decoration: none; background: #fff; }
+    .admin-nav form { margin: 0 0 0 auto; }
+    .glass-admin-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-top: 16px; }
+    .glass-admin-item { padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+    .glass-admin-item input { width: 100%; min-width: 0; margin: 7px 0; }
+    @media(max-width:850px){.glass-admin-grid{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:520px){.glass-admin-grid{grid-template-columns:1fr}.admin-nav form{margin-left:0}}
   </style>
 </head>
 <body>
 <main>
+  {% if not teacher_portal|default(false) %}
+  <nav class="admin-nav">
+    <a href="#authGlassPanel">眼镜校准</a><a href="#videoPanel">演示视频</a><a href="#recordPanel">学生记录</a><a href="#photoPanel">学生照片</a><a href="{{ url_for('teacher_admin_index') }}">教师记录</a><a href="{{ url_for('admin_users_page') }}">身份与角色</a><a href="{{ url_for('test_login_page') }}">甲乙丙丁测试</a>
+    <form action="{{ url_for('admin_logout') }}" method="post"><button class="secondary" type="submit">退出管理员</button></form>
+  </nav>
+  {% endif %}
+  {% if not teacher_portal|default(false) %}
+  <section class="panel" id="authGlassPanel">
+    <h2>眼镜编号校准（01—08）</h2>
+    <div class="status">把眼镜上贴的固定硬件编号填入对应系统编号。以后学生和教师只按上课时间认领，不与个人身份永久绑定。</div>
+    <div id="authGlassList"></div>
+    <div id="authGlassStatus" class="status"></div>
+  </section>
+  {% endif %}
   {% if teacher_portal|default(false) %}
   <section class="panel" id="devicePanel">
     <h2>教师眼镜设备</h2>
+    <div class="status">眼镜上传一次后会出现在这里。选择它外壳上贴的 01—08 编号并保存，显示编号和数据认领校准会同时生效。</div>
     <div class="row">
       <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
         当前设备：
@@ -110,10 +133,38 @@
     <div id="deviceStatus" class="status"></div>
     <div id="deviceList"></div>
   </section>
+  <section class="panel" id="commonIssuePanel">
+    <h2>共性问题与指导建议</h2>
+    <div class="row">
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        实验：<select id="commonIssueExperiment" style="min-width:180px;"></select>
+      </label>
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        日期：<input type="date" id="commonIssueDate" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit;">
+      </label>
+      <button type="button" id="generateCommonIssues">生成总结</button>
+      <button type="button" class="secondary" id="refreshCommonIssues">刷新</button>
+    </div>
+    <div id="commonIssueStatus" class="status"></div>
+    <div id="commonIssueList"></div>
+  </section>
+  <section class="panel" id="dailyCoursePanel">
+    <h2>每日课程内容整理</h2>
+    <div class="row">
+      <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        日期：<input type="date" id="dailyCourseDate" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit;">
+      </label>
+      <button type="button" id="generateDailyCourse">生成当天课程</button>
+      <button type="button" class="secondary" id="refreshDailyCourse">刷新</button>
+    </div>
+    <div class="status">汇总当天全部教师记录，按时间整理成连贯课程内容。</div>
+    <div id="dailyCourseStatus" class="status"></div>
+    <div id="dailyCourseList"></div>
+  </section>
   {% endif %}
   <h1>化学实验资源管理</h1>
 
-  <section class="panel">
+  <section class="panel" id="videoPanel">
     <h2>演示视频</h2>
     <form id="videoForm" class="row">
       <label style="font-size:14px;color:var(--muted);display:flex;align-items:center;gap:6px;">
@@ -136,7 +187,7 @@
     </div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="recordPanel">
     <h2>实验记录</h2>
     <div class="row">
       <button type="button" class="secondary" id="refreshRecords">刷新记录</button>
@@ -148,7 +199,7 @@
     <div id="recordList"></div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="recordVideoPanel">
     <h2>实验录像</h2>
     <div class="row">
       <button type="button" class="secondary" id="refreshRecordVideos">刷新录像</button>
@@ -160,7 +211,7 @@
     <div id="recordVideoList"></div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="photoPanel">
     <h2>拍摄照片</h2>
     <div class="row">
       <button type="button" class="secondary" id="refreshPhotos">刷新照片</button>
@@ -172,7 +223,7 @@
     <div id="photoList"></div>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="feedbackPanel">
     <h2>意见反馈</h2>
     <form id="feedbackForm">
       <div class="row">
@@ -202,6 +253,13 @@ const teacherPortal = {{ teacher_portal|default(false)|tojson }};
 const deviceStatus = document.getElementById('deviceStatus');
 const deviceFilter = document.getElementById('deviceFilter');
 const deviceList = document.getElementById('deviceList');
+const commonIssueStatus = document.getElementById('commonIssueStatus');
+const commonIssueExperiment = document.getElementById('commonIssueExperiment');
+const commonIssueDate = document.getElementById('commonIssueDate');
+const commonIssueList = document.getElementById('commonIssueList');
+const dailyCourseStatus = document.getElementById('dailyCourseStatus');
+const dailyCourseDate = document.getElementById('dailyCourseDate');
+const dailyCourseList = document.getElementById('dailyCourseList');
 let allDevices = [];
 let deviceLabels = {};
 
@@ -235,7 +293,7 @@ async function fetchJson(url, options = {}) {
   return payload;
 }
 
-const defaultDeviceLabels = ['一号', '二号', '三号', '四号', '五号', '六号', '七号', '八号', '九号', '十号'];
+const defaultDeviceLabels = ['01', '02', '03', '04', '05', '06', '07', '08'];
 
 function deviceMatches(deviceId) {
   if (!teacherPortal || !deviceFilter || deviceFilter.value === '__all__') return true;
@@ -285,7 +343,7 @@ function renderDeviceList() {
   }
   deviceList.innerHTML = `
     <table>
-      <thead><tr><th>设备 ID</th><th>显示名称</th><th>记录数</th><th>照片数</th><th>操作</th></tr></thead>
+      <thead><tr><th>设备 ID</th><th>系统编号</th><th>记录数</th><th>照片数</th><th>操作</th></tr></thead>
       <tbody>
         ${allDevices.map(device => `
           <tr>
@@ -297,12 +355,192 @@ function renderDeviceList() {
               <select data-device-label="${escapeAttr(device.device_id)}" style="min-width:110px;">
                 ${deviceLabelOptions(device.label || '未映射')}
               </select>
-              <button type="button" class="secondary" data-save-device="${escapeAttr(device.device_id)}">保存</button>
+              <button type="button" class="secondary" data-save-device="${escapeAttr(device.device_id)}">保存配对</button>
             </td>
           </tr>
         `).join('')}
       </tbody>
     </table>`;
+}
+
+async function loadCommonIssueExperiments() {
+  if (!teacherPortal || !commonIssueExperiment) return;
+  try {
+    const data = await fetchJson('/api/glasses/health');
+    const experiments = data.experiments || [];
+    commonIssueExperiment.innerHTML = experiments
+      .map(item => `<option value="${escapeAttr(item.value)}">${escapeHtml(item.label || item.value)}</option>`)
+      .join('');
+  } catch (error) {
+    setStatus(commonIssueStatus, error.message, true);
+  }
+}
+
+function renderCommonIssueReports(reports) {
+  if (!teacherPortal || !commonIssueList) return;
+  if (!reports.length) {
+    commonIssueList.innerHTML = '<div class="empty">还没有生成共性问题总结。</div>';
+    return;
+  }
+  commonIssueList.innerHTML = reports.map(report => {
+    const warnings = (report.warnings || []).map(escapeHtml).join('<br>');
+    const issues = (report.common_issues || []).map(issue => `
+      <tr>
+        <td>${escapeHtml(issue.problem || '')}</td>
+        <td>${Number(issue.count || 0)}</td>
+        <td>${escapeHtml(issue.guidance || '')}</td>
+        <td>${escapeHtml((issue.record_ids || []).join('、'))}</td>
+      </tr>`).join('');
+    return `
+      <div class="panel" style="margin:12px 0;padding:14px;">
+        <div style="font-size:13px;color:var(--muted);">${escapeHtml(report.generated_at || '')} · ${escapeHtml(report.status || '')} · ${Number(report.transcript_count || 0)} 条转写</div>
+        ${warnings ? `<div class="status">${warnings}</div>` : ''}
+        ${issues ? `<table><thead><tr><th>共性问题</th><th>次数</th><th>指导建议</th><th>记录</th></tr></thead><tbody>${issues}</tbody></table>` : ''}
+      </div>`;
+  }).join('');
+}
+
+async function loadCommonIssueReports() {
+  if (!teacherPortal) return;
+  const experiment = commonIssueExperiment && commonIssueExperiment.value;
+  const date = commonIssueDate && commonIssueDate.value;
+  try {
+    const params = new URLSearchParams();
+    if (experiment) params.set('experiment_type', experiment);
+    if (date) params.set('date', date);
+    const data = await fetchJson(`${RECORD_API_PREFIX}/derived/common-issues?${params.toString()}`);
+    renderCommonIssueReports(data.reports || []);
+  } catch (error) {
+    setStatus(commonIssueStatus, error.message, true);
+  }
+}
+
+async function waitForCommonIssueReport(reportId) {
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    const data = await fetchJson(`${RECORD_API_PREFIX}/derived/common-issues/${encodeURIComponent(reportId)}`);
+    const report = data.report || {};
+    if (['succeeded', 'failed', 'insufficient_data'].includes(report.status)) return report;
+    setStatus(commonIssueStatus, '正在分析对话，请稍候...');
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+  throw new Error('生成超时，请稍后刷新查看。');
+}
+
+async function generateCommonIssues() {
+  if (!teacherPortal) return;
+  const experiment = commonIssueExperiment.value;
+  const date = commonIssueDate.value;
+  if (!experiment || !date) {
+    setStatus(commonIssueStatus, '请选择实验和日期。', true);
+    return;
+  }
+  setStatus(commonIssueStatus, '正在提交分析任务...');
+  try {
+    const data = await fetchJson(`${RECORD_API_PREFIX}/derived/common-issues`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ experiment_type: experiment, date }),
+    });
+    const report = data.report || {};
+    if (report.status === 'insufficient_data') {
+      setStatus(commonIssueStatus, '样本不足，至少需要两条含转写的记录。', true);
+    } else {
+      setStatus(commonIssueStatus, '任务已提交。');
+      await waitForCommonIssueReport(report.report_id);
+    }
+    await loadCommonIssueReports();
+  } catch (error) {
+    setStatus(commonIssueStatus, error.message, true);
+  }
+}
+
+function renderDailyCourseReports(reports) {
+  if (!teacherPortal || !dailyCourseList) return;
+  if (!reports.length) {
+    dailyCourseList.innerHTML = '<div class="empty">还没有生成每日课程内容。</div>';
+    return;
+  }
+  dailyCourseList.innerHTML = reports.map(report => {
+    const warnings = (report.warnings || []).map(escapeHtml).join('<br>');
+    const sourceRows = (report.source_records || []).map(item => `
+      <tr>
+        <td>${escapeHtml(item.record_id || '')}</td>
+        <td>${escapeHtml(item.created_at || '')}</td>
+        <td>${escapeHtml(deviceDisplayName(item.device_id || ''))}</td>
+        <td>${escapeHtml(item.experiment_type || '')}</td>
+        <td>${escapeHtml(item.status || '')}</td>
+      </tr>`).join('');
+    const content = report.course_content ? `
+      <div style="white-space:pre-wrap;margin-top:12px;">${escapeHtml(report.course_content)}</div>` : '';
+    const highlights = (report.highlights || []).length ? `
+      <div style="margin-top:12px;"><strong>重点：</strong>${report.highlights.map(escapeHtml).join('；')}</div>` : '';
+    const download = report.status === 'succeeded'
+      ? `<a class="link-button secondary" href="${RECORD_API_PREFIX}/derived/daily-course/${encodeURIComponent(report.report_id)}/download">下载 Markdown</a>`
+      : '';
+    return `
+      <div class="panel" style="margin:12px 0;padding:14px;">
+        <div style="font-size:13px;color:var(--muted);">${escapeHtml(report.date || '')} · ${escapeHtml(report.generated_at || '')} · ${escapeHtml(report.status || '')} · ${Number(report.transcript_count || 0)}/${Number(report.record_count || 0)} 条记录</div>
+        ${warnings ? `<div class="status">${warnings}</div>` : ''}
+        <h3 style="margin:12px 0 0;">${escapeHtml(report.title || '当天课程内容')}</h3>
+        ${content}${highlights}
+        <div class="actions" style="margin-top:12px;">${download}</div>
+        ${sourceRows ? `<details style="margin-top:12px;"><summary>查看来源记录</summary><table><thead><tr><th>记录</th><th>时间</th><th>设备</th><th>实验</th><th>状态</th></tr></thead><tbody>${sourceRows}</tbody></table></details>` : ''}
+      </div>`;
+  }).join('');
+}
+
+async function loadDailyCourseReports() {
+  if (!teacherPortal) return;
+  const date = dailyCourseDate && dailyCourseDate.value;
+  try {
+    const params = new URLSearchParams();
+    if (date) params.set('date', date);
+    const data = await fetchJson(`${RECORD_API_PREFIX}/derived/daily-course?${params.toString()}`);
+    renderDailyCourseReports(data.reports || []);
+  } catch (error) {
+    setStatus(dailyCourseStatus, error.message, true);
+  }
+}
+
+async function waitForDailyCourseReport(reportId) {
+  const deadline = Date.now() + 180000;
+  while (Date.now() < deadline) {
+    const data = await fetchJson(`${RECORD_API_PREFIX}/derived/daily-course/${encodeURIComponent(reportId)}`);
+    const report = data.report || {};
+    if (['succeeded', 'failed', 'insufficient_data'].includes(report.status)) return report;
+    setStatus(dailyCourseStatus, '正在整理当天课程内容，请稍候...');
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+  throw new Error('生成超时，请稍后刷新查看。');
+}
+
+async function generateDailyCourse() {
+  if (!teacherPortal) return;
+  const date = dailyCourseDate.value;
+  if (!date) {
+    setStatus(dailyCourseStatus, '请选择日期。', true);
+    return;
+  }
+  setStatus(dailyCourseStatus, '正在提交课程整理任务...');
+  try {
+    const data = await fetchJson(`${RECORD_API_PREFIX}/derived/daily-course`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date }),
+    });
+    const report = data.report || {};
+    if (report.status === 'insufficient_data') {
+      setStatus(dailyCourseStatus, '当天没有可用的已完成转写。', true);
+    } else {
+      setStatus(dailyCourseStatus, '任务已提交。');
+      const completed = await waitForDailyCourseReport(report.report_id);
+      setStatus(dailyCourseStatus, completed.status === 'succeeded' ? '课程整理完成。' : '课程整理未完成，请查看提示。', completed.status !== 'succeeded');
+    }
+    await loadDailyCourseReports();
+  } catch (error) {
+    setStatus(dailyCourseStatus, error.message, true);
+  }
 }
 
 async function loadVideos() {
@@ -605,6 +843,7 @@ document.addEventListener('click', async (event) => {
         body: JSON.stringify({ label: selector.value }),
       });
       await loadDevices();
+      setStatus(deviceStatus, `设备 ${saveDeviceId} 已完成显示编号和认领校准。`);
     } catch (error) {
       setStatus(deviceStatus, error.message, true);
     }
@@ -666,6 +905,26 @@ document.addEventListener('click', async (event) => {
   }
 });
 
+async function loadAuthGlasses() {
+  const panel = document.getElementById('authGlassPanel');
+  if (!panel) return;
+  const list = document.getElementById('authGlassList');
+  const status = document.getElementById('authGlassStatus');
+  try {
+    const data = await fetchJson('/admin/api/auth/glasses');
+    list.innerHTML = `<div class="glass-admin-grid">${(data.glasses || []).map(glass => `
+      <div class="glass-admin-item"><strong>眼镜 ${escapeHtml(glass.glass_number)}</strong><input data-auth-device="${escapeAttr(glass.glass_number)}" type="text" value="${escapeAttr(glass.device_id || '')}" placeholder="稳定硬件 device_id"><button type="button" data-save-auth-glass="${escapeAttr(glass.glass_number)}">保存校准</button></div>`).join('')}</div>`;
+    list.querySelectorAll('[data-save-auth-glass]').forEach(button => button.addEventListener('click', async () => {
+      const number = button.dataset.saveAuthGlass;
+      const input = list.querySelector(`[data-auth-device="${CSS.escape(number)}"]`);
+      const response = await fetch(`/admin/api/auth/glasses/${encodeURIComponent(number)}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({device_id:input.value})});
+      const result = await response.json().catch(() => ({}));
+      status.textContent = response.ok ? `眼镜 ${number} 已保存。` : (result.error || '保存失败');
+      if (response.ok) loadAuthGlasses();
+    }));
+  } catch (error) { status.textContent = error.message; }
+}
+
 document.getElementById('refreshVideos').addEventListener('click', loadVideos);
 document.getElementById('videoExperiment').addEventListener('change', loadVideos);
 document.getElementById('refreshRecords').addEventListener('click', loadRecords);
@@ -682,6 +941,15 @@ if (teacherPortal) {
     renderRecordVideos();
     renderPhotos();
   });
+  document.getElementById('generateCommonIssues').addEventListener('click', generateCommonIssues);
+  document.getElementById('refreshCommonIssues').addEventListener('click', loadCommonIssueReports);
+  document.getElementById('generateDailyCourse').addEventListener('click', generateDailyCourse);
+  document.getElementById('refreshDailyCourse').addEventListener('click', loadDailyCourseReports);
+  const today = new Date();
+  commonIssueDate.value = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  dailyCourseDate.value = commonIssueDate.value;
+  loadCommonIssueExperiments().then(loadCommonIssueReports);
+  loadDailyCourseReports();
 }
 
 function escapeHtml(value) {
@@ -717,6 +985,7 @@ loadRecords();
 loadPhotos();
 loadDevices();
 loadFeedback();
+loadAuthGlasses();
 </script>
 </body>
 </html>

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>甲乙丙丁测试身份</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f5f2eb;color:#171717;font-family:system-ui,"Microsoft YaHei",sans-serif}.wrap{width:min(1040px,calc(100% - 36px));margin:42px auto}.top{display:flex;justify-content:space-between;align-items:center;gap:18px}.back{color:#6049c7;text-decoration:none}.hint{color:#6b6862;line-height:1.65}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:24px}.card{padding:24px;border:1px solid #ded7ca;border-radius:16px;background:#fff}.name{font-size:28px;font-weight:750}.id{margin:8px 0;font-family:ui-monospace,monospace;color:#6049c7}.state{display:inline-block;padding:5px 10px;border-radius:99px;background:#eee9ff;color:#533ab8}.actions{display:flex;gap:10px;margin-top:20px}.actions form{margin:0}button{padding:10px 14px;border:0;border-radius:8px;background:#684fd5;color:#fff;font:inherit;cursor:pointer}.secondary{background:#696969}@media(max-width:680px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body><main class="wrap">
+  <div class="top"><div><h1>甲乙丙丁测试身份</h1><p class="hint">这是管理员测试工具。登录测试身份后，管理员会话仍保留，但 <code>/workspace</code> 与 <code>/admin</code> 已完全分路。</p></div><a class="back" href="{{ url_for('admin_index') }}">返回管理页</a></div>
+  <div class="grid">
+    {% for identity in identities %}
+    <section class="card">
+      <div class="name">{{ identity.name }}</div>
+      <div class="id">{{ identity.identity_id }}</div>
+      <span class="state">{{ '未选择角色' if not identity.current_role else ('学生' if identity.current_role == 'student' else '教师') }}</span>
+      <p class="hint">{{ identity.description }}</p>
+      <div class="actions">
+        <form action="{{ url_for('test_identity_login', key=identity.key) }}" method="post"><button type="submit">使用此身份进入</button></form>
+        <form action="{{ url_for('reset_test_identity', key=identity.key) }}" method="post"><button class="secondary" type="submit">恢复首次登录</button></form>
+      </div>
+    </section>
+    {% endfor %}
+  </div>
+</main></body></html>

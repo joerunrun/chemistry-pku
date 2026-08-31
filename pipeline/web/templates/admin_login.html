@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理员入口</title>
+  <style>
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f6f4ef;color:#171717;font-family:system-ui,"Microsoft YaHei",sans-serif}
+    main{width:min(420px,calc(100% - 40px));padding:30px;border:1px solid #ddd3c7;border-radius:16px;background:#fff;box-sizing:border-box}
+    h1{margin-top:0}.hint{color:#686868;line-height:1.6} input{width:100%;padding:12px;box-sizing:border-box;border:1px solid #ddd3c7;border-radius:8px;font:inherit;margin:14px 0} button{width:100%;padding:12px;border:0;border-radius:8px;background:#6f55d9;color:#fff;font:inherit;cursor:pointer}.error{color:#b3261e;min-height:24px}
+  </style>
+</head>
+<body>
+<main>
+  <h1>管理员入口</h1>
+  <p class="hint">管理员只需要输入项目配置的密码，不参与学生/教师身份注册。</p>
+  <form id="adminForm">
+    <input id="password" type="password" placeholder="管理员密码" autocomplete="current-password" required>
+    <button type="submit">进入管理页面</button>
+  </form>
+  <div id="error" class="error"></div>
+</main>
+<script>
+document.getElementById('adminForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const response = await fetch('{{ url_for("admin_login") }}', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:document.getElementById('password').value})});
+  if (response.redirected) { window.location.href = response.url; return; }
+  const data = await response.json().catch(() => ({}));
+  document.getElementById('error').textContent = data.error || '管理员登录失败';
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>化小北实验空间</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:#07111d;color:#eaf5ff;font-family:system-ui,"Microsoft YaHei",sans-serif}.wrap{width:min(1180px,calc(100% - 40px));margin:48px auto}.top{display:flex;justify-content:space-between;align-items:center;gap:20px}.top-actions{display:flex;gap:10px;align-items:center}.muted{color:#afc1d1;line-height:1.65}.card{margin-top:24px;padding:24px;border:1px solid #29445a;border-radius:16px;background:#0d1d2b}.pill{display:inline-block;padding:5px 10px;border-radius:999px;background:#173b4a;color:#65e6d5}.glasses{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:16px}.glass{padding:14px;border:1px solid #29445a;border-radius:10px;color:#afc1d1}.glass b{display:block;color:#65e6d5;font-size:20px;margin-bottom:4px}a,button{color:#07111d;background:#65e6d5;border:0;border-radius:8px;padding:10px 14px;text-decoration:none;cursor:pointer;font:inherit}.secondary{background:#a8d8ff}.pending-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}.pending-card{padding:18px;border:1px solid #31536b;border-radius:13px;background:#0a1825}.pending-title{font-size:18px;color:#65e6d5;font-weight:700}.pending-meta{margin:8px 0;color:#d7e8f5}.pending-card details{margin:12px 0;color:#afc1d1}.pending-card summary{cursor:pointer}.pending-items{margin:8px 0 0;padding-left:20px;font-size:13px;line-height:1.7}.claim-form{display:grid;grid-template-columns:minmax(150px,1.1fr) repeat(4,minmax(135px,1fr));gap:12px;align-items:end}.claim-form label{display:grid;gap:6px;color:#afc1d1;font-size:14px}.claim-form input,.claim-form select{width:100%;padding:10px;border:1px solid #29445a;border-radius:8px;background:#07111d;color:#eaf5ff;font:inherit;color-scheme:dark}.claim-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}.claim-list,.data-list{margin-top:14px;display:grid;gap:10px}.claim-item,.data-item{padding:14px;border:1px solid #29445a;border-radius:10px;color:#afc1d1}.claim-item b,.data-item b{color:#65e6d5}.data-item a{display:inline-block;margin:8px 7px 0 0;padding:6px 9px;font-size:13px}.state{float:right;font-size:12px;color:#a8d8ff}.profile{white-space:pre-wrap;word-break:break-all;font:13px/1.6 ui-monospace,monospace;color:#afc1d1}@media(max-width:900px){.claim-form{grid-template-columns:repeat(2,1fr)}.pending-grid{grid-template-columns:1fr}}@media(max-width:600px){.glasses{grid-template-columns:repeat(2,1fr)}.top{align-items:flex-start;flex-direction:column}.claim-form{grid-template-columns:1fr}.top-actions{flex-wrap:wrap}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><div><div class="muted">化小北 AI 眼镜</div><h1>{{ '教师工作台' if user.role == 'teacher' else '学生工作台' }}</h1></div><div class="top-actions">{% if admin_unlocked %}<a class="secondary" href="{{ url_for('admin_index') }}">进入管理页</a>{% endif %}<form action="{{ url_for('auth_logout') }}" method="post"><button type="submit">退出当前身份</button></form></div></div>
+  <section class="card">
+    <div class="muted">当前身份</div>
+    <p><span class="pill">{{ '学生' if user.role == 'student' else '教师' }}</span>　{{ user.identity_id[:2] }}***{{ user.identity_id[-2:] }}</p>
+    <p class="muted">门户身份和角色已经生效。眼镜不会永久绑定到个人；每次下课后按实际使用时间认领。</p>
+    <details><summary>查看本次门户保存的 userInfo</summary><pre id="profileData" class="profile">正在加载……</pre></details>
+  </section>
+  <section class="card">
+    <div class="muted">系统中的 8 个眼镜</div>
+    <div class="glasses">{% for glass in glasses %}<div class="glass"><b>{{ glass.glass_number }}</b><span>{{ '已校准' if glass.device_id else '待校准' }}</span></div>{% endfor %}</div>
+  </section>
+  <section class="card">
+    <div class="muted">等待认领数据</div>
+    <p class="muted">系统按日期、上午/下午、眼镜编号和实验类型整理尚未认领的数据。展开可查看具体时间，确认是你的课程后再带入认领。</p>
+    <div id="pendingStatus" class="muted">正在查找……</div>
+    <div id="pendingGroups" class="pending-grid"></div>
+  </section>
+  <section class="card" id="claimPanel">
+    <div class="muted">下课后认领本次实验数据</div>
+    <p class="muted">选择上课日期、时间和眼镜编号，先预览匹配结果，再确认认领。日期和时间既可以键盘输入，也可以点击输入框右侧图标选择；时间按北京时间计算。</p>
+    <div class="claim-form">
+      <label>眼镜编号<select id="claimGlass">{% for glass in glasses %}<option value="{{ glass.glass_number }}" {% if not glass.device_id %}disabled{% endif %}>{{ glass.glass_number }}{% if not glass.device_id %}（待校准）{% endif %}</option>{% endfor %}</select></label>
+      <label>开始日期<input id="claimStartDate" type="date"></label>
+      <label>开始时间<input id="claimStartTime" type="time" step="60"></label>
+      <label>结束日期<input id="claimEndDate" type="date"></label>
+      <label>结束时间<input id="claimEndTime" type="time" step="60"></label>
+    </div>
+    <div class="claim-actions"><button id="previewClaim" type="button">预览匹配数据</button><button id="confirmClaim" type="button" disabled>确认认领</button><button id="claimLastHour" class="secondary" type="button">最近一小时</button><button id="claimOneHour" class="secondary" type="button">结束时间 = 开始 + 1 小时</button></div>
+    <div id="claimStatus" class="muted"></div>
+    <div id="claimPreview" class="claim-list"></div>
+  </section>
+  <section class="card">
+    <div class="muted">已认领记录</div>
+    <div id="claimHistory" class="claim-list"><span class="muted">正在加载……</span></div>
+  </section>
+  <section class="card">
+    <div class="muted">我的实验数据</div>
+    <p class="muted">这里只显示已经通过眼镜编号和时间段认领到你名下的数据。</p>
+    <div id="ownData" class="data-list"><span class="muted">正在加载……</span></div>
+  </section>
+  {% if user.role == 'teacher' %}
+  <section class="card">
+    <div class="muted">全部学生采集数据</div>
+    <p class="muted">教师可以看到学生程序上传的数据；尚未认领的数据会明确标记。</p>
+    <div id="studentData" class="data-list"><span class="muted">正在加载……</span></div>
+  </section>
+  {% endif %}
+</div>
+<script>
+const CURRENT_ROLE = {{ user.role|tojson }};
+let matchedItems = [];
+let pendingGroups = [];
+const statusEl = document.getElementById('claimStatus');
+const previewEl = document.getElementById('claimPreview');
+const confirmEl = document.getElementById('confirmClaim');
+function joinClaimDateTime(dateId,timeId){const date=document.getElementById(dateId).value;const time=document.getElementById(timeId).value;return date&&time?`${date}T${time}`:'';}
+function claimPayload(){return {glass_number:document.getElementById('claimGlass').value,started_at:joinClaimDateTime('claimStartDate','claimStartTime'),ended_at:joinClaimDateTime('claimEndDate','claimEndTime')};}
+function localDateValue(value){return `${value.getFullYear()}-${String(value.getMonth()+1).padStart(2,'0')}-${String(value.getDate()).padStart(2,'0')}`;}
+function localTimeValue(value){return `${String(value.getHours()).padStart(2,'0')}:${String(value.getMinutes()).padStart(2,'0')}`;}
+function setClaimDateTime(prefix,value){document.getElementById(`${prefix}Date`).value=localDateValue(value);document.getElementById(`${prefix}Time`).value=localTimeValue(value);}
+function setLastHour(){const end=new Date();end.setSeconds(0,0);const start=new Date(end.getTime()-60*60*1000);setClaimDateTime('claimStart',start);setClaimDateTime('claimEnd',end);}
+function setOneHourAfterStart(){const value=joinClaimDateTime('claimStartDate','claimStartTime');if(!value){statusEl.textContent='请先选择开始日期和开始时间。';return;}const start=new Date(value);if(Number.isNaN(start.getTime())){statusEl.textContent='开始日期或时间格式不正确。';return;}setClaimDateTime('claimEnd',new Date(start.getTime()+60*60*1000));}
+const escapeHtml=value=>String(value??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+function showItems(items){previewEl.innerHTML = items.length ? items.map((item,index)=>`<div class="claim-item"><b>${index+1}. ${item.item_type === 'record' ? '音视频记录' : '照片'}</b>　${item.source_role === 'teacher' ? '教师程序' : '学生程序'}<br><span>${escapeHtml(item.experiment_type || '未标记实验')} · ${escapeHtml(item.item_created_at || '')} · ${item.time_source === 'created_at_fallback' ? '使用上传时间匹配' : '使用采集时间匹配'}</span></div>`).join('') : '<span class="muted">这个时间段没有匹配数据。</span>';}
+function pendingItemTime(item){const start=new Date(item.started_at);const end=new Date(item.ended_at);const options={month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false};const startText=Number.isNaN(start.getTime())?item.started_at:start.toLocaleString('zh-CN',options);const endText=Number.isNaN(end.getTime())?item.ended_at:end.toLocaleString('zh-CN',options);return `${startText}—${endText}`;}
+function renderPendingGroups(groups){const container=document.getElementById('pendingGroups');container.innerHTML=groups.length?groups.map((group,index)=>`<article class="pending-card"><div class="pending-title">${escapeHtml(group.date_label)} · ${escapeHtml(group.glass_number)}号眼镜</div><div class="pending-meta">${escapeHtml(group.experiment_type||'未标记实验')} · ${Number(group.count||0)} 条数据</div><div class="muted">${Number(group.record_count||0)} 条音视频，${Number(group.photo_count||0)} 张照片</div><details><summary>展开具体时间</summary><div class="muted">建议认领：${escapeHtml(group.started_at.replace('T',' '))} 至 ${escapeHtml(group.ended_at.replace('T',' '))}</div><ul class="pending-items">${(group.items||[]).map(item=>`<li>${item.item_type==='record'?'音视频':'照片'} · ${escapeHtml(pendingItemTime(item))}</li>`).join('')}</ul></details><button type="button" data-use-pending="${index}">填入并预览</button></article>`).join(''):'<span class="muted">目前没有等待你认领的数据。</span>';}
+function fillPendingGroup(group){document.getElementById('claimGlass').value=group.glass_number;const [startDate,startTime]=group.started_at.split('T');const [endDate,endTime]=group.ended_at.split('T');document.getElementById('claimStartDate').value=startDate;document.getElementById('claimStartTime').value=startTime;document.getElementById('claimEndDate').value=endDate;document.getElementById('claimEndTime').value=endTime;document.getElementById('claimPanel').scrollIntoView({behavior:'smooth',block:'start'});document.getElementById('previewClaim').click();}
+async function loadPendingClaims(){const status=document.getElementById('pendingStatus');try{const response=await fetch('/api/claims/pending');const data=await response.json();if(!response.ok)throw new Error(data.error||'加载失败');pendingGroups=data.groups||[];renderPendingGroups(pendingGroups);const unmapped=Number(data.unmapped_count||0);status.textContent=`共 ${Number(data.count||0)} 条待认领数据，整理为 ${pendingGroups.length} 个时间段。${unmapped?`另有 ${unmapped} 条数据尚未完成眼镜编号配对，请联系管理员。`:''}`;}catch(error){pendingGroups=[];renderPendingGroups([]);status.textContent=error.message;}}
+document.getElementById('pendingGroups').addEventListener('click',event=>{const index=event.target.dataset&&event.target.dataset.usePending;if(index===undefined)return;const group=pendingGroups[Number(index)];if(group)fillPendingGroup(group);});
+document.getElementById('previewClaim').addEventListener('click', async()=>{statusEl.textContent='正在查找……';confirmEl.disabled=true;try{const response=await fetch('/api/claims/match',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(claimPayload())});const data=await response.json();if(!response.ok)throw new Error(data.error||'匹配失败');matchedItems=data.items||[];showItems(matchedItems);confirmEl.disabled=!matchedItems.length;statusEl.textContent=`找到 ${matchedItems.length} 条可认领数据。`;}catch(error){matchedItems=[];showItems([]);statusEl.textContent=error.message;}});
+confirmEl.addEventListener('click', async()=>{confirmEl.disabled=true;try{const response=await fetch('/api/claims',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...claimPayload(),items:matchedItems})});const data=await response.json();if(!response.ok)throw new Error(data.error||'认领失败');statusEl.textContent=`认领成功：${data.claim.claim_id}`;matchedItems=[];showItems([]);loadClaims();loadPendingClaims();loadWorkspaceData();}catch(error){statusEl.textContent=error.message;confirmEl.disabled=false;}});
+async function loadClaims(){const response=await fetch('/api/claims');const data=await response.json();if(!response.ok){document.getElementById('claimHistory').textContent=data.error||'加载失败';return;}const claims=data.claims||[];document.getElementById('claimHistory').innerHTML=claims.length?claims.map(claim=>`<div class="claim-item"><b>眼镜 ${escapeHtml(claim.glass_number)}</b>　${escapeHtml(claim.started_at)} 至 ${escapeHtml(claim.ended_at)}<br><span>${claim.role === 'teacher' ? '教师' : '学生'} · ${claim.items.length} 条数据 · ${escapeHtml(claim.identity_id.startsWith('demo-')?claim.identity_id:`${claim.identity_id.slice(0,2)}***${claim.identity_id.slice(-2)}`)}</span></div>`).join(''):'<span class="muted">还没有认领记录。</span>';}
+function renderDataItem(item){const title=item.item_type==='photo'?'照片':'音视频记录';const claim=item.claim;const state=claim?`已认领：${claim.identity_display} / 眼镜 ${claim.glass_number}`:'尚未认领';let links='';if(item.item_type==='photo'){links=`<a href="${escapeHtml(item.file_url)}" target="_blank">查看照片</a><a href="${escapeHtml(item.download_url)}">下载</a>`;}else{links=(item.files||[]).map(file=>`<a href="${escapeHtml(file.file_url)}" target="_blank">打开 ${escapeHtml(file.filename)}</a>`).join('');}return `<div class="data-item"><span class="state">${escapeHtml(state)}</span><b>${title}</b><div>${escapeHtml(item.created_at||'')} · ${escapeHtml(item.experiment_type||'未标记实验')} · ${escapeHtml(item.device_id||'未标记设备')}</div>${links}</div>`;}
+function fillData(id,items,empty){document.getElementById(id).innerHTML=items.length?items.map(renderDataItem).join(''):`<span class="muted">${empty}</span>`;}
+async function loadWorkspaceData(){const response=await fetch('/api/workspace/data');const data=await response.json();if(!response.ok){fillData('ownData',[],data.error||'加载失败');return;}fillData('ownData',data.own_items||[],'还没有认领到你的数据。');if(CURRENT_ROLE==='teacher')fillData('studentData',data.student_items||[],'还没有学生程序上传的数据。');}
+async function loadProfile(){const response=await fetch('/api/auth/profile');const data=await response.json();document.getElementById('profileData').textContent=response.ok?(data.profile?JSON.stringify(data.profile,null,2):'旧登录只保存了 identityId；下次通过北大门户登录后会在这里显示完整返回字段。'):(data.error||'加载失败');}
+document.getElementById('claimLastHour').addEventListener('click',setLastHour);
+document.getElementById('claimOneHour').addEventListener('click',setOneHourAfterStart);
+setLastHour();loadPendingClaims();loadClaims();loadWorkspaceData();loadProfile();
+</script>
+</body>
+</html>

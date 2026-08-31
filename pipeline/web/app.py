@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import mimetypes
 import os
@@ -16,14 +16,17 @@ import uuid
 from pathlib import Path
 from threading import Lock, Semaphore
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import cv2
+from dotenv import load_dotenv
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+load_dotenv(Path(PROJECT_ROOT) / ".env")
 
-from flask import Flask, jsonify, render_template, request, send_file, url_for
+from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from pipeline.common.cv_wrapper import (
     CVDetectionParams,
@@ -37,10 +40,31 @@ from pipeline.common.vlm_client import DEFAULT_VLM_MODEL, DEFAULT_VLM_PROVIDER, 
 from pipeline.experiments import get_experiment_config, list_specs, resolve_experiment_spec
 from pipeline.experiments.spec_loader import SPECS_DIR
 from pipeline.media_analysis import MediaAnalysisQueue
+from pipeline.web.pku_iaaa import client_ip, validate_token
+from pipeline.web.identity_store import (
+    calibrate_glass,
+    find_user,
+    init_store,
+    list_glasses,
+    list_users,
+    reset_user_role,
+    upsert_user,
+)
+from pipeline.web.claim_store import (
+    ClaimConflict,
+    claim_item_owners,
+    claimed_item_keys,
+    create_claim,
+    init_claim_store,
+    list_claims,
+)
 from pipeline.resource_paths import runtime_asset_path
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
+app.secret_key = os.getenv("CHEM_SESSION_SECRET") or os.urandom(32)
+init_store()
+init_claim_store()
 
 # 内存存储：session_id → detection 结果
 _detect_store: dict[str, dict] = {}
@@ -77,6 +101,49 @@ _vlm_semaphore = Semaphore(int(os.environ.get("CHEM_VLM_CONCURRENCY", "4")))
 _omni_semaphore = Semaphore(int(os.environ.get("CHEM_OMNI_CONCURRENCY", "4")))
 _media_analysis_queue = MediaAnalysisQueue()
 _device_mapping_lock = Lock()
+_common_issue_lock = Lock()
+_common_issue_submitted: set[str] = set()
+_daily_course_lock = Lock()
+_daily_course_submitted: set[str] = set()
+
+_GLASS_NUMBERS = tuple(f"{number:02d}" for number in range(1, 9))
+_LEGACY_GLASS_LABELS = {
+    "一号": "01",
+    "二号": "02",
+    "三号": "03",
+    "四号": "04",
+    "五号": "05",
+    "六号": "06",
+    "七号": "07",
+    "八号": "08",
+}
+
+TEST_IDENTITIES = {
+    "jia": {
+        "identity_id": "demo-jia",
+        "name": "测试甲",
+        "initial_role": None,
+        "description": "首次登录：需要选择学生或教师",
+    },
+    "yi": {
+        "identity_id": "demo-yi",
+        "name": "测试乙",
+        "initial_role": "student",
+        "description": "已注册学生：直接进入学生工作台",
+    },
+    "bing": {
+        "identity_id": "demo-bing",
+        "name": "测试丙",
+        "initial_role": None,
+        "description": "首次登录：可选择教师验证注册流程",
+    },
+    "ding": {
+        "identity_id": "demo-ding",
+        "name": "测试丁",
+        "initial_role": "teacher",
+        "description": "已注册教师：直接进入教师工作台",
+    },
+}
 
 
 def _device_mapping_path() -> Path:
@@ -111,12 +178,54 @@ def _save_device_mappings(mappings: dict[str, str]) -> None:
     temporary.replace(path)
 
 
+def _normalize_glass_number(value: Any) -> str:
+    text = str(value or "").strip()
+    return _LEGACY_GLASS_LABELS.get(text, text if text in _GLASS_NUMBERS else "")
+
+
+def _save_glass_calibration(glass_number: str, device_id: str | None) -> dict[str, Any]:
+    """Keep the display mapping and claim calibration in sync."""
+    glass_number = _normalize_glass_number(glass_number)
+    if not glass_number:
+        raise ValueError("眼镜编号必须是 01 到 08")
+    clean_device_id = (device_id or "").strip() or None
+
+    glass = calibrate_glass(glass_number, clean_device_id)
+    with _device_mapping_lock:
+        mappings = _load_device_mappings()
+        for mapped_device_id, mapped_label in list(mappings.items()):
+            if mapped_device_id == clean_device_id or _normalize_glass_number(mapped_label) == glass_number:
+                mappings.pop(mapped_device_id, None)
+        if clean_device_id:
+            mappings[clean_device_id] = glass_number
+        _save_device_mappings(mappings)
+    return glass
+
+
+def _clear_device_calibration(device_id: str) -> None:
+    glass = next(
+        (item for item in list_glasses() if str(item.get("device_id") or "") == device_id),
+        None,
+    )
+    if glass:
+        calibrate_glass(str(glass["glass_number"]), None)
+    with _device_mapping_lock:
+        mappings = _load_device_mappings()
+        mappings.pop(device_id, None)
+        _save_device_mappings(mappings)
+
+
 def _teacher_device_inventory() -> list[dict[str, Any]]:
     with _device_mapping_lock:
         mappings = _load_device_mappings()
+    calibrated = {
+        str(item["device_id"]): str(item["glass_number"])
+        for item in list_glasses()
+        if item.get("device_id")
+    }
     counts: dict[str, dict[str, int]] = {
         device_id: {"record_count": 0, "photo_count": 0}
-        for device_id in mappings
+        for device_id in set(mappings) | set(calibrated)
     }
     for root, metadata_name, count_key in (
         (_teacher_record_root(), "record.json", "record_count"),
@@ -137,12 +246,391 @@ def _teacher_device_inventory() -> list[dict[str, Any]]:
     return [
         {
             "device_id": device_id,
-            "label": mappings.get(device_id, ""),
-            "display_name": mappings.get(device_id, "未映射"),
+            "label": calibrated.get(device_id) or _normalize_glass_number(mappings.get(device_id, "")),
+            "display_name": calibrated.get(device_id) or _normalize_glass_number(mappings.get(device_id, "")) or "未映射",
             **counts[device_id],
         }
         for device_id in sorted(counts)
     ]
+
+
+def _common_issue_root() -> Path:
+    return runtime_asset_path("derived", "common_issues")
+
+
+def _common_issue_job_root() -> Path:
+    return _common_issue_root() / "jobs"
+
+
+def _common_issue_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_common_issue_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _read_common_issue_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _common_issue_report_path(report_id: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", report_id or ""):
+        return None
+    return _common_issue_root() / f"{report_id}.json"
+
+
+def _daily_course_root() -> Path:
+    return runtime_asset_path("derived", "daily_courses")
+
+
+def _daily_course_job_root() -> Path:
+    return _daily_course_root() / "jobs"
+
+
+def _daily_course_report_path(report_id: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", report_id or ""):
+        return None
+    return _daily_course_root() / f"{report_id}.json"
+
+
+def _daily_course_markdown_path(report_id: str) -> Path | None:
+    path = _daily_course_report_path(report_id)
+    return path.with_suffix(".md") if path else None
+
+
+def _write_daily_course_markdown(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = [
+        f"# {report.get('title') or '当天课程内容'}",
+        "",
+        f"- 日期：{report.get('date', '')}",
+        f"- 状态：{report.get('status', '')}",
+        f"- 记录数：{report.get('transcript_count', 0)}/{report.get('record_count', 0)}",
+        f"- 模型：{report.get('model', '')}",
+        f"- 生成时间：{report.get('generated_at', '')}",
+        "",
+    ]
+    warnings = [str(item).strip() for item in report.get("warnings", []) if str(item).strip()]
+    if warnings:
+        content.extend(["## 提示", "", *[f"- {item}" for item in warnings], ""])
+    if report.get("highlights"):
+        content.extend(["## 重点", "", *[f"- {item}" for item in report["highlights"]], ""])
+    content.extend(["## 课程内容", "", str(report.get("course_content", "")).strip() or "暂无课程内容", ""])
+    content.extend(["## 来源记录", ""])
+    for item in report.get("source_records", []):
+        content.append(
+            f"- {item.get('record_id', '')}｜{item.get('created_at', '')}｜"
+            f"{item.get('device_id', '') or '未提供'}｜{item.get('experiment_type', '') or '未提供'}｜"
+            f"{item.get('status', '')}"
+        )
+    path.write_text("\n".join(content) + "\n", encoding="utf-8")
+
+
+def _collect_teacher_transcripts(experiment_type: str, date_text: str) -> list[dict[str, str]]:
+    root = _teacher_record_root() / date_text.replace("-", "")
+    if not root.exists():
+        return []
+    transcripts: list[dict[str, str]] = []
+    for metadata_path in root.rglob("record.json"):
+        record_dir = metadata_path.parent
+        metadata = _read_common_issue_json(metadata_path) or {}
+        if str(metadata.get("experiment_type", "")).strip() != experiment_type:
+            continue
+        analysis = _load_analysis(record_dir)
+        pieces: list[str] = []
+        for item in (analysis.get("items", {}) or {}).values():
+            if not isinstance(item, dict):
+                continue
+            transcript = str(item.get("transcript", "")).strip()
+            if transcript:
+                pieces.append(transcript)
+        if not pieces:
+            continue
+        transcripts.append({
+            "record_id": str(metadata.get("record_id") or record_dir.name),
+            "created_at": str(metadata.get("created_at", "")),
+            "device_id": str(metadata.get("device_id", "")),
+            "transcript": "\n".join(pieces),
+        })
+    transcripts.sort(key=lambda item: item.get("created_at", ""))
+    return transcripts
+
+
+def _collect_teacher_daily_transcripts(date_text: str) -> dict[str, Any]:
+    """Collect every teacher record for a date and retain missing/failed status."""
+    root = _teacher_record_root() / date_text.replace("-", "")
+    if not root.exists():
+        return {"transcripts": [], "source_records": [], "warnings": []}
+
+    transcripts: list[dict[str, str]] = []
+    source_records: list[dict[str, Any]] = []
+    for metadata_path in root.rglob("record.json"):
+        record_dir = metadata_path.parent
+        metadata = _read_common_issue_json(metadata_path) or {}
+        record_id = str(metadata.get("record_id") or record_dir.name)
+        analysis = _load_analysis(record_dir)
+        items = analysis.get("items", {}) if isinstance(analysis, dict) else {}
+        if not isinstance(items, dict):
+            items = {}
+        pieces: list[str] = []
+        statuses: list[str] = []
+        for item in items.values():
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", "")).strip()
+            if status:
+                statuses.append(status)
+            transcript = str(item.get("transcript", "")).strip()
+            if transcript:
+                pieces.append(transcript)
+
+        if pieces:
+            status = "succeeded"
+            transcripts.append({
+                "record_id": record_id,
+                "created_at": str(metadata.get("created_at", "")),
+                "device_id": str(metadata.get("device_id", "")),
+                "experiment_type": str(metadata.get("experiment_type", "")),
+                "transcript": "\n".join(pieces),
+            })
+        elif "running" in statuses or "queued" in statuses:
+            status = "pending"
+        elif "failed" in statuses:
+            status = "failed"
+        else:
+            status = "missing"
+        source_records.append({
+            "record_id": record_id,
+            "created_at": str(metadata.get("created_at", "")),
+            "device_id": str(metadata.get("device_id", "")),
+            "experiment_type": str(metadata.get("experiment_type", "")),
+            "status": status,
+        })
+
+    transcripts.sort(key=lambda item: item.get("created_at", ""))
+    source_records.sort(key=lambda item: item.get("created_at", ""))
+    incomplete = [item for item in source_records if item["status"] != "succeeded"]
+    warnings = []
+    if incomplete:
+        warnings.append(f"有 {len(incomplete)} 条记录没有纳入课程转述，请确认转写状态。")
+    return {
+        "transcripts": transcripts,
+        "source_records": source_records,
+        "warnings": warnings,
+    }
+
+
+def _common_issue_experiment_context(cfg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": cfg.get("id", ""),
+        "name": cfg.get("name", ""),
+        "experiment_requirements": cfg.get("experiment_requirements", ""),
+        "components": cfg.get("components", []),
+    }
+
+
+def _schedule_common_issue_job(job_path: Path) -> None:
+    key = str(job_path.resolve())
+    with _common_issue_lock:
+        if key in _common_issue_submitted:
+            return
+        _common_issue_submitted.add(key)
+    _glasses_executor.submit(_run_common_issue_job, job_path)
+
+
+def _recover_common_issue_jobs() -> None:
+    root = _common_issue_job_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for job_path in root.glob("*.json"):
+        job = _read_common_issue_json(job_path)
+        if not job or job.get("status") not in {"queued", "running"}:
+            continue
+        if job.get("status") == "running":
+            job["status"] = "queued"
+            job["updated_at"] = _common_issue_now()
+            _write_common_issue_json(job_path, job)
+        _schedule_common_issue_job(job_path)
+
+
+def _run_common_issue_job(job_path: Path) -> None:
+    from pipeline.derived_analysis import generate_common_issues
+
+    job = _read_common_issue_json(job_path)
+    if not job:
+        return
+    job["status"] = "running"
+    job["updated_at"] = _common_issue_now()
+    _write_common_issue_json(job_path, job)
+    report_path = Path(str(job["report_path"]))
+    running_report = _read_common_issue_json(report_path) or {
+        "report_id": job["report_id"],
+        "experiment_type": job["experiment_type"],
+        "date": job["date"],
+        "input_record_ids": job["input_record_ids"],
+        "transcript_count": job["transcript_count"],
+        "common_issues": [],
+        "warnings": [],
+    }
+    running_report.update({"status": "running", "updated_at": job["updated_at"]})
+    _write_common_issue_json(report_path, running_report)
+    try:
+        result = generate_common_issues(
+            job["experiment"],
+            job["transcripts"],
+            provider=job.get("provider"),
+            model=job.get("model"),
+        )
+        report = {
+            "report_id": job["report_id"],
+            "experiment_type": job["experiment_type"],
+            "date": job["date"],
+            "input_record_ids": job["input_record_ids"],
+            "transcript_count": job["transcript_count"],
+            "knowledge_source": f"{job['experiment_type']}.json",
+            "provider": result["provider"],
+            "model": result["model"],
+            "common_issues": result["common_issues"],
+            "warnings": ([] if result["common_issues"] else ["未发现至少出现在两条记录中的重复问题。"]),
+            "status": "succeeded",
+            "generated_at": _common_issue_now(),
+        }
+        _write_common_issue_json(report_path, report)
+        job.update({"status": "succeeded", "updated_at": report["generated_at"]})
+    except Exception as exc:
+        error = str(exc)[:1000]
+        report = {
+            "report_id": job["report_id"],
+            "experiment_type": job["experiment_type"],
+            "date": job["date"],
+            "input_record_ids": job["input_record_ids"],
+            "transcript_count": job["transcript_count"],
+            "knowledge_source": f"{job['experiment_type']}.json",
+            "common_issues": [],
+            "warnings": [error],
+            "status": "failed",
+            "generated_at": _common_issue_now(),
+        }
+        _write_common_issue_json(report_path, report)
+        job.update({"status": "failed", "error": error, "updated_at": report["generated_at"]})
+    finally:
+        _write_common_issue_json(job_path, job)
+        with _common_issue_lock:
+            _common_issue_submitted.discard(str(job_path.resolve()))
+
+
+def _schedule_daily_course_job(job_path: Path) -> None:
+    key = str(job_path.resolve())
+    with _daily_course_lock:
+        if key in _daily_course_submitted:
+            return
+        _daily_course_submitted.add(key)
+    _glasses_executor.submit(_run_daily_course_job, job_path)
+
+
+def _recover_daily_course_jobs() -> None:
+    root = _daily_course_job_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for job_path in root.glob("*.json"):
+        job = _read_common_issue_json(job_path)
+        if not job or job.get("status") not in {"queued", "running"}:
+            continue
+        if job.get("status") == "running":
+            job["status"] = "queued"
+            job["updated_at"] = _common_issue_now()
+            _write_common_issue_json(job_path, job)
+        _schedule_daily_course_job(job_path)
+
+
+def _run_daily_course_job(job_path: Path) -> None:
+    from pipeline.derived_analysis import generate_daily_course
+
+    job = _read_common_issue_json(job_path)
+    if not job:
+        return
+    job["status"] = "running"
+    job["updated_at"] = _common_issue_now()
+    _write_common_issue_json(job_path, job)
+    report_path = Path(str(job["report_path"]))
+    report = _read_common_issue_json(report_path) or {}
+    report.update({"status": "running", "updated_at": job["updated_at"]})
+    _write_common_issue_json(report_path, report)
+    try:
+        result = generate_daily_course(
+            job["date"],
+            job["transcripts"],
+            experiment_contexts=job.get("experiment_contexts", []),
+            provider=job.get("provider"),
+            model=job.get("model"),
+        )
+        report.update({
+            "title": result["title"],
+            "course_content": result["course_content"],
+            "highlights": result["highlights"],
+            "provider": result["provider"],
+            "model": result["model"],
+            "status": "succeeded",
+            "generated_at": _common_issue_now(),
+        })
+        _write_common_issue_json(report_path, report)
+        markdown_path = _daily_course_markdown_path(job["report_id"])
+        if markdown_path:
+            _write_daily_course_markdown(markdown_path, report)
+        job.update({"status": "succeeded", "updated_at": report["generated_at"]})
+    except Exception as exc:
+        error = str(exc)[:1000]
+        report.update({
+            "course_content": "",
+            "highlights": [],
+            "warnings": [*report.get("warnings", []), error],
+            "status": "failed",
+            "generated_at": _common_issue_now(),
+        })
+        _write_common_issue_json(report_path, report)
+        job.update({"status": "failed", "error": error, "updated_at": report["generated_at"]})
+    finally:
+        _write_common_issue_json(job_path, job)
+        with _daily_course_lock:
+            _daily_course_submitted.discard(str(job_path.resolve()))
+
+
+def _list_daily_course_reports(date_text: str = "") -> list[dict[str, Any]]:
+    root = _daily_course_root()
+    root.mkdir(parents=True, exist_ok=True)
+    reports = []
+    for path in root.glob("*.json"):
+        report = _read_common_issue_json(path)
+        if not report:
+            continue
+        if date_text and report.get("date") != date_text:
+            continue
+        reports.append(report)
+    reports.sort(key=lambda item: item.get("generated_at", ""), reverse=True)
+    return reports
+
+
+def _list_common_issue_reports(experiment_type: str = "", date_text: str = "") -> list[dict[str, Any]]:
+    root = _common_issue_root()
+    root.mkdir(parents=True, exist_ok=True)
+    reports = []
+    for path in root.glob("*.json"):
+        report = _read_common_issue_json(path)
+        if not report:
+            continue
+        if experiment_type and report.get("experiment_type") != experiment_type:
+            continue
+        if date_text and report.get("date") != date_text:
+            continue
+        reports.append(report)
+    reports.sort(key=lambda item: item.get("generated_at", ""), reverse=True)
+    return reports
 
 
 def _cleanup_store():
@@ -153,18 +641,712 @@ def _cleanup_store():
         _detect_store.pop(k, None)
 
 
+def _current_user() -> dict[str, Any] | None:
+    identity_id = str(session.get("identity_id", "")).strip()
+    if not identity_id:
+        return None
+    return find_user(identity_id)
+
+
+def _admin_is_unlocked() -> bool:
+    return bool(session.get("admin_unlocked"))
+
+
+def _admin_required():
+    if not _admin_is_unlocked():
+        return jsonify({"error": "admin login required"}), 401
+    return None
+
+
+_BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _parse_claim_time(value: str, field_name: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} 不能为空")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 格式应为 YYYY-MM-DDTHH:MM") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_BEIJING_TZ)
+    return parsed.astimezone(timezone.utc)
+
+
+def _candidate_datetime(value: Any, *, fallback: datetime) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return fallback
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_BEIJING_TZ)
+    return parsed.astimezone(timezone.utc)
+
+
+def _claim_candidate_items(
+    glass_number: str,
+    started_at: datetime,
+    ended_at: datetime,
+    *,
+    source_role: str | None = None,
+) -> list[dict[str, Any]]:
+    glass = next((item for item in list_glasses() if item["glass_number"] == glass_number), None)
+    if not glass or not glass.get("device_id"):
+        return []
+    device_id = str(glass["device_id"])
+    candidates: list[dict[str, Any]] = []
+    sources = (
+        ("student", _list_records(_record_root(), "admin_download_record_file"), "record"),
+        ("teacher", _list_records(_teacher_record_root(), "teacher_admin_download_record_file"), "record"),
+        ("student", _list_photos(_photo_root(), "admin_photo_file"), "photo"),
+        ("teacher", _list_photos(_teacher_photo_root(), "teacher_admin_photo_file"), "photo"),
+    )
+    for item_source_role, items, item_type in sources:
+        if source_role and item_source_role != source_role:
+            continue
+        for item in items:
+            if str(item.get("device_id", "")).strip() != device_id:
+                continue
+            created_at = _candidate_datetime(item.get("created_at"), fallback=datetime.min.replace(tzinfo=timezone.utc))
+            if item_type == "record":
+                item_start_raw = item.get("started_at") or item.get("created_at")
+                item_end_raw = item.get("ended_at") or item_start_raw
+                time_source = "record_interval" if item.get("started_at") and item.get("ended_at") else "created_at_fallback"
+                item_id = str(item.get("record_id", ""))
+            else:
+                item_start_raw = item.get("captured_at") or item.get("created_at")
+                item_end_raw = item_start_raw
+                time_source = "captured_at" if item.get("captured_at") else "created_at_fallback"
+                item_id = str(item.get("photo_id", ""))
+            item_start = _candidate_datetime(item_start_raw, fallback=created_at)
+            item_end = _candidate_datetime(item_end_raw, fallback=item_start)
+            if item_end < item_start:
+                item_end = item_start
+            if item_end < started_at or item_start > ended_at:
+                continue
+            candidates.append({
+                "item_type": item_type,
+                "item_id": item_id,
+                "source_role": item_source_role,
+                "device_id": device_id,
+                "experiment_type": str(item.get("experiment_type", "")),
+                "item_created_at": str(item.get("created_at", "")),
+                "started_at": item_start.isoformat(),
+                "ended_at": item_end.isoformat(),
+                "time_source": time_source,
+            })
+    candidates.sort(key=lambda item: item.get("started_at", ""))
+    return candidates
+
+
+def _claim_period(value: datetime) -> tuple[str, str]:
+    local = value.astimezone(_BEIJING_TZ)
+    if local.hour < 6:
+        period = "凌晨"
+    elif local.hour < 12:
+        period = "上午"
+    elif local.hour < 18:
+        period = "下午"
+    else:
+        period = "晚上"
+    return local.strftime("%Y-%m-%d"), period
+
+
+def _pending_claim_groups(source_role: str) -> tuple[list[dict[str, Any]], int]:
+    device_glasses = {
+        str(item["device_id"]): str(item["glass_number"])
+        for item in list_glasses()
+        if item.get("device_id")
+    }
+    claimed = claimed_item_keys()
+    sources = (
+        ("record", _list_records(_record_root(), "admin_download_record_file")),
+        ("photo", _list_photos(_photo_root(), "admin_photo_file")),
+    ) if source_role == "student" else (
+        ("record", _list_records(_teacher_record_root(), "teacher_admin_download_record_file")),
+        ("photo", _list_photos(_teacher_photo_root(), "teacher_admin_photo_file")),
+    )
+
+    pending_items: list[dict[str, Any]] = []
+    unmapped_count = 0
+    for item_type, items in sources:
+        for source in items:
+            item_id = str(source.get("record_id") or source.get("photo_id") or "")
+            if not item_id or (item_type, source_role, item_id) in claimed:
+                continue
+            device_id = str(source.get("device_id", "")).strip()
+            glass_number = device_glasses.get(device_id)
+            if not glass_number:
+                unmapped_count += 1
+                continue
+            created_at = _candidate_datetime(
+                source.get("created_at"),
+                fallback=datetime.min.replace(tzinfo=timezone.utc),
+            )
+            if item_type == "record":
+                start_raw = source.get("started_at") or source.get("created_at")
+                end_raw = source.get("ended_at") or start_raw
+                time_source = "record_interval" if source.get("started_at") and source.get("ended_at") else "created_at_fallback"
+            else:
+                start_raw = source.get("captured_at") or source.get("created_at")
+                end_raw = start_raw
+                time_source = "captured_at" if source.get("captured_at") else "created_at_fallback"
+            started_at = _candidate_datetime(start_raw, fallback=created_at)
+            ended_at = _candidate_datetime(end_raw, fallback=started_at)
+            if started_at.year < 2000:
+                continue
+            if ended_at < started_at:
+                ended_at = started_at
+            date_key, period = _claim_period(started_at)
+            pending_items.append({
+                "item_type": item_type,
+                "item_id": item_id,
+                "source_role": source_role,
+                "device_id": device_id,
+                "glass_number": glass_number,
+                "experiment_type": str(source.get("experiment_type", "")).strip(),
+                "item_created_at": str(source.get("created_at", "")),
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "time_source": time_source,
+                "date_key": date_key,
+                "period": period,
+            })
+
+    pending_items.sort(key=lambda item: item["started_at"])
+    sessions: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for item in pending_items:
+        key = (
+            item["date_key"],
+            item["period"],
+            item["glass_number"],
+            item["experiment_type"],
+        )
+        key_sessions = sessions.setdefault(key, [])
+        if not key_sessions or item["started_at"] - key_sessions[-1]["ended_at"] > timedelta(minutes=60):
+            key_sessions.append({
+                "started_at": item["started_at"],
+                "ended_at": item["ended_at"],
+                "items": [],
+            })
+        session_item = key_sessions[-1]
+        session_item["ended_at"] = max(session_item["ended_at"], item["ended_at"])
+        session_item["items"].append(item)
+
+    result: list[dict[str, Any]] = []
+    for (date_key, period, glass_number, experiment_type), key_sessions in sessions.items():
+        date_value = datetime.strptime(date_key, "%Y-%m-%d")
+        for index, session_item in enumerate(key_sessions, start=1):
+            started_at = session_item["started_at"].astimezone(_BEIJING_TZ)
+            ended_at = session_item["ended_at"].astimezone(_BEIJING_TZ)
+            if ended_at <= started_at:
+                ended_at = started_at + timedelta(minutes=1)
+            public_items = [{
+                "item_type": item["item_type"],
+                "item_id": item["item_id"],
+                "experiment_type": item["experiment_type"],
+                "item_created_at": item["item_created_at"],
+                "started_at": item["started_at"].astimezone(_BEIJING_TZ).isoformat(),
+                "ended_at": item["ended_at"].astimezone(_BEIJING_TZ).isoformat(),
+                "time_source": item["time_source"],
+            } for item in session_item["items"]]
+            result.append({
+                "group_id": f"{date_key}-{period}-{glass_number}-{index}",
+                "date": date_key,
+                "period": period,
+                "date_label": f"{date_value.month}月{date_value.day}日{period}",
+                "glass_number": glass_number,
+                "experiment_type": experiment_type,
+                "source_role": source_role,
+                "started_at": started_at.strftime("%Y-%m-%dT%H:%M"),
+                "ended_at": ended_at.strftime("%Y-%m-%dT%H:%M"),
+                "record_count": sum(item["item_type"] == "record" for item in session_item["items"]),
+                "photo_count": sum(item["item_type"] == "photo" for item in session_item["items"]),
+                "count": len(session_item["items"]),
+                "items": public_items,
+            })
+    result.sort(key=lambda item: item["started_at"], reverse=True)
+    return result, unmapped_count
+
+
 @app.get("/")
 def index():
+    if request.args.get("token", "").strip():
+        return pku_callback()
     return render_template("index.html")
+
+
+@app.get("/login")
+def login_page():
+    return render_template(
+        "login.html",
+        pku_app_id=os.getenv("PKU_IAAA_APP_ID", "hxb001").strip() or "hxb001",
+        pku_redirect_url=os.getenv("PKU_IAAA_REDIRECT_URL", "").strip(),
+    )
+
+
+def _clear_user_session() -> None:
+    for key in (
+        "identity_id",
+        "role",
+        "pku_pending_identity_id",
+        "pku_pending_identity_display",
+    ):
+        session.pop(key, None)
+
+
+def _masked_identity_for_page(identity_id: str) -> str:
+    text = str(identity_id)
+    if text.startswith("demo-"):
+        return text
+    if len(text) <= 4:
+        return "***"
+    return f"{text[:2]}***{text[-2:]}"
+
+
+def _begin_user_session(user: dict[str, Any], identity_display: str) -> str:
+    _clear_user_session()
+    if user.get("role") in {"student", "teacher"}:
+        session["identity_id"] = user["identity_id"]
+        session["role"] = user["role"]
+        return url_for("workspace_index")
+    session["pku_pending_identity_id"] = user["identity_id"]
+    session["pku_pending_identity_display"] = identity_display
+    return url_for("onboarding_page")
+
+
+def pku_callback():
+    payload = request.get_json(silent=True) or {}
+    token = (
+        request.args.get("token", "")
+        or request.form.get("token", "")
+        or payload.get("token", "")
+    )
+    result = validate_token(
+        str(token),
+        client_ip(
+            remote_addr=request.remote_addr,
+            x_real_ip=request.headers.get("X-Real-IP"),
+        ),
+    )
+    if not result.get("ok"):
+        if request.is_json:
+            return jsonify({"ok": False, "error": result.get("error", "北大认证失败")}), 400
+        return render_template("pku_callback.html", **result)
+
+    user = upsert_user(
+        str(result["identity_id"]),
+        profile=result.get("user_info") if isinstance(result.get("user_info"), dict) else None,
+    )
+    next_url = _begin_user_session(user, str(result.get("identity_display") or "***"))
+    if request.is_json:
+        return jsonify({
+            "ok": True,
+            "next_url": next_url,
+            "needs_role": user.get("role") not in {"student", "teacher"},
+        })
+    return redirect(next_url)
+
+
+@app.route("/auth/pku/callback", methods=["GET", "POST"])
+def pku_callback_route():
+    return pku_callback()
+
+
+@app.get("/onboarding")
+def onboarding_page():
+    identity_id = str(session.get("pku_pending_identity_id", "")).strip()
+    if not identity_id:
+        if _current_user() is not None:
+            return redirect(url_for("workspace_index"))
+        return redirect(url_for("login_page"))
+    return render_template(
+        "onboarding.html",
+        identity_display=session.get("pku_pending_identity_display", "***"),
+    )
+
+
+@app.post("/auth/role")
+def complete_role_registration():
+    payload = request.get_json(silent=True) or {}
+    role = str(payload.get("role") or request.form.get("role", "")).strip()
+    identity_id = str(session.get("pku_pending_identity_id", "")).strip()
+    if role not in {"student", "teacher"}:
+        return jsonify({"error": "role must be student or teacher"}), 400
+    if not identity_id:
+        return jsonify({"error": "请先完成北大门户认证"}), 400
+    user = upsert_user(identity_id, role=role)
+    session["identity_id"] = user["identity_id"]
+    session["role"] = user["role"]
+    session.pop("pku_pending_identity_id", None)
+    session.pop("pku_pending_identity_display", None)
+    next_url = url_for("workspace_index")
+    if request.is_json:
+        return jsonify({"ok": True, "next_url": next_url, "user": user})
+    return redirect(next_url)
+
+
+@app.get("/workspace")
+def workspace_index():
+    user = _current_user()
+    if user is None:
+        if session.get("pku_pending_identity_id"):
+            return redirect(url_for("onboarding_page"))
+        return redirect(url_for("login_page"))
+    if user.get("role") not in {"student", "teacher"}:
+        session["pku_pending_identity_id"] = user["identity_id"]
+        session["pku_pending_identity_display"] = _masked_identity_for_page(user["identity_id"])
+        session.pop("identity_id", None)
+        session.pop("role", None)
+        return redirect(url_for("onboarding_page"))
+    return render_template(
+        "workspace.html",
+        user=user,
+        glasses=list_glasses(),
+        admin_unlocked=_admin_is_unlocked(),
+    )
+
+
+@app.get("/api/auth/me")
+def auth_me():
+    user = _current_user()
+    return jsonify({
+        "authenticated": user is not None,
+        "user": user,
+        "admin_unlocked": _admin_is_unlocked(),
+    })
+
+
+@app.get("/api/auth/profile")
+def auth_profile():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先完成身份登录"}), 401
+    return jsonify({
+        "identity_id": user["identity_id"],
+        "role": user.get("role"),
+        "profile": user.get("profile"),
+        "profile_updated_at": user.get("profile_updated_at"),
+    })
+
+
+@app.post("/auth/admin/login")
+def admin_login():
+    configured_password = os.getenv("CHEM_ADMIN_PASSWORD", "").strip()
+    payload = request.get_json(silent=True) or {}
+    password = str(payload.get("password") or request.form.get("password", ""))
+    if not configured_password:
+        return jsonify({"error": "服务端尚未配置 CHEM_ADMIN_PASSWORD"}), 503
+    if password != configured_password:
+        return jsonify({"error": "管理员密码不正确"}), 401
+    session["admin_unlocked"] = True
+    return redirect(url_for("admin_index"))
+
+
+@app.post("/auth/logout")
+def auth_logout():
+    _clear_user_session()
+    return redirect(url_for("login_page"))
+
+
+@app.post("/auth/admin/logout")
+def admin_logout():
+    session.pop("admin_unlocked", None)
+    return redirect(url_for("admin_index"))
 
 
 @app.get("/admin")
 def admin_index():
+    if not _admin_is_unlocked():
+        return render_template("admin_login.html")
     return render_template(
         "admin.html",
         portal_title="化学实验资源管理",
         record_api_prefix="/admin/api",
     )
+
+
+def _test_identity_user(key: str) -> dict[str, Any] | None:
+    spec = TEST_IDENTITIES.get(key)
+    if spec is None:
+        return None
+    existing = find_user(spec["identity_id"])
+    return upsert_user(
+        spec["identity_id"],
+        role=spec["initial_role"] if existing is None else None,
+        profile={
+            "identityId": spec["identity_id"],
+            "name": spec["name"],
+            "source": "local-test",
+            "testIdentity": True,
+        },
+    )
+
+
+@app.get("/admin/users")
+def admin_users_page():
+    if not _admin_is_unlocked():
+        return redirect(url_for("admin_index"))
+    return render_template("admin_users.html")
+
+
+@app.get("/admin/api/auth/users")
+def admin_auth_users():
+    required = _admin_required()
+    if required:
+        return required
+    return jsonify({"users": list_users()})
+
+
+@app.post("/admin/api/auth/users/<identity_id>/reset-role")
+def admin_reset_user_role(identity_id: str):
+    required = _admin_required()
+    if required:
+        return required
+    user = reset_user_role(identity_id)
+    if user is None:
+        return jsonify({"error": "身份不存在"}), 404
+    if session.get("identity_id") == identity_id:
+        _clear_user_session()
+    return jsonify({"user": user})
+
+
+@app.get("/admin/test-identities")
+def test_login_page():
+    if not _admin_is_unlocked():
+        return redirect(url_for("admin_index"))
+    identities = []
+    for key, spec in TEST_IDENTITIES.items():
+        user = _test_identity_user(key)
+        identities.append({"key": key, **spec, "current_role": user.get("role") if user else None})
+    return render_template("test_login.html", identities=identities)
+
+
+@app.post("/admin/test-identities/<key>/login")
+def test_identity_login(key: str):
+    required = _admin_required()
+    if required:
+        return required
+    user = _test_identity_user(key)
+    if user is None:
+        return jsonify({"error": "未知测试身份"}), 404
+    next_url = _begin_user_session(user, user["identity_id"])
+    return redirect(next_url)
+
+
+@app.post("/admin/test-identities/<key>/reset")
+def reset_test_identity(key: str):
+    required = _admin_required()
+    if required:
+        return required
+    spec = TEST_IDENTITIES.get(key)
+    if spec is None:
+        return jsonify({"error": "未知测试身份"}), 404
+    reset_user_role(spec["identity_id"])
+    if session.get("identity_id") == spec["identity_id"]:
+        _clear_user_session()
+    return redirect(url_for("test_login_page"))
+
+
+@app.get("/admin/api/auth/glasses")
+def admin_auth_glasses():
+    required = _admin_required()
+    if required:
+        return required
+    return jsonify({"glasses": list_glasses()})
+
+
+@app.put("/admin/api/auth/glasses/<glass_number>")
+def admin_auth_glass_update(glass_number: str):
+    required = _admin_required()
+    if required:
+        return required
+    payload = request.get_json(silent=True) or {}
+    try:
+        glass = _save_glass_calibration(glass_number, payload.get("device_id"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"glass": glass})
+
+
+@app.post("/api/claims/match")
+def claims_match():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先完成北大认证"}), 401
+    payload = request.get_json(silent=True) or {}
+    glass_number = str(payload.get("glass_number", "")).strip()
+    if glass_number not in {f"{number:02d}" for number in range(1, 9)}:
+        return jsonify({"error": "glass_number 必须是 01 到 08"}), 400
+    try:
+        started_at = _parse_claim_time(payload.get("started_at"), "开始时间")
+        ended_at = _parse_claim_time(payload.get("ended_at"), "结束时间")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if ended_at <= started_at:
+        return jsonify({"error": "结束时间必须晚于开始时间"}), 400
+    glass = next((item for item in list_glasses() if item["glass_number"] == glass_number), None)
+    if not glass or not glass.get("device_id"):
+        return jsonify({"error": f"眼镜 {glass_number} 还没有完成硬件校准"}), 400
+    items = _claim_candidate_items(
+        glass_number,
+        started_at,
+        ended_at,
+        source_role=str(user.get("role") or ""),
+    )
+    return jsonify({
+        "glass_number": glass_number,
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "items": items,
+        "count": len(items),
+    })
+
+
+@app.get("/api/claims/pending")
+def claims_pending():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先完成北大认证"}), 401
+    groups, unmapped_count = _pending_claim_groups(str(user.get("role") or ""))
+    return jsonify({
+        "groups": groups,
+        "count": sum(group["count"] for group in groups),
+        "unmapped_count": unmapped_count,
+    })
+
+
+@app.post("/api/claims")
+def claims_create():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先完成北大认证"}), 401
+    payload = request.get_json(silent=True) or {}
+    glass_number = str(payload.get("glass_number", "")).strip()
+    try:
+        started_at = _parse_claim_time(payload.get("started_at"), "开始时间")
+        ended_at = _parse_claim_time(payload.get("ended_at"), "结束时间")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if ended_at <= started_at:
+        return jsonify({"error": "结束时间必须晚于开始时间"}), 400
+    candidates = _claim_candidate_items(
+        glass_number,
+        started_at,
+        ended_at,
+        source_role=str(user.get("role") or ""),
+    )
+    candidate_map = {
+        (item["item_type"], item["source_role"], item["item_id"]): item
+        for item in candidates
+    }
+    requested_items = payload.get("items")
+    if not isinstance(requested_items, list) or not requested_items:
+        requested_items = candidates
+    selected = []
+    selected_keys = set()
+    for requested in requested_items:
+        if not isinstance(requested, dict):
+            continue
+        key = (
+            str(requested.get("item_type", "")).strip(),
+            str(requested.get("source_role", "")).strip(),
+            str(requested.get("item_id", "")).strip(),
+        )
+        if key in candidate_map and key not in selected_keys:
+            selected.append(candidate_map[key])
+            selected_keys.add(key)
+    if not selected:
+        return jsonify({"error": "没有选择任何匹配数据"}), 400
+    try:
+        claim = create_claim(
+            identity_id=str(user["identity_id"]),
+            role=str(user["role"]),
+            glass_number=glass_number,
+            started_at=started_at.isoformat(),
+            ended_at=ended_at.isoformat(),
+            items=selected,
+        )
+    except ClaimConflict as exc:
+        return jsonify({"error": "其中一些数据已经被认领", "items": exc.items}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"claim": claim}), 201
+
+
+@app.get("/api/claims")
+def claims_list():
+    user = _current_user()
+    if user is None and not _admin_is_unlocked():
+        return jsonify({"error": "请先登录"}), 401
+    if user and user.get("role") == "teacher":
+        identity_id = str(user["identity_id"])
+        claims = [
+            claim for claim in list_claims()
+            if claim.get("role") == "student" or claim.get("identity_id") == identity_id
+        ]
+    elif user:
+        claims = list_claims(str(user["identity_id"]))
+    else:
+        claims = list_claims()
+    return jsonify({"claims": claims})
+
+
+def _workspace_data_catalog() -> list[dict[str, Any]]:
+    sources = (
+        ("student", "record", _list_records(_record_root(), "admin_download_record_file")),
+        ("teacher", "record", _list_records(_teacher_record_root(), "teacher_admin_download_record_file")),
+        ("student", "photo", _list_photos(_photo_root(), "admin_photo_file")),
+        ("teacher", "photo", _list_photos(_teacher_photo_root(), "teacher_admin_photo_file")),
+    )
+    owners = claim_item_owners()
+    catalog: list[dict[str, Any]] = []
+    for source_role, item_type, items in sources:
+        for source in items:
+            item = dict(source)
+            item.pop("path", None)
+            item_id = str(item.get("record_id") or item.get("photo_id") or "")
+            owner = owners.get((item_type, source_role, item_id))
+            if owner:
+                owner = dict(owner)
+                owner["identity_display"] = _masked_identity_for_page(owner["identity_id"])
+            item.update({
+                "item_id": item_id,
+                "item_type": item_type,
+                "source_role": source_role,
+                "claim": owner,
+            })
+            catalog.append(item)
+    catalog.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return catalog
+
+
+@app.get("/api/workspace/data")
+def workspace_data():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先完成身份登录"}), 401
+    catalog = _workspace_data_catalog()
+    identity_id = str(user["identity_id"])
+    own_items = [
+        item for item in catalog
+        if item.get("claim") and item["claim"].get("identity_id") == identity_id
+    ]
+    payload: dict[str, Any] = {"own_items": own_items}
+    if user.get("role") == "teacher":
+        payload["student_items"] = [
+            item for item in catalog if item.get("source_role") == "student"
+        ]
+    return jsonify(payload)
 
 
 @app.get("/teacher-admin")
@@ -188,21 +1370,15 @@ def teacher_admin_update_device(device_id: str):
     if not device_id:
         return jsonify({"error": "invalid device_id"}), 400
     payload = request.get_json(silent=True) or {}
-    label = str(payload.get("label", "")).strip()
-    if len(label) > 32:
-        return jsonify({"error": "device label is too long"}), 400
-
-    with _device_mapping_lock:
-        mappings = _load_device_mappings()
-        if label:
-            # A visible number belongs to one physical device at a time.
-            for other_id, other_label in list(mappings.items()):
-                if other_id != device_id and other_label == label:
-                    mappings.pop(other_id, None)
-            mappings[device_id] = label
-        else:
-            mappings.pop(device_id, None)
-        _save_device_mappings(mappings)
+    raw_label = str(payload.get("label", "")).strip()
+    label = _normalize_glass_number(raw_label)
+    if raw_label and not label:
+        return jsonify({"error": "眼镜编号必须是 01 到 08"}), 400
+    if label:
+        _save_glass_calibration(label, device_id)
+    else:
+        _clear_device_calibration(device_id)
+    mappings = _load_device_mappings()
     device = next(
         (item for item in _teacher_device_inventory() if item["device_id"] == device_id),
         {
@@ -216,9 +1392,198 @@ def teacher_admin_update_device(device_id: str):
     return jsonify({"device": device})
 
 
+@app.post("/teacher-admin/api/derived/common-issues")
+def teacher_admin_create_common_issues():
+    payload = request.get_json(silent=True) or {}
+    experiment_type = str(payload.get("experiment_type", "")).strip()
+    date_text = str(payload.get("date", "")).strip()
+    cfg = get_experiment_config(experiment_type)
+    if cfg is None:
+        return jsonify({"error": "未知实验类型"}), 400
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date 必须是 YYYY-MM-DD"}), 400
+
+    transcripts = _collect_teacher_transcripts(experiment_type, date_text)
+    experiment_slug = re.sub(r"[^A-Za-z0-9_-]+", "_", experiment_type)[:40] or "experiment"
+    report_id = f"{date_text.replace('-', '')}_{experiment_slug}_{uuid.uuid4().hex[:8]}"
+    report_path = _common_issue_report_path(report_id)
+    if report_path is None:
+        return jsonify({"error": "无法创建报告 ID"}), 500
+    now = _common_issue_now()
+    base_report = {
+        "report_id": report_id,
+        "experiment_type": experiment_type,
+        "date": date_text,
+        "input_record_ids": [item["record_id"] for item in transcripts],
+        "transcript_count": len(transcripts),
+        "knowledge_source": f"{experiment_type}.json",
+        "common_issues": [],
+        "warnings": [],
+        "status": "queued",
+        "generated_at": now,
+        "updated_at": now,
+    }
+    if len(transcripts) < 2:
+        base_report["status"] = "insufficient_data"
+        base_report["warnings"] = ["至少需要两条含转写的不同记录，才能提炼共性问题。"]
+        _write_common_issue_json(report_path, base_report)
+        return jsonify({"report": base_report}), 200
+
+    provider = os.getenv("MEDIA_ANALYSIS_PROVIDER", DEFAULT_VLM_PROVIDER).strip() or DEFAULT_VLM_PROVIDER
+    model = os.getenv("MEDIA_ANALYSIS_MODEL", DEFAULT_VLM_MODEL).strip() or DEFAULT_VLM_MODEL
+    job = {
+        "job_id": report_id,
+        "report_id": report_id,
+        "report_path": str(report_path.resolve()),
+        "experiment_type": experiment_type,
+        "date": date_text,
+        "experiment": _common_issue_experiment_context(cfg),
+        "transcripts": transcripts,
+        "input_record_ids": base_report["input_record_ids"],
+        "transcript_count": len(transcripts),
+        "provider": provider,
+        "model": model,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+    }
+    _write_common_issue_json(_common_issue_job_root() / f"{report_id}.json", job)
+    _write_common_issue_json(report_path, base_report)
+    _schedule_common_issue_job(_common_issue_job_root() / f"{report_id}.json")
+    return jsonify({"report": base_report}), 202
+
+
+@app.get("/teacher-admin/api/derived/common-issues")
+def teacher_admin_common_issue_reports():
+    return jsonify({
+        "reports": _list_common_issue_reports(
+            request.args.get("experiment_type", "").strip(),
+            request.args.get("date", "").strip(),
+        ),
+    })
+
+
+@app.get("/teacher-admin/api/derived/common-issues/<report_id>")
+def teacher_admin_common_issue_report(report_id: str):
+    path = _common_issue_report_path(report_id)
+    report = _read_common_issue_json(path) if path else None
+    if not report:
+        return jsonify({"error": "报告不存在"}), 404
+    return jsonify({"report": report})
+
+
+@app.post("/teacher-admin/api/derived/daily-course")
+def teacher_admin_create_daily_course():
+    payload = request.get_json(silent=True) or {}
+    date_text = str(payload.get("date", "")).strip()
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date 必须是 YYYY-MM-DD"}), 400
+
+    collected = _collect_teacher_daily_transcripts(date_text)
+    report_id = f"{date_text.replace('-', '')}_daily_course_{uuid.uuid4().hex[:8]}"
+    report_path = _daily_course_report_path(report_id)
+    if report_path is None:
+        return jsonify({"error": "无法创建报告 ID"}), 500
+    now = _common_issue_now()
+    transcripts = collected["transcripts"]
+    source_records = collected["source_records"]
+    base_report = {
+        "report_id": report_id,
+        "date": date_text,
+        "input_record_ids": [item["record_id"] for item in transcripts],
+        "record_count": len(source_records),
+        "transcript_count": len(transcripts),
+        "source_records": source_records,
+        "title": "当天课程内容",
+        "course_content": "",
+        "highlights": [],
+        "warnings": collected["warnings"],
+        "status": "queued",
+        "generated_at": now,
+        "updated_at": now,
+    }
+    if not transcripts:
+        base_report["status"] = "insufficient_data"
+        if not base_report["warnings"]:
+            base_report["warnings"] = ["当天没有可用于整理的已完成转写。"]
+        _write_common_issue_json(report_path, base_report)
+        _write_daily_course_markdown(_daily_course_markdown_path(report_id), base_report)
+        return jsonify({"report": base_report}), 200
+
+    experiment_contexts = []
+    seen_experiments: set[str] = set()
+    for item in transcripts:
+        experiment_type = str(item.get("experiment_type", "")).strip()
+        if not experiment_type or experiment_type in seen_experiments:
+            continue
+        seen_experiments.add(experiment_type)
+        cfg = get_experiment_config(experiment_type)
+        experiment_contexts.append({
+            "id": experiment_type,
+            "name": str((cfg or {}).get("name", experiment_type)),
+        })
+
+    provider = os.getenv("MEDIA_ANALYSIS_PROVIDER", DEFAULT_VLM_PROVIDER).strip() or DEFAULT_VLM_PROVIDER
+    model = os.getenv("MEDIA_ANALYSIS_MODEL", DEFAULT_VLM_MODEL).strip() or DEFAULT_VLM_MODEL
+    job = {
+        "job_id": report_id,
+        "report_id": report_id,
+        "report_path": str(report_path.resolve()),
+        "date": date_text,
+        "transcripts": transcripts,
+        "experiment_contexts": experiment_contexts,
+        "input_record_ids": base_report["input_record_ids"],
+        "record_count": base_report["record_count"],
+        "transcript_count": base_report["transcript_count"],
+        "provider": provider,
+        "model": model,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+    }
+    _write_common_issue_json(_daily_course_job_root() / f"{report_id}.json", job)
+    _write_common_issue_json(report_path, base_report)
+    _schedule_daily_course_job(_daily_course_job_root() / f"{report_id}.json")
+    return jsonify({"report": base_report}), 202
+
+
+@app.get("/teacher-admin/api/derived/daily-course")
+def teacher_admin_daily_course_reports():
+    date_text = request.args.get("date", "").strip()
+    if date_text:
+        try:
+            datetime.strptime(date_text, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "date 必须是 YYYY-MM-DD"}), 400
+    return jsonify({"reports": _list_daily_course_reports(date_text)})
+
+
+@app.get("/teacher-admin/api/derived/daily-course/<report_id>")
+def teacher_admin_daily_course_report(report_id: str):
+    path = _daily_course_report_path(report_id)
+    report = _read_common_issue_json(path) if path else None
+    if not report:
+        return jsonify({"error": "报告不存在"}), 404
+    return jsonify({"report": report})
+
+
+@app.get("/teacher-admin/api/derived/daily-course/<report_id>/download")
+def teacher_admin_daily_course_download(report_id: str):
+    path = _daily_course_markdown_path(report_id)
+    if not path or not path.exists():
+        return jsonify({"error": "课程报告尚未生成"}), 404
+    return send_file(path, as_attachment=True, download_name=f"{report_id}.md", mimetype="text/markdown; charset=utf-8")
+
+
 @app.before_request
 def start_media_analysis_queue():
     _media_analysis_queue.start()
+    _recover_common_issue_jobs()
+    _recover_daily_course_jobs()
 
 
 @app.get("/experiment-lab")

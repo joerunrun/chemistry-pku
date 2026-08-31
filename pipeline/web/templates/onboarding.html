@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>首次进入 · 化小北</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#07111d;color:#eaf5ff;font-family:system-ui,"Microsoft YaHei",sans-serif}.card{width:min(620px,calc(100% - 36px));padding:36px;border:1px solid #29445a;border-radius:20px;background:#0d1d2b}.eyebrow{color:#65e6d5;letter-spacing:.18em}.muted{color:#afc1d1;line-height:1.7}.roles{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}.role{padding:22px;text-align:left;border:1px solid #31526a;border-radius:14px;background:#102434;color:#eaf5ff;cursor:pointer}.role:hover{border-color:#65e6d5;transform:translateY(-1px)}.role strong{display:block;margin-bottom:8px;font-size:22px;color:#65e6d5}.role.teacher strong{color:#a8d8ff}.id{font-family:ui-monospace,monospace}@media(max-width:560px){.roles{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main class="card">
+  <div class="eyebrow">FIRST SIGN-IN</div>
+  <h1>第一次进入，请选择你的身份</h1>
+  <p class="muted">已验证身份：<span class="id">{{ identity_display }}</span>。角色只需选择一次，之后登录会直接进入对应工作台；眼镜编号不在这里绑定。</p>
+  <div class="roles">
+    <form action="{{ url_for('complete_role_registration') }}" method="post"><input type="hidden" name="role" value="student"><button class="role" type="submit"><strong>我是学生</strong><span>认领自己的上课记录，并查看个人数据。</span></button></form>
+    <form action="{{ url_for('complete_role_registration') }}" method="post"><input type="hidden" name="role" value="teacher"><button class="role teacher" type="submit"><strong>我是教师</strong><span>认领教师眼镜数据，并查看学生记录。</span></button></form>
+  </div>
+</main>
+</body>
+</html>
