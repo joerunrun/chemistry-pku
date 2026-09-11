@@ -18,7 +18,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\sync_to_code.ps1 -Apply
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_code_zip.ps1
 ```
 
-脚本默认生成带时间戳的 `code_deploy_*.zip`，并在完成后再次检查压缩包中不存在受保护数据。这样第一次把新版本上传到服务器时，压缩包本身就不会携带本地运行数据。
+脚本固定生成 `code_deploy.zip`，本地已经存在旧包时直接覆盖，并在完成后再次检查压缩包中不存在受保护数据。因此每次上传和部署都使用同一个文件名。
 
 ## 前置条件
 
@@ -69,6 +69,8 @@ docker compose down
 - 设备映射：`runtime_assets/device_mappings.json`
 - 第三层报告：`runtime_assets/derived/`
 - 每日课程报告：`runtime_assets/derived/daily_courses/`
+- 时间段课程报告：`runtime_assets/derived/scoped_courses/`
+- 共性问题报告：`runtime_assets/derived/common_issues/`
 - 后续实验目录与参考资料：`runtime_assets/experiment_catalog/`
 
 每条记录使用日期、时间和随机 ID 建立独立目录，正常上传不会覆盖旧文件。`docker compose up -d --build` 只重建代码容器，绑定的 `runtime_assets/` 不会被更新覆盖；不要删除该目录，也不要使用带清空数据的部署脚本。
@@ -81,14 +83,16 @@ docker compose down
 
 ### 使用安全解压脚本更新
 
-服务器更新代码统一使用 `deploy/safe_extract.py`，不要再直接执行 `unzip -o code.zip`。第一次启用本机制时，先把本地 [code/deploy/safe_extract.py] 单独上传到服务器 `/projects/chemistry-glasses/deploy/safe_extract.py`；此后它会随安全代码包正常更新：
+服务器更新代码统一使用 `deploy/safe_extract.py`，不要再直接执行 `unzip -o code_deploy.zip`。第一次启用本机制时，先把本地 `code/deploy/safe_extract.py` 单独上传到服务器 `/projects/chemistry-glasses/deploy/safe_extract.py`；此后它会随安全代码包正常更新：
 
 ```bash
 cd /projects/chemistry-glasses
-python3 deploy/safe_extract.py code.zip --target . --dry-run
-python3 deploy/safe_extract.py code.zip --target .
+python3 deploy/safe_extract.py code_deploy.zip --target . --dry-run
+python3 deploy/safe_extract.py code_deploy.zip --target .
 docker compose up -d --build
 ```
+
+脚本在服务器终端只输出英文，避免终端编码不一致造成中文乱码。
 
 脚本具备以下保护：
 
@@ -129,7 +133,7 @@ tar -czf runtime_assets_$(date +%Y%m%d_%H%M%S).tar.gz runtime_assets
 cp .env .env.backup
 ```
 
-如果使用 `code.zip`，通过上面的安全解压脚本部署。脚本会自动处理压缩包是否多一层 `code/`，并强制保护 `runtime_assets/` 和 `.env`。
+上传新的 `code_deploy.zip` 后，通过上面的安全解压脚本部署。脚本会自动处理压缩包是否多一层 `code/`，并强制保护 `runtime_assets/` 和 `.env`。
 
 更新后检查：
 
@@ -144,9 +148,16 @@ docker compose logs --tail=100 chemistry-api
 
 | 用途 | 地址 |
 |---|---|
+| 统一登录入口 | `http://162.105.209.134/login` |
+| 登录后统一工作台 | `http://162.105.209.134/workspace` |
+| 旧实验纠错调试页 | `http://162.105.209.134/pipeline` |
 | 眼镜健康检查 | `http://162.105.209.134/api/glasses/health` |
-| 学生管理页 | `http://162.105.209.134/admin` |
-| 教师管理页 | `http://162.105.209.134/teacher-admin` |
+
+用户只需要访问 `/login`。北大门户登录后，学生、教师自动进入同一个 `/workspace`，页面根据身份显示对应标签；管理员也在登录页右下角弹窗输入密码后进入该工作台。
+
+根路径 `/` 会立即跳转到 `/login`。这也保证北大从已登记的 `/#/iaaa_login?...` 返回时，不会先渲染旧实验纠错页面；旧页面保留在 `/pipeline`，仅供单独调试。
+
+旧的 `/teacher-admin`、`/admin`、`/admin/users` 地址仅作为兼容入口，会自动跳转到统一工作台对应标签，不再作为独立操作页面。
 
 ## 数据目录
 

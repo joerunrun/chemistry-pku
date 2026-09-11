@@ -29,7 +29,7 @@ def _safe_parts(name: str) -> tuple[str, ...]:
     normalized = name.replace("\\", "/")
     path = PurePosixPath(normalized)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ValueError(f"压缩包包含不安全路径: {name}")
+        raise ValueError(f"archive contains an unsafe path: {name}")
     return path.parts
 
 
@@ -50,7 +50,7 @@ def _relative_parts(member: ZipInfo, prefix: str | None) -> tuple[str, ...]:
     if prefix and parts[0] == prefix:
         parts = parts[1:]
     if not parts:
-        raise ValueError(f"压缩包成员缺少相对路径: {member.filename}")
+        raise ValueError(f"archive member has no relative path: {member.filename}")
     return parts
 
 
@@ -67,7 +67,7 @@ def _backup_critical_files(target: Path, backup_root: Path) -> Path:
         shutil.copy2(source, backup)
         copied += 1
     if copied:
-        print(f"已备份 {copied} 个关键数据文件到: {destination}")
+        print(f"Backed up {copied} critical data file(s) to: {destination}")
     return destination
 
 
@@ -81,9 +81,9 @@ def deploy_archive(
     archive = archive.resolve()
     target = target.resolve()
     if not archive.is_file():
-        raise FileNotFoundError(f"找不到部署压缩包: {archive}")
+        raise FileNotFoundError(f"deployment archive not found: {archive}")
     if not target.is_dir():
-        raise NotADirectoryError(f"部署目标不是目录: {target}")
+        raise NotADirectoryError(f"deployment target is not a directory: {target}")
     backup_root = (backup_root or target.parent / f"{target.name}_deploy_backups").resolve()
 
     with ZipFile(archive) as zipped:
@@ -95,14 +95,14 @@ def deploy_archive(
             if member.is_dir():
                 continue
             if _is_symlink(member):
-                raise ValueError(f"压缩包不允许包含符号链接: {member.filename}")
+                raise ValueError(f"archive symlinks are not allowed: {member.filename}")
             parts = _relative_parts(member, prefix)
             if parts[0] in PROTECTED_TOP_LEVEL:
                 skipped += 1
                 continue
             selected.append((member, parts))
 
-        print(f"待更新代码文件: {len(selected)}；受保护而跳过: {skipped}")
+        print(f"Code files planned: {len(selected)}; protected files skipped: {skipped}")
         if dry_run:
             return {"updated": 0, "protected": skipped, "planned": len(selected)}
 
@@ -120,18 +120,18 @@ def deploy_archive(
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(staged, destination)
 
-    print("代码更新完成；.env 和 runtime_assets 未被读取、覆盖或删除。")
+    print("Code update complete. .env and runtime_assets were not read, overwritten, or deleted.")
     return {"updated": len(selected), "protected": skipped, "planned": len(selected)}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="安全解压代码包，强制保护服务器 .env 与 runtime_assets。"
+        description="Deploy a code archive while protecting server .env and runtime_assets."
     )
-    parser.add_argument("archive", type=Path, help="code.zip 路径")
-    parser.add_argument("--target", type=Path, default=Path.cwd(), help="服务器项目目录")
-    parser.add_argument("--backup-root", type=Path, help="关键数据备份目录")
-    parser.add_argument("--dry-run", action="store_true", help="只检查，不写入")
+    parser.add_argument("archive", type=Path, help="path to code_deploy.zip")
+    parser.add_argument("--target", type=Path, default=Path.cwd(), help="server project directory")
+    parser.add_argument("--backup-root", type=Path, help="critical data backup directory")
+    parser.add_argument("--dry-run", action="store_true", help="validate without writing")
     args = parser.parse_args()
     try:
         deploy_archive(
@@ -141,7 +141,7 @@ def main() -> int:
             dry_run=args.dry_run,
         )
     except (BadZipFile, OSError, ValueError) as exc:
-        parser.exit(1, f"安全部署失败: {exc}\n")
+        parser.exit(1, f"Deployment failed: {exc}\n")
     return 0
 
 

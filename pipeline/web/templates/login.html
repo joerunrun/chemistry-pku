@@ -2,6 +2,8 @@
 <html>
     <head>
         <meta charset="utf-8">
+        <meta name="csrf-token" content="{{ csrf_token() }}">
+        <script src="{{ url_for('static', filename='security.js') }}"></script>
         <base href="{{ url_for('static', filename='fluid/') }}">
         <meta http-equiv="Cache-Control" content="no-cache">
 
@@ -222,12 +224,58 @@
                 right: 28px;
                 bottom: 22px;
                 z-index: 3;
+                border: 0;
+                background: transparent;
                 color: rgba(255,255,255,.72);
                 font: 12px/1 "Microsoft YaHei", system-ui, sans-serif;
-                text-decoration: none;
+                cursor: pointer;
             }
 
             .admin-entry:hover { color: #fff; }
+
+            .admin-modal {
+                position: fixed;
+                inset: 0;
+                z-index: 10;
+                display: none;
+                place-items: center;
+                padding: 20px;
+                background: rgba(0, 0, 0, .56);
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+            }
+
+            .admin-modal.open { display: grid; }
+
+            .admin-dialog {
+                width: min(360px, calc(100vw - 40px));
+                padding: 24px;
+                border: 1px solid rgba(255, 255, 255, .2);
+                border-radius: 18px;
+                color: #fff;
+                background: rgba(7, 17, 28, .88);
+                box-shadow: 0 24px 70px rgba(0, 0, 0, .45);
+                font-family: "Microsoft YaHei", system-ui, sans-serif;
+            }
+
+            .admin-dialog h2 { margin: 0 0 8px; font-size: 20px; }
+            .admin-dialog p { margin: 0 0 18px; color: rgba(255,255,255,.66); font-size: 13px; }
+            .admin-dialog input {
+                box-sizing: border-box;
+                width: 100%;
+                padding: 12px 14px;
+                border: 1px solid rgba(255,255,255,.24);
+                border-radius: 10px;
+                color: #fff;
+                background: rgba(0,0,0,.35);
+                font: 14px "Microsoft YaHei", system-ui, sans-serif;
+                user-select: text;
+            }
+            .admin-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+            .admin-actions button { padding: 10px 16px; border: 0; border-radius: 10px; cursor: pointer; }
+            .admin-actions .cancel { color: #fff; background: rgba(255,255,255,.12); }
+            .admin-actions .submit { color: #00151a; background: #65e4df; font-weight: 700; }
+            .admin-error { min-height: 18px; margin-top: 10px; color: #ffaaa5; font-size: 13px; }
 
             @media (max-width: 600px) {
                 .portal-entry {
@@ -258,7 +306,20 @@
                 进入北大门户登录
             </button>
         </form>
-        <a class="admin-entry" href="{{ url_for('admin_index') }}">管理员入口</a>
+        <button id="openAdmin" class="admin-entry" type="button">管理员入口</button>
+
+        <div id="adminModal" class="admin-modal" role="dialog" aria-modal="true" aria-labelledby="adminTitle">
+            <form id="adminForm" class="admin-dialog">
+                <h2 id="adminTitle">管理员登录</h2>
+                <p>输入管理员密码，进入同一个化小北工作台。</p>
+                <input id="adminPassword" type="password" autocomplete="current-password" placeholder="管理员密码" required>
+                <div id="adminError" class="admin-error" aria-live="polite"></div>
+                <div class="admin-actions">
+                    <button id="closeAdmin" class="cancel" type="button">取消</button>
+                    <button class="submit" type="submit">进入工作台</button>
+                </div>
+            </form>
+        </div>
 
         <!-- Mother of God, pls forgive me -->
         <div class="promo">
@@ -284,5 +345,46 @@
 
         <script src="./script.js"></script>
         <script src="{{ url_for('static', filename='pku-callback.js') }}"></script>
+        <script>
+            (() => {
+                const modal = document.getElementById('adminModal');
+                const form = document.getElementById('adminForm');
+                const password = document.getElementById('adminPassword');
+                const error = document.getElementById('adminError');
+                const open = () => {
+                    modal.classList.add('open');
+                    error.textContent = '';
+                    window.setTimeout(() => password.focus(), 0);
+                };
+                const close = () => {
+                    modal.classList.remove('open');
+                    password.value = '';
+                    error.textContent = '';
+                };
+                document.getElementById('openAdmin').addEventListener('click', open);
+                document.getElementById('closeAdmin').addEventListener('click', close);
+                modal.addEventListener('click', event => { if (event.target === modal) close(); });
+                document.addEventListener('keydown', event => { if (event.key === 'Escape') close(); });
+                form.addEventListener('submit', async event => {
+                    event.preventDefault();
+                    error.textContent = '正在验证……';
+                    try {
+                        const response = await fetch('/auth/admin/login', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({password: password.value}),
+                        });
+                        if (!response.ok) {
+                            const data = await response.json().catch(() => ({}));
+                            throw new Error(data.error || `登录失败（${response.status}）`);
+                        }
+                        window.location.assign(response.url || '/workspace#admin');
+                    } catch (reason) {
+                        error.textContent = reason.message || '管理员登录失败';
+                    }
+                });
+                if (window.location.hash === '#admin') open();
+            })();
+        </script>
     </body>
 </html>

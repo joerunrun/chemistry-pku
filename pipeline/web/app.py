@@ -48,6 +48,7 @@ from pipeline.web.identity_store import (
     list_glasses,
     list_users,
     reset_user_role,
+    set_user_role,
     upsert_user,
 )
 from pipeline.web.claim_store import (
@@ -59,10 +60,13 @@ from pipeline.web.claim_store import (
     list_claims,
 )
 from pipeline.resource_paths import runtime_asset_path
+from pipeline.web.security import install_security
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
 app.secret_key = os.getenv("CHEM_SESSION_SECRET") or os.urandom(32)
+install_security(app, lambda: _current_user(), lambda: _admin_is_unlocked(),
+                 runtime_asset_path("auth", "device_credentials.json"))
 init_store()
 init_claim_store()
 
@@ -81,6 +85,7 @@ _DEMO_VIDEO_EXPERIMENTS = {
 }
 _ALLOWED_DEMO_VIDEO_SUFFIXES = {".mp4"}
 _ALLOWED_RECORD_SUFFIXES = {".mp4", ".wav", ".m4a", ".aac", ".mp3"}
+_AUDIO_RECORD_SUFFIXES = {".wav", ".m4a", ".aac", ".mp3"}
 _ALLOWED_PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png"}
 _TEACHER_SPEAKER_THRESHOLD = 0.5
 _TEACHER_SPEAKER_MIN_SPEECH_MS = 200
@@ -105,8 +110,10 @@ _common_issue_lock = Lock()
 _common_issue_submitted: set[str] = set()
 _daily_course_lock = Lock()
 _daily_course_submitted: set[str] = set()
+_workspace_report_lock = Lock()
+_workspace_report_submitted: set[str] = set()
 
-_GLASS_NUMBERS = tuple(f"{number:02d}" for number in range(1, 9))
+_GLASS_NUMBERS = tuple(f"{number:02d}" for number in range(1, 13))
 _LEGACY_GLASS_LABELS = {
     "一号": "01",
     "二号": "02",
@@ -116,14 +123,18 @@ _LEGACY_GLASS_LABELS = {
     "六号": "06",
     "七号": "07",
     "八号": "08",
+    "九号": "09",
+    "十号": "10",
+    "十一号": "11",
+    "十二号": "12",
 }
 
 TEST_IDENTITIES = {
     "jia": {
         "identity_id": "demo-jia",
         "name": "测试甲",
-        "initial_role": None,
-        "description": "首次登录：需要选择学生或教师",
+        "initial_role": "student",
+        "description": "测试学生甲",
     },
     "yi": {
         "identity_id": "demo-yi",
@@ -134,8 +145,8 @@ TEST_IDENTITIES = {
     "bing": {
         "identity_id": "demo-bing",
         "name": "测试丙",
-        "initial_role": None,
-        "description": "首次登录：可选择教师验证注册流程",
+        "initial_role": "teacher",
+        "description": "测试教师丙",
     },
     "ding": {
         "identity_id": "demo-ding",
@@ -187,7 +198,7 @@ def _save_glass_calibration(glass_number: str, device_id: str | None) -> dict[st
     """Keep the display mapping and claim calibration in sync."""
     glass_number = _normalize_glass_number(glass_number)
     if not glass_number:
-        raise ValueError("眼镜编号必须是 01 到 08")
+        raise ValueError("眼镜编号必须是 01 到 12")
     clean_device_id = (device_id or "").strip() or None
 
     glass = calibrate_glass(glass_number, clean_device_id)
@@ -304,6 +315,81 @@ def _daily_course_report_path(report_id: str) -> Path | None:
 def _daily_course_markdown_path(report_id: str) -> Path | None:
     path = _daily_course_report_path(report_id)
     return path.with_suffix(".md") if path else None
+
+
+def _scoped_course_root() -> Path:
+    return runtime_asset_path("derived", "scoped_courses")
+
+
+def _workspace_report_job_root() -> Path:
+    return _scoped_course_root() / "jobs"
+
+
+def _workspace_report_path(report_id: str, kind: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", report_id or ""):
+        return None
+    root = _common_issue_root() if kind == "common_issues" else _scoped_course_root()
+    return root / f"{report_id}.json"
+
+
+def _find_workspace_report_path(report_id: str) -> Path | None:
+    for kind in ("course", "common_issues"):
+        path = _workspace_report_path(report_id, kind)
+        if path and path.exists():
+            return path
+    legacy = _daily_course_report_path(report_id)
+    return legacy if legacy and legacy.exists() else None
+
+
+def _workspace_report_markdown_path(report_id: str, kind: str) -> Path | None:
+    path = _workspace_report_path(report_id, kind)
+    return path.with_suffix(".md") if path else None
+
+
+def _write_workspace_report_markdown(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kind = str(report.get("kind", "course"))
+    title = str(report.get("title") or ("共性问题与指导建议" if kind == "common_issues" else "课程内容整理"))
+    filters = report.get("filters") if isinstance(report.get("filters"), dict) else {}
+    lines = [
+        f"# {title}",
+        "",
+        f"- 日期范围：{filters.get('start_date', report.get('date', ''))} 至 {filters.get('end_date', report.get('date', ''))}",
+        f"- 实验：{filters.get('experiment_type') or '全部'}",
+        f"- 眼镜编号：{filters.get('glass_number') or '全部'}",
+        f"- 有效转写：{report.get('transcript_count', 0)} 条",
+        f"- 模型：{report.get('model', '')}",
+        f"- 生成时间：{report.get('generated_at', '')}",
+        "",
+    ]
+    warnings = [str(item).strip() for item in report.get("warnings", []) if str(item).strip()]
+    if warnings:
+        lines.extend(["## 提示", "", *[f"- {item}" for item in warnings], ""])
+    if kind == "common_issues":
+        lines.extend(["## 共性问题", ""])
+        issues = report.get("common_issues") if isinstance(report.get("common_issues"), list) else []
+        if not issues:
+            lines.append("暂无可归纳的共性问题。")
+        for index, issue in enumerate(issues, 1):
+            lines.extend([
+                f"### {index}. {issue.get('problem', '未命名问题')}",
+                "",
+                str(issue.get("guidance", "")).strip() or "暂无建议。",
+                "",
+            ])
+    else:
+        highlights = report.get("highlights") if isinstance(report.get("highlights"), list) else []
+        if highlights:
+            lines.extend(["## 课程重点", "", *[f"- {item}" for item in highlights], ""])
+        lines.extend(["## 课程内容", "", str(report.get("course_content", "")).strip() or "暂无课程内容。", ""])
+    lines.extend(["## 来源记录", ""])
+    for item in report.get("source_records", []):
+        lines.append(
+            f"- {item.get('record_id', '')}｜{item.get('created_at', '')}｜"
+            f"眼镜 {item.get('glass_number', '') or '未提供'}｜"
+            f"{item.get('experiment_type', '') or '未标记实验'}｜{item.get('status', '')}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_daily_course_markdown(path: Path, report: dict[str, Any]) -> None:
@@ -601,6 +687,93 @@ def _run_daily_course_job(job_path: Path) -> None:
             _daily_course_submitted.discard(str(job_path.resolve()))
 
 
+def _schedule_workspace_report_job(job_path: Path) -> None:
+    key = str(job_path.resolve())
+    with _workspace_report_lock:
+        if key in _workspace_report_submitted:
+            return
+        _workspace_report_submitted.add(key)
+    _glasses_executor.submit(_run_workspace_report_job, job_path)
+
+
+def _recover_workspace_report_jobs() -> None:
+    root = _workspace_report_job_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for job_path in root.glob("*.json"):
+        job = _read_common_issue_json(job_path)
+        if not job or job.get("status") not in {"queued", "running"}:
+            continue
+        if job.get("status") == "running":
+            job["status"] = "queued"
+            job["updated_at"] = _common_issue_now()
+            _write_common_issue_json(job_path, job)
+        _schedule_workspace_report_job(job_path)
+
+
+def _run_workspace_report_job(job_path: Path) -> None:
+    from pipeline.derived_analysis import generate_common_issues, generate_daily_course
+
+    job = _read_common_issue_json(job_path)
+    if not job:
+        return
+    report_path = Path(str(job["report_path"]))
+    report = _read_common_issue_json(report_path) or {}
+    job["status"] = "running"
+    job["updated_at"] = _common_issue_now()
+    report.update({"status": "running", "updated_at": job["updated_at"]})
+    _write_common_issue_json(job_path, job)
+    _write_common_issue_json(report_path, report)
+    try:
+        if job["kind"] == "common_issues":
+            result = generate_common_issues(
+                job["experiment"],
+                job["transcripts"],
+                provider=job.get("provider"),
+                model=job.get("model"),
+            )
+            report.update({
+                "title": "共性问题与指导建议",
+                "common_issues": result["common_issues"],
+                "provider": result["provider"],
+                "model": result["model"],
+                "warnings": ([] if result["common_issues"] else ["未发现至少出现在两条记录中的重复问题。"]),
+            })
+        else:
+            result = generate_daily_course(
+                f"{job['filters']['start_date']} 至 {job['filters']['end_date']}",
+                job["transcripts"],
+                experiment_contexts=job.get("experiment_contexts", []),
+                provider=job.get("provider"),
+                model=job.get("model"),
+            )
+            report.update({
+                "title": result["title"],
+                "course_content": result["course_content"],
+                "highlights": result["highlights"],
+                "provider": result["provider"],
+                "model": result["model"],
+            })
+        report.update({"status": "succeeded", "generated_at": _common_issue_now()})
+        _write_common_issue_json(report_path, report)
+        markdown_path = _workspace_report_markdown_path(job["report_id"], job["kind"])
+        if markdown_path:
+            _write_workspace_report_markdown(markdown_path, report)
+        job.update({"status": "succeeded", "updated_at": report["generated_at"]})
+    except Exception as exc:
+        error = str(exc)[:1000]
+        report.update({
+            "status": "failed",
+            "warnings": [*report.get("warnings", []), error],
+            "generated_at": _common_issue_now(),
+        })
+        _write_common_issue_json(report_path, report)
+        job.update({"status": "failed", "error": error, "updated_at": report["generated_at"]})
+    finally:
+        _write_common_issue_json(job_path, job)
+        with _workspace_report_lock:
+            _workspace_report_submitted.discard(str(job_path.resolve()))
+
+
 def _list_daily_course_reports(date_text: str = "") -> list[dict[str, Any]]:
     root = _daily_course_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -655,6 +828,17 @@ def _admin_is_unlocked() -> bool:
 def _admin_required():
     if not _admin_is_unlocked():
         return jsonify({"error": "admin login required"}), 401
+    return None
+
+
+def _teacher_or_admin_required():
+    if _admin_is_unlocked():
+        return None
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先登录"}), 401
+    if user.get("role") != "teacher":
+        return jsonify({"error": "只有教师或管理员可以查看学生资料"}), 403
     return None
 
 
@@ -882,6 +1066,11 @@ def _pending_claim_groups(source_role: str) -> tuple[list[dict[str, Any]], int]:
 def index():
     if request.args.get("token", "").strip():
         return pku_callback()
+    return redirect(url_for("login_page"))
+
+
+@app.get("/pipeline")
+def pipeline_index():
     return render_template("index.html")
 
 
@@ -915,13 +1104,17 @@ def _masked_identity_for_page(identity_id: str) -> str:
 
 def _begin_user_session(user: dict[str, Any], identity_display: str) -> str:
     _clear_user_session()
-    if user.get("role") in {"student", "teacher"}:
-        session["identity_id"] = user["identity_id"]
-        session["role"] = user["role"]
-        return url_for("workspace_index")
-    session["pku_pending_identity_id"] = user["identity_id"]
-    session["pku_pending_identity_display"] = identity_display
-    return url_for("onboarding_page")
+    session.pop("admin_unlocked", None)
+    role = str(user.get("role") or "teacher")
+    session["identity_id"] = user["identity_id"]
+    session["role"] = role if role in {"student", "teacher"} else "teacher"
+    return url_for("workspace_index")
+
+
+def _role_from_portal_profile(profile: dict[str, Any]) -> str:
+    identity_type = str(profile.get("identityType", "")).strip()
+    detail_type = str(profile.get("detailType", "")).strip()
+    return "student" if "学生" in identity_type or "学生" in detail_type else "teacher"
 
 
 def pku_callback():
@@ -935,7 +1128,7 @@ def pku_callback():
         str(token),
         client_ip(
             remote_addr=request.remote_addr,
-            x_real_ip=request.headers.get("X-Real-IP"),
+            x_real_ip=None,  # remote_addr is normalized only by the trusted proxy middleware.
         ),
     )
     if not result.get("ok"):
@@ -943,16 +1136,18 @@ def pku_callback():
             return jsonify({"ok": False, "error": result.get("error", "北大认证失败")}), 400
         return render_template("pku_callback.html", **result)
 
+    profile = result.get("user_info") if isinstance(result.get("user_info"), dict) else {}
     user = upsert_user(
         str(result["identity_id"]),
-        profile=result.get("user_info") if isinstance(result.get("user_info"), dict) else None,
+        profile=profile,
+        portal_role=_role_from_portal_profile(profile),
     )
     next_url = _begin_user_session(user, str(result.get("identity_display") or "***"))
     if request.is_json:
         return jsonify({
             "ok": True,
             "next_url": next_url,
-            "needs_role": user.get("role") not in {"student", "teacher"},
+            "needs_role": False,
         })
     return redirect(next_url)
 
@@ -964,50 +1159,26 @@ def pku_callback_route():
 
 @app.get("/onboarding")
 def onboarding_page():
-    identity_id = str(session.get("pku_pending_identity_id", "")).strip()
-    if not identity_id:
-        if _current_user() is not None:
-            return redirect(url_for("workspace_index"))
-        return redirect(url_for("login_page"))
-    return render_template(
-        "onboarding.html",
-        identity_display=session.get("pku_pending_identity_display", "***"),
-    )
+    if _current_user() is not None or _admin_is_unlocked():
+        return redirect(url_for("workspace_index"))
+    return redirect(url_for("login_page"))
 
 
 @app.post("/auth/role")
 def complete_role_registration():
-    payload = request.get_json(silent=True) or {}
-    role = str(payload.get("role") or request.form.get("role", "")).strip()
-    identity_id = str(session.get("pku_pending_identity_id", "")).strip()
-    if role not in {"student", "teacher"}:
-        return jsonify({"error": "role must be student or teacher"}), 400
-    if not identity_id:
-        return jsonify({"error": "请先完成北大门户认证"}), 400
-    user = upsert_user(identity_id, role=role)
-    session["identity_id"] = user["identity_id"]
-    session["role"] = user["role"]
-    session.pop("pku_pending_identity_id", None)
-    session.pop("pku_pending_identity_display", None)
-    next_url = url_for("workspace_index")
-    if request.is_json:
-        return jsonify({"ok": True, "next_url": next_url, "user": user})
-    return redirect(next_url)
+    message = {"error": "角色由北大门户自动判断；如需调整，请联系管理员。"}
+    return jsonify(message), 410
 
 
 @app.get("/workspace")
 def workspace_index():
     user = _current_user()
-    if user is None:
-        if session.get("pku_pending_identity_id"):
-            return redirect(url_for("onboarding_page"))
+    if user is None and not _admin_is_unlocked():
         return redirect(url_for("login_page"))
-    if user.get("role") not in {"student", "teacher"}:
-        session["pku_pending_identity_id"] = user["identity_id"]
-        session["pku_pending_identity_display"] = _masked_identity_for_page(user["identity_id"])
-        session.pop("identity_id", None)
-        session.pop("role", None)
-        return redirect(url_for("onboarding_page"))
+    if user is not None and user.get("role") not in {"student", "teacher"}:
+        profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+        user = upsert_user(user["identity_id"], portal_role=_role_from_portal_profile(profile))
+        session["role"] = user["role"]
     return render_template(
         "workspace.html",
         user=user,
@@ -1048,8 +1219,9 @@ def admin_login():
         return jsonify({"error": "服务端尚未配置 CHEM_ADMIN_PASSWORD"}), 503
     if password != configured_password:
         return jsonify({"error": "管理员密码不正确"}), 401
+    _clear_user_session()
     session["admin_unlocked"] = True
-    return redirect(url_for("admin_index"))
+    return redirect(url_for("workspace_index") + "#admin")
 
 
 @app.post("/auth/logout")
@@ -1061,18 +1233,14 @@ def auth_logout():
 @app.post("/auth/admin/logout")
 def admin_logout():
     session.pop("admin_unlocked", None)
-    return redirect(url_for("admin_index"))
+    return redirect(url_for("login_page"))
 
 
 @app.get("/admin")
 def admin_index():
     if not _admin_is_unlocked():
-        return render_template("admin_login.html")
-    return render_template(
-        "admin.html",
-        portal_title="化学实验资源管理",
-        record_api_prefix="/admin/api",
-    )
+        return redirect(url_for("login_page") + "#admin")
+    return redirect(url_for("workspace_index") + "#admin")
 
 
 def _test_identity_user(key: str) -> dict[str, Any] | None:
@@ -1080,23 +1248,29 @@ def _test_identity_user(key: str) -> dict[str, Any] | None:
     if spec is None:
         return None
     existing = find_user(spec["identity_id"])
-    return upsert_user(
-        spec["identity_id"],
-        role=spec["initial_role"] if existing is None else None,
-        profile={
+    profile = {
             "identityId": spec["identity_id"],
             "name": spec["name"],
+            "identityType": "学生" if spec["initial_role"] == "student" else "职工",
             "source": "local-test",
             "testIdentity": True,
-        },
+        }
+    if existing is not None and existing.get("role_source") == "admin":
+        return upsert_user(spec["identity_id"], profile=profile)
+    return upsert_user(
+        spec["identity_id"],
+        role=spec["initial_role"],
+        profile=profile,
+        portal_role=spec["initial_role"],
+        role_source="test",
     )
 
 
 @app.get("/admin/users")
 def admin_users_page():
     if not _admin_is_unlocked():
-        return redirect(url_for("admin_index"))
-    return render_template("admin_users.html")
+        return redirect(url_for("login_page") + "#admin")
+    return redirect(url_for("workspace_index") + "#admin-identities")
 
 
 @app.get("/admin/api/auth/users")
@@ -1120,15 +1294,42 @@ def admin_reset_user_role(identity_id: str):
     return jsonify({"user": user})
 
 
+@app.put("/api/workspace/admin/users/<identity_id>/role")
+def workspace_admin_set_user_role(identity_id: str):
+    required = _admin_required()
+    if required:
+        return required
+    payload = request.get_json(silent=True) or {}
+    raw_role = payload.get("role")
+    role = None if raw_role in {None, "", "portal"} else str(raw_role).strip()
+    if role not in {None, "student", "teacher"}:
+        return jsonify({"error": "role 必须是 student、teacher 或 portal"}), 400
+    try:
+        user = set_user_role(identity_id, role)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if user is None:
+        return jsonify({"error": "身份不存在"}), 404
+    return jsonify({"user": user})
+
+
 @app.get("/admin/test-identities")
 def test_login_page():
     if not _admin_is_unlocked():
-        return redirect(url_for("admin_index"))
+        return redirect(url_for("login_page") + "#admin")
+    return redirect(url_for("workspace_index") + "#admin-tests")
+
+
+@app.get("/api/workspace/admin/test-identities")
+def workspace_admin_test_identities():
+    required = _admin_required()
+    if required:
+        return required
     identities = []
     for key, spec in TEST_IDENTITIES.items():
         user = _test_identity_user(key)
         identities.append({"key": key, **spec, "current_role": user.get("role") if user else None})
-    return render_template("test_login.html", identities=identities)
+    return jsonify({"identities": identities})
 
 
 @app.post("/admin/test-identities/<key>/login")
@@ -1185,8 +1386,8 @@ def claims_match():
         return jsonify({"error": "请先完成北大认证"}), 401
     payload = request.get_json(silent=True) or {}
     glass_number = str(payload.get("glass_number", "")).strip()
-    if glass_number not in {f"{number:02d}" for number in range(1, 9)}:
-        return jsonify({"error": "glass_number 必须是 01 到 08"}), 400
+    if glass_number not in _GLASS_NUMBERS:
+        return jsonify({"error": "glass_number 必须是 01 到 12"}), 400
     try:
         started_at = _parse_claim_time(payload.get("started_at"), "开始时间")
         ended_at = _parse_claim_time(payload.get("ended_at"), "结束时间")
@@ -1221,6 +1422,88 @@ def claims_pending():
     return jsonify({
         "groups": groups,
         "count": sum(group["count"] for group in groups),
+        "unmapped_count": unmapped_count,
+    })
+
+
+def _calendar_month(value: str) -> str:
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", text):
+        return datetime.now(_BEIJING_TZ).strftime("%Y-%m")
+    try:
+        datetime.strptime(f"{text}-01", "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("month 格式应为 YYYY-MM") from exc
+    return text
+
+
+def _calendar_claim_entries(identity_id: str, month: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for claim in list_claims(identity_id):
+        started_at = _candidate_datetime(
+            claim.get("started_at"),
+            fallback=datetime.min.replace(tzinfo=timezone.utc),
+        ).astimezone(_BEIJING_TZ)
+        if started_at.year < 2000 or started_at.strftime("%Y-%m") != month:
+            continue
+        ended_at = _candidate_datetime(
+            claim.get("ended_at"),
+            fallback=started_at.astimezone(timezone.utc),
+        ).astimezone(_BEIJING_TZ)
+        date_key, period = _claim_period(started_at.astimezone(timezone.utc))
+        items = claim.get("items") if isinstance(claim.get("items"), list) else []
+        entries.append({
+            "entry_id": f"claim:{claim.get('claim_id', '')}",
+            "status": "claimed",
+            "date": date_key,
+            "date_label": f"{started_at.month}月{started_at.day}日{period}",
+            "period": period,
+            "glass_number": str(claim.get("glass_number", "")),
+            "experiment_type": next(
+                (str(item.get("experiment_type", "")).strip() for item in items if item.get("experiment_type")),
+                "",
+            ),
+            "source_role": str(claim.get("role", "")),
+            "started_at": started_at.strftime("%Y-%m-%dT%H:%M"),
+            "ended_at": ended_at.strftime("%Y-%m-%dT%H:%M"),
+            "count": len(items),
+            "items": [{
+                "item_type": str(item.get("item_type", "")),
+                "experiment_type": str(item.get("experiment_type", "")),
+                "item_created_at": str(item.get("item_created_at", "")),
+            } for item in items if isinstance(item, dict)],
+        })
+    entries.sort(key=lambda item: item["started_at"])
+    return entries
+
+
+@app.get("/api/claims/calendar")
+def claims_calendar():
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先完成北大认证"}), 401
+    try:
+        month = _calendar_month(request.args.get("month", ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    pending, unmapped_count = _pending_claim_groups(str(user.get("role") or ""))
+    pending_entries = [
+        {
+            **group,
+            "entry_id": f"pending:{group['group_id']}",
+            "status": "pending",
+        }
+        for group in pending
+        if group.get("date", "").startswith(f"{month}-")
+    ]
+    claimed_entries = _calendar_claim_entries(str(user["identity_id"]), month)
+    entries = sorted(
+        [*pending_entries, *claimed_entries],
+        key=lambda item: (item.get("date", ""), item.get("started_at", "")),
+    )
+    return jsonify({
+        "month": month,
+        "entries": entries,
         "unmapped_count": unmapped_count,
     })
 
@@ -1349,14 +1632,323 @@ def workspace_data():
     return jsonify(payload)
 
 
+def _teacher_user_required() -> tuple[dict[str, Any] | None, Any | None]:
+    user = _current_user()
+    if user is None:
+        return None, (jsonify({"error": "请先完成身份登录"}), 401)
+    if user.get("role") != "teacher":
+        return None, (jsonify({"error": "只有教师可以使用该功能"}), 403)
+    return user, None
+
+
+def _parse_report_range(start_value: Any, end_value: Any) -> tuple[str, str, datetime, datetime]:
+    start_text = str(start_value or "").strip()
+    end_text = str(end_value or "").strip()
+    try:
+        start_day = datetime.strptime(start_text, "%Y-%m-%d").replace(tzinfo=_BEIJING_TZ)
+        end_day = datetime.strptime(end_text, "%Y-%m-%d").replace(tzinfo=_BEIJING_TZ)
+    except ValueError as exc:
+        raise ValueError("开始日期和结束日期必须是 YYYY-MM-DD") from exc
+    if end_day < start_day:
+        raise ValueError("结束日期不能早于开始日期")
+    if (end_day.date() - start_day.date()).days >= 31:
+        raise ValueError("一份报告最多覆盖 31 天")
+    range_end = end_day + timedelta(days=1) - timedelta(microseconds=1)
+    return start_text, end_text, start_day.astimezone(timezone.utc), range_end.astimezone(timezone.utc)
+
+
+def _analysis_transcript(analysis: dict[str, Any]) -> tuple[str, str]:
+    items = analysis.get("items") if isinstance(analysis, dict) else {}
+    if not isinstance(items, dict):
+        items = {}
+    pieces: list[str] = []
+    statuses: list[str] = []
+    for item in items.values():
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip()
+        if status:
+            statuses.append(status)
+        transcript = str(item.get("transcript", "")).strip()
+        if transcript:
+            pieces.append(transcript)
+    if pieces:
+        return "\n".join(pieces), "succeeded"
+    if "running" in statuses or "queued" in statuses:
+        return "", "pending"
+    if "failed" in statuses:
+        return "", "failed"
+    return "", "missing"
+
+
+def _teacher_report_sources(
+    identity_id: str,
+    start_value: Any,
+    end_value: Any,
+    *,
+    experiment_type: str = "",
+    glass_number: str = "",
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    start_text, end_text, range_start, range_end = _parse_report_range(start_value, end_value)
+    experiment_type = str(experiment_type or "").strip()
+    glass_number = str(glass_number or "").strip()
+    if glass_number and glass_number not in _GLASS_NUMBERS:
+        raise ValueError("眼镜编号必须是 01 到 12")
+
+    claimed: dict[str, dict[str, Any]] = {}
+    for claim in list_claims(identity_id):
+        if claim.get("role") != "teacher":
+            continue
+        for item in claim.get("items", []):
+            if item.get("item_type") != "record" or item.get("source_role") != "teacher":
+                continue
+            claimed[str(item.get("item_id", ""))] = {
+                "claim_id": str(claim.get("claim_id", "")),
+                "glass_number": str(claim.get("glass_number", "")),
+            }
+
+    sources: list[dict[str, Any]] = []
+    for record in _list_records(_teacher_record_root(), "teacher_admin_download_record_file"):
+        record_id = str(record.get("record_id", ""))
+        claim = claimed.get(record_id)
+        if claim is None:
+            continue
+        if not any(Path(str(item.get("filename", ""))).suffix.lower() in _AUDIO_RECORD_SUFFIXES
+                   for item in record.get("files", [])):
+            continue
+        record_experiment = str(record.get("experiment_type", "")).strip()
+        if experiment_type and record_experiment != experiment_type:
+            continue
+        if glass_number and claim["glass_number"] != glass_number:
+            continue
+        created = _candidate_datetime(
+            record.get("started_at") or record.get("created_at"),
+            fallback=datetime.min.replace(tzinfo=timezone.utc),
+        )
+        if created < range_start or created > range_end:
+            continue
+        transcript, status = _analysis_transcript(record.get("analysis") or {})
+        sources.append({
+            "record_id": record_id,
+            "claim_id": claim["claim_id"],
+            "glass_number": claim["glass_number"],
+            "device_id": str(record.get("device_id", "")),
+            "experiment_type": record_experiment,
+            "created_at": str(record.get("created_at", "")),
+            "started_at": str(record.get("started_at", "")),
+            "ended_at": str(record.get("ended_at", "")),
+            "status": status,
+            "eligible": status == "succeeded",
+            "transcript": transcript,
+        })
+    sources.sort(key=lambda item: item.get("started_at") or item.get("created_at") or "")
+    return {
+        "start_date": start_text,
+        "end_date": end_text,
+        "experiment_type": experiment_type,
+        "glass_number": glass_number,
+    }, sources
+
+
+@app.get("/api/workspace/teacher/report-sources")
+def workspace_teacher_report_sources():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    try:
+        filters, sources = _teacher_report_sources(
+            str(user["identity_id"]),
+            request.args.get("start_date"),
+            request.args.get("end_date"),
+            experiment_type=request.args.get("experiment_type", ""),
+            glass_number=request.args.get("glass_number", ""),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    public_sources = [{key: value for key, value in item.items() if key != "transcript"} for item in sources]
+    return jsonify({"filters": filters, "sources": public_sources})
+
+
+@app.post("/api/workspace/teacher/reports")
+def workspace_teacher_create_report():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind", "course")).strip()
+    if kind not in {"course", "common_issues"}:
+        return jsonify({"error": "kind 必须是 course 或 common_issues"}), 400
+    experiment_type = str(payload.get("experiment_type", "")).strip()
+    if kind == "common_issues" and not experiment_type:
+        return jsonify({"error": "生成共性问题时必须选择实验"}), 400
+    cfg = get_experiment_config(experiment_type) if experiment_type else None
+    if experiment_type and cfg is None:
+        return jsonify({"error": "未知实验类型"}), 400
+    try:
+        filters, sources = _teacher_report_sources(
+            str(user["identity_id"]),
+            payload.get("start_date"),
+            payload.get("end_date"),
+            experiment_type=experiment_type,
+            glass_number=payload.get("glass_number", ""),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    requested_ids = payload.get("record_ids")
+    if requested_ids is not None and not isinstance(requested_ids, list):
+        return jsonify({"error": "record_ids 必须是数组"}), 400
+    source_map = {item["record_id"]: item for item in sources}
+    if requested_ids:
+        normalized_ids = list(dict.fromkeys(str(item).strip() for item in requested_ids if str(item).strip()))
+        unknown = [record_id for record_id in normalized_ids if record_id not in source_map]
+        if unknown:
+            return jsonify({"error": "包含不属于当前教师或筛选范围的记录", "record_ids": unknown}), 403
+        selected = [source_map[record_id] for record_id in normalized_ids]
+    else:
+        selected = sources
+    unavailable = [item["record_id"] for item in selected if not item["eligible"]]
+    if unavailable:
+        return jsonify({"error": "所选记录中有尚未完成转写的内容", "record_ids": unavailable}), 400
+    selected = [item for item in selected if item["eligible"]]
+
+    minimum = 2 if kind == "common_issues" else 1
+    now = _common_issue_now()
+    prefix = "issues" if kind == "common_issues" else "course"
+    report_id = f"range_{filters['start_date'].replace('-', '')}_{filters['end_date'].replace('-', '')}_{prefix}_{uuid.uuid4().hex[:8]}"
+    report_path = _workspace_report_path(report_id, kind)
+    if report_path is None:
+        return jsonify({"error": "无法创建报告 ID"}), 500
+    public_sources = [{key: value for key, value in item.items() if key != "transcript"} for item in selected]
+    report = {
+        "report_id": report_id,
+        "kind": kind,
+        "owner_identity_id": str(user["identity_id"]),
+        "filters": {**filters, "record_ids": [item["record_id"] for item in selected]},
+        "input_record_ids": [item["record_id"] for item in selected],
+        "record_count": len(selected),
+        "transcript_count": len(selected),
+        "source_records": public_sources,
+        "title": "共性问题与指导建议" if kind == "common_issues" else "课程内容整理",
+        "course_content": "",
+        "highlights": [],
+        "common_issues": [],
+        "warnings": [],
+        "status": "queued",
+        "generated_at": now,
+        "updated_at": now,
+    }
+    if len(selected) < minimum:
+        report["status"] = "insufficient_data"
+        report["warnings"] = [
+            "共性问题至少需要两条已完成转写的记录。"
+            if kind == "common_issues" else "所选范围没有可用于整理的已完成转写。"
+        ]
+        _write_common_issue_json(report_path, report)
+        markdown_path = _workspace_report_markdown_path(report_id, kind)
+        if markdown_path:
+            _write_workspace_report_markdown(markdown_path, report)
+        return jsonify({"report": report}), 200
+
+    transcripts = [{
+        "record_id": item["record_id"],
+        "created_at": item["created_at"],
+        "device_id": item["device_id"],
+        "experiment_type": item["experiment_type"],
+        "transcript": item["transcript"],
+    } for item in selected]
+    provider = os.getenv("MEDIA_ANALYSIS_PROVIDER", DEFAULT_VLM_PROVIDER).strip() or DEFAULT_VLM_PROVIDER
+    model = os.getenv("MEDIA_ANALYSIS_MODEL", DEFAULT_VLM_MODEL).strip() or DEFAULT_VLM_MODEL
+    experiment_contexts = []
+    seen_experiments: set[str] = set()
+    for item in transcripts:
+        item_experiment = item["experiment_type"]
+        if not item_experiment or item_experiment in seen_experiments:
+            continue
+        seen_experiments.add(item_experiment)
+        item_cfg = get_experiment_config(item_experiment) or {}
+        experiment_contexts.append({"id": item_experiment, "name": item_cfg.get("name", item_experiment)})
+    job = {
+        "job_id": report_id,
+        "report_id": report_id,
+        "report_path": str(report_path.resolve()),
+        "kind": kind,
+        "filters": filters,
+        "transcripts": transcripts,
+        "experiment": _common_issue_experiment_context(cfg or {}),
+        "experiment_contexts": experiment_contexts,
+        "provider": provider,
+        "model": model,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+    }
+    job_path = _workspace_report_job_root() / f"{report_id}.json"
+    _write_common_issue_json(job_path, job)
+    _write_common_issue_json(report_path, report)
+    _schedule_workspace_report_job(job_path)
+    return jsonify({"report": report}), 202
+
+
+def _workspace_report_visible(report: dict[str, Any], identity_id: str) -> bool:
+    owner = str(report.get("owner_identity_id", "")).strip()
+    return owner == identity_id or (not owner and bool(report.get("date")))
+
+
+@app.get("/api/workspace/teacher/reports")
+def workspace_teacher_reports():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    identity_id = str(user["identity_id"])
+    reports: list[dict[str, Any]] = []
+    for root in (_scoped_course_root(), _common_issue_root()):
+        root.mkdir(parents=True, exist_ok=True)
+        for path in root.glob("*.json"):
+            report = _read_common_issue_json(path)
+            if report and str(report.get("owner_identity_id", "")) == identity_id:
+                reports.append(report)
+    for legacy in _list_daily_course_reports():
+        reports.append({**legacy, "kind": "course", "legacy": True})
+    reports.sort(key=lambda item: item.get("generated_at", ""), reverse=True)
+    return jsonify({"reports": reports})
+
+
+@app.get("/api/workspace/teacher/reports/<report_id>")
+def workspace_teacher_report(report_id: str):
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    path = _find_workspace_report_path(report_id)
+    report = _read_common_issue_json(path) if path else None
+    if not report or not _workspace_report_visible(report, str(user["identity_id"])):
+        return jsonify({"error": "报告不存在"}), 404
+    return jsonify({"report": report})
+
+
+@app.get("/api/workspace/teacher/reports/<report_id>/download")
+def workspace_teacher_report_download(report_id: str):
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    path = _find_workspace_report_path(report_id)
+    report = _read_common_issue_json(path) if path else None
+    if not report or not _workspace_report_visible(report, str(user["identity_id"])):
+        return jsonify({"error": "报告不存在"}), 404
+    if report.get("legacy") or (not report.get("owner_identity_id") and report.get("date")):
+        markdown_path = _daily_course_markdown_path(report_id)
+    else:
+        markdown_path = _workspace_report_markdown_path(report_id, str(report.get("kind", "course")))
+    if markdown_path is None or not markdown_path.exists():
+        return jsonify({"error": "报告文件不存在"}), 404
+    return send_file(markdown_path, as_attachment=True, download_name=markdown_path.name)
+
+
 @app.get("/teacher-admin")
 def teacher_admin_index():
-    return render_template(
-        "admin.html",
-        portal_title="化学实验教师资源管理",
-        record_api_prefix="/teacher-admin/api",
-        teacher_portal=True,
-    )
+    if _current_user() is None and not _admin_is_unlocked():
+        return redirect(url_for("login_page"))
+    return redirect(url_for("workspace_index") + "#teacher-tools")
 
 
 @app.get("/teacher-admin/api/devices")
@@ -1366,6 +1958,9 @@ def teacher_admin_devices():
 
 @app.put("/teacher-admin/api/devices/<device_id>")
 def teacher_admin_update_device(device_id: str):
+    required = _admin_required()
+    if required:
+        return required
     device_id = _safe_text_field(device_id, "")
     if not device_id:
         return jsonify({"error": "invalid device_id"}), 400
@@ -1373,7 +1968,7 @@ def teacher_admin_update_device(device_id: str):
     raw_label = str(payload.get("label", "")).strip()
     label = _normalize_glass_number(raw_label)
     if raw_label and not label:
-        return jsonify({"error": "眼镜编号必须是 01 到 08"}), 400
+        return jsonify({"error": "眼镜编号必须是 01 到 12"}), 400
     if label:
         _save_glass_calibration(label, device_id)
     else:
@@ -1584,6 +2179,7 @@ def start_media_analysis_queue():
     _media_analysis_queue.start()
     _recover_common_issue_jobs()
     _recover_daily_course_jobs()
+    _recover_workspace_report_jobs()
 
 
 @app.get("/experiment-lab")
@@ -1905,11 +2501,17 @@ def _store_uploaded_record(record_root: Path, *, record_role: str):
 
 @app.get("/admin/api/records")
 def admin_records():
+    required = _teacher_or_admin_required()
+    if required:
+        return required
     return jsonify({"records": _list_records(_record_root(), "admin_download_record_file")})
 
 
 @app.get("/admin/api/records/<record_id>/files/<filename>")
 def admin_download_record_file(record_id: str, filename: str):
+    required = _teacher_or_admin_required()
+    if required:
+        return required
     record_dir = _resolve_record_dir(_record_root(), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
@@ -1928,6 +2530,9 @@ def admin_download_record_file(record_id: str, filename: str):
 
 @app.delete("/admin/api/records/<record_id>")
 def admin_delete_record(record_id: str):
+    required = _admin_required()
+    if required:
+        return required
     record_dir = _resolve_record_dir(_record_root(), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
@@ -1940,11 +2545,35 @@ def admin_delete_record(record_id: str):
 
 @app.get("/teacher-admin/api/records")
 def teacher_admin_records():
-    return jsonify({"records": _list_records(_teacher_record_root(), "teacher_admin_download_record_file")})
+    if not _admin_is_unlocked():
+        user, error = _teacher_user_required()
+        if error:
+            return error
+        identity_id = str(user["identity_id"])
+        owners = claim_item_owners()
+        records = [
+            item for item in _list_records(_teacher_record_root(), "teacher_admin_download_record_file")
+            if (owners.get(("record", "teacher", str(item.get("record_id", "")))) or {}).get("identity_id") == identity_id
+        ]
+    else:
+        records = _list_records(_teacher_record_root(), "teacher_admin_download_record_file")
+    return jsonify({"records": records})
+
+
+def _teacher_media_access_allowed(item_type: str, item_id: str) -> bool:
+    if _admin_is_unlocked():
+        return True
+    user = _current_user()
+    if user is None or user.get("role") != "teacher":
+        return False
+    owner = claim_item_owners().get((item_type, "teacher", item_id)) or {}
+    return owner.get("identity_id") == user.get("identity_id")
 
 
 @app.get("/teacher-admin/api/records/<record_id>/files/<filename>")
 def teacher_admin_download_record_file(record_id: str, filename: str):
+    if not _teacher_media_access_allowed("record", record_id):
+        return jsonify({"error": "无权访问该记录"}), 403
     record_dir = _resolve_record_dir(_teacher_record_root(), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
@@ -1963,6 +2592,8 @@ def teacher_admin_download_record_file(record_id: str, filename: str):
 
 @app.delete("/teacher-admin/api/records/<record_id>")
 def teacher_admin_delete_record(record_id: str):
+    if not _teacher_media_access_allowed("record", record_id):
+        return jsonify({"error": "无权删除该记录"}), 403
     record_dir = _resolve_record_dir(_teacher_record_root(), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
@@ -2028,11 +2659,17 @@ def _store_uploaded_photo(photo_root: Path, *, record_role: str):
 
 @app.get("/admin/api/photos")
 def admin_photos():
+    required = _teacher_or_admin_required()
+    if required:
+        return required
     return jsonify({"photos": _list_photos(_photo_root(), "admin_photo_file")})
 
 
 @app.get("/admin/api/photos/<photo_id>/file")
 def admin_photo_file(photo_id: str):
+    required = _teacher_or_admin_required()
+    if required:
+        return required
     photo_dir = _resolve_photo_dir(_photo_root(), photo_id)
     if photo_dir is None:
         return jsonify({"error": "photo not found"}), 404
@@ -2056,6 +2693,9 @@ def admin_photo_file(photo_id: str):
 
 @app.delete("/admin/api/photos/<photo_id>")
 def admin_delete_photo(photo_id: str):
+    required = _admin_required()
+    if required:
+        return required
     photo_dir = _resolve_photo_dir(_photo_root(), photo_id)
     if photo_dir is None:
         return jsonify({"error": "photo not found"}), 404
@@ -2068,16 +2708,32 @@ def admin_delete_photo(photo_id: str):
 
 @app.get("/teacher-admin/api/photos")
 def teacher_admin_photos():
-    return jsonify({"photos": _list_photos(_teacher_photo_root(), "teacher_admin_photo_file")})
+    if not _admin_is_unlocked():
+        user, error = _teacher_user_required()
+        if error:
+            return error
+        identity_id = str(user["identity_id"])
+        owners = claim_item_owners()
+        photos = [
+            item for item in _list_photos(_teacher_photo_root(), "teacher_admin_photo_file")
+            if (owners.get(("photo", "teacher", str(item.get("photo_id", "")))) or {}).get("identity_id") == identity_id
+        ]
+    else:
+        photos = _list_photos(_teacher_photo_root(), "teacher_admin_photo_file")
+    return jsonify({"photos": photos})
 
 
 @app.get("/teacher-admin/api/photos/<photo_id>/file")
 def teacher_admin_photo_file(photo_id: str):
+    if not _teacher_media_access_allowed("photo", photo_id):
+        return jsonify({"error": "无权访问该照片"}), 403
     return _send_photo_file(_teacher_photo_root(), photo_id)
 
 
 @app.delete("/teacher-admin/api/photos/<photo_id>")
 def teacher_admin_delete_photo(photo_id: str):
+    if not _teacher_media_access_allowed("photo", photo_id):
+        return jsonify({"error": "无权删除该照片"}), 403
     photo_dir = _resolve_photo_dir(_teacher_photo_root(), photo_id)
     if photo_dir is None:
         return jsonify({"error": "photo not found"}), 404

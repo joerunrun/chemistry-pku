@@ -65,5 +65,5 @@ def test_path_traversal_is_rejected(tmp_path: Path) -> None:
     archive = tmp_path / "code.zip"
     _write_zip(archive, {"../outside.txt": "bad"})
 
-    with pytest.raises(ValueError, match="不安全路径"):
+    with pytest.raises(ValueError, match="unsafe path"):
         deploy_archive(archive, target)

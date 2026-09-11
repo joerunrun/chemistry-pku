@@ -2,6 +2,8 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <script src="{{ url_for('static', filename='security.js') }}"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>北大认证</title>
   <style>

@@ -20,6 +20,8 @@ from omni_client import load_omni_config
 
 SUPPORTED_INTENTS = {
     "start_recording",
+    "start_audio_recording",
+    "start_video_recording",
     "stop_recording",
     "capture_photo",
     "experiment_check",
@@ -33,6 +35,8 @@ SUPPORTED_INTENTS = {
 }
 MAIN_INTENTS = {
     "start_recording",
+    "start_audio_recording",
+    "start_video_recording",
     "capture_photo",
     "experiment_check",
     "safety_check",
@@ -59,11 +63,31 @@ SUPPORTED_EXPERIMENTS = {
 }
 # select_experiment 只用于启动阶段的 experiment_setup 上下文；苏醒模式不切换实验。
 
-# 沉睡模式：精简 prompt，只检测唤醒词
-SLEEP_MODE_PROMPT = """你是唤醒词检测器。判断用户是否说了“小北助手”。
-只输出 JSON: {"wake": true, "transcript": "小北助手"} 或 {"wake": false, "transcript": "其他内容"}
-规则: 只要明确听到“小北助手”就返回 true；其它内容、环境噪声、听不清都返回 false。
+# 沉睡模式：检测用户是否正在呼叫或启动化小北助手。
+SLEEP_MODE_PROMPT = """你是“化小北”眼镜助手的唤醒检测器。请判断用户是否有意呼叫或启动小北助手。
+以下情况返回 wake=true：
+1. 用户说“小北助手”，包括“小北助手，开始工作”等带后续要求的说法；
+2. 音频或转写出现明显近音，例如“小贝助手”“晓北助手”“小北助守”；
+3. 用户用“小北”“化小北”或“助手”称呼系统，并表达“开始工作”“启动”“醒醒”“在吗”“帮个忙”等唤醒意图。
+不要要求逐字完全一致，应结合发音相似度和呼叫意图判断。
+旁人闲聊、偶然提到小北、只说“开始工作”但没有呼叫助手、环境噪声或无法判断时，返回 wake=false。
+只输出严格 JSON：{"wake": true/false, "transcript": "忠实转录的文字"}。
 """
+
+_WAKE_NEAR_SOUND_PATTERN = re.compile(r"(?:小|晓)[北贝倍备背][助住柱][手守首]")
+_WAKE_ADDRESSES = ("小北", "小贝", "晓北", "化小北", "小北助理", "助手")
+_WAKE_ACTIONS = (
+    "开始工作",
+    "开始服务",
+    "开始干活",
+    "启动",
+    "醒醒",
+    "在吗",
+    "听得到",
+    "帮个忙",
+    "帮帮我",
+    "来帮我",
+)
 
 # 苏醒模式：自然语言理解 → 分类到固定 action（不含 wake）
 AWAKE_MODE_PROMPT = """你是一个自然语言理解分类器。
@@ -71,7 +95,8 @@ AWAKE_MODE_PROMPT = """你是一个自然语言理解分类器。
 你的任务是**理解用户语义意图**，把它归类到下面某个 action。用户不会背诵固定口令，请根据含义判断，而不是字面匹配。
 
 可分类的 action（按语义场景）:
-- start_recording: 用户想记录、留存、保存当前的实验过程或画面，比如“把这一段录下来”“帮我存一下现在的过程”“我想留个档”“实验记录”。
+- start_audio_recording: 用户想只记录声音、口述实验现象或留存语音，比如“开始记录”“开始录音”“把我说的录下来”“我想留个语音档”。没有明确提到录像/视频时，默认选择这个动作。
+- start_video_recording: 用户明确想打开摄像头录像，比如“开始录像”“开始视频录制”“把画面录下来”。只有明确提到录像或视频时才选择这个动作。
 - capture_photo: 用户只想拍摄并保存一张照片，不要求分析，也不要求开始录像，比如“拍张照片”“帮我拍一下”“把现在这个画面拍下来”。
 - experiment_check: 用户对当前实验装置/操作有疑问，想检查装置对不对、纠错、纠正操作，比如“这样搭对吗”“装置好像不太对”“帮我看看有没有装错”“这里是不是不对”。
 - safety_check: 用户关心安全、担心隐患、想排查危险，比如“这样安全吗”“有没有什么问题”“会不会有问题”“检查一下安全”。
@@ -84,7 +109,8 @@ AWAKE_MODE_PROMPT = """你是一个自然语言理解分类器。
 2. 理解用户**当下想做的一件事**，归类到最贴近的 action。口语化、省略主语、近义词、比喻都应该正确归类，不要苛求字面。
 3. 无法映射到支持动作时统一输出 unclear，不要输出 unknown。
 4. 苏醒模式不负责停止记录、选择视频、停止视频，也不负责投影测试。
-5. 如果用户只说实验名称而没有表达其它需求，intent=unclear。
+5. “记录”或“录音”默认是纯录音；“录像”“视频”才是录像。不要把泛化的“记录”误判为录像。
+6. 如果用户只说实验名称而没有表达其它需求，intent=unclear。
 
 输出严格 JSON，不要 Markdown，不要解释:
 {
@@ -404,9 +430,15 @@ def _build_response_instruction(
 ) -> str:
     if is_sleep_mode:
         return (
-            "Wake-word detector. Only decide whether the audio clearly contains the Chinese wake phrase "
-            "'xiao bei zhu shou'. Output strict JSON: "
-            "{\"wake\": true/false, \"transcript\": \"recognized text\"}."
+            "Wake detector for the Chinese assistant named '化小北 / 小北助手' "
+            "(xiao bei zhu shou). Return wake=true when the user intentionally calls or activates "
+            "the assistant, including phrases such as '小北助手，开始工作', clear near-homophones "
+            "such as '小贝助手' or '晓北助手', or an assistant address combined with an activation "
+            "request such as start working, wake up, are you there, or help me. Judge pronunciation "
+            "and intent instead of requiring an exact transcript. Return wake=false for unrelated "
+            "conversation, incidental mentions, generic '开始工作' without addressing the assistant, "
+            "noise, or uncertain speech. Output strict JSON: "
+            "{\"wake\": true/false, \"transcript\": \"faithful recognized text\"}."
         )
 
     context_text = (context or "VOICE_IDLE").strip() or "VOICE_IDLE"
@@ -426,11 +458,12 @@ def _build_response_instruction(
 
     if context_text == "recording_stop_only":
         return (
-            "The glasses are currently recording an experiment. Your only task is to decide whether "
-            "the user wants to end or save the recording. Understand natural language generously: "
+            "The glasses are currently recording audio or video. Your only task is to decide whether "
+            "the user wants to end or save the current recording. Understand natural language generously: "
             "treat any expression of finishing/done/enough/stopping/saving as stop_recording, e.g. "
-            "end recording / stop recording / save recording / I'm done / that's enough / "
-            "可以了 / 差不多行了 / 先停一下 / 别录了 / 录好了 / 保存一下 / 结束吧. "
+            "end recording / stop recording / stop audio / stop video / save recording / I'm done / that's enough / "
+            "停止录音 / 结束录音 / 保存录音 / 停止录像 / 结束录像 / 保存录像 / 可以了 / 差不多行了 / "
+            "先停一下 / 别录了 / 录好了 / 保存一下 / 结束吧. "
             "Only return unclear for genuinely unrelated content (asking questions, discussing "
             "something else, environmental noise, or unrelated chitchat). "
             "Allowed intents: stop_recording or unclear. Output strict JSON with slots all null."
@@ -476,9 +509,15 @@ def _parse_wake_json(text: str, fallback_transcript: str) -> dict[str, Any]:
         wake = payload.get("wake")
         if isinstance(wake, bool):
             return {"wake": wake, "transcript": transcript}
-    # JSON 解析失败或格式不对，用关键词兜底
-    normalized = transcript.strip()
-    wake = "小北助手" in normalized
+    # JSON 解析失败或模型尚未返回时，用转录文本快速兜底。沉睡模式通常
+    # 在 ASR 完成后立即结束，以免云端生成延迟扩大眼镜的监听空窗。
+    normalized = re.sub(r"[\s，。！？、,.!?：:；;‘’'\"“”_-]+", "", transcript).lower()
+    near_sound = bool(_WAKE_NEAR_SOUND_PATTERN.search(normalized)) or "xiaobeizhushou" in normalized
+    addressed_activation = (
+        any(address in normalized for address in _WAKE_ADDRESSES)
+        and any(action in normalized for action in _WAKE_ACTIONS)
+    )
+    wake = near_sound or addressed_activation
     return {"wake": wake, "transcript": transcript}
 
 
@@ -583,7 +622,7 @@ def _fallback_from_transcript(
     if ctx == "recording_stop_only":
         if any(word in normalized for word in (
             "结束记录", "停止记录", "结束录像", "停止录像", "保存录像",
-            "录好了", "可以停了", "别录了", "先停一下", "结束吧",
+            "结束录音", "停止录音", "保存录音", "录好了", "可以停了", "别录了", "先停一下", "结束吧",
         )):
             return _safe_intent(normalized, "stop_recording", "结束记录。", 0.7)
         return _safe_intent(normalized, "unclear", "", 0.5)
@@ -646,8 +685,15 @@ def _fallback_from_transcript(
     lower = normalized.lower()
     if any(word in normalized for word in ("演示指引", "播放演示", "看演示", "看视频", "演示视频")):
         return _safe_intent(normalized, "demo_guide", "进入演示指引。", 0.7)
-    if any(word in normalized for word in ("开始记录", "开始录像", "开始录制")):
-        return _safe_intent(normalized, "start_recording", "开始记录。", 0.7)
+    if any(word in normalized for word in (
+        "开始录像", "开始视频", "录视频", "录像", "视频录制", "视频记录", "把画面录下来", "录下画面",
+    )):
+        return _safe_intent(normalized, "start_video_recording", "开始录像。", 0.7)
+    if any(word in normalized for word in (
+        "开始记录", "开始录音", "开始录制", "录音", "语音记录", "记录一下",
+        "录一下", "录一段", "录下来", "帮我记录", "留个记录",
+    )):
+        return _safe_intent(normalized, "start_audio_recording", "开始录音。", 0.7)
     if any(word in normalized for word in ("开始拍照", "拍一张", "拍照", "保存照片")):
         return _safe_intent(normalized, "capture_photo", "开始拍照。", 0.7)
     if "安全" in normalized:
@@ -786,6 +832,8 @@ def _coerce_video_index(value: Any) -> int | None:
 def _default_reply(intent: str, slots: dict[str, Any]) -> str:
     replies = {
         "start_recording": "开始记录。",
+        "start_audio_recording": "开始录音。",
+        "start_video_recording": "开始录像。",
         "stop_recording": "结束记录。",
         "capture_photo": "开始拍照。",
         "experiment_check": "开始实验纠错，请保持画面稳定。",

@@ -72,17 +72,19 @@ def build_daily_course_prompt(
     contexts = experiment_contexts or []
     context_text = json.dumps(contexts, ensure_ascii=False, indent=2)
     truncation_note = "部分转写因长度限制未全部送入模型。" if truncated else ""
-    return f"""你是化学实验课程整理助手。请把{date_text}当天多条、零散的教师/实验对话转写，整理成一份连贯、简洁、可阅读的课程内容转述。
+    scope_label = f"{date_text}期间" if " 至 " in date_text else f"{date_text}当天"
+    default_title = "时间段课程内容" if " 至 " in date_text else "当天课程内容"
+    return f"""你是化学实验课程整理助手。请把{scope_label}多条、零散的教师/实验对话转写，整理成一份连贯、简洁、可阅读的课程内容转述。
 
 实验信息仅用于理解名词和实验背景，不能据此断言对话中没有明确说出的操作或结论：
 {context_text}
 
-当天转写（按时间顺序）：
+所选范围转写（按时间顺序）：
 {chr(10).join(blocks)}
 
 整理要求：
 1. 不是逐条复制，也不是简单拼接；删除重复的唤醒词、拍照/录像等系统指令和无意义口头语。
-2. 保留当天明确讲到的实验原理、操作过程、现象、问题、教师解释和注意事项，并按课程推进顺序组织段落。
+2. 保留所选范围内明确讲到的实验原理、操作过程、现象、问题、教师解释和注意事项，并按课程推进顺序组织段落。
 3. 不要编造转写中没有出现的事实；不清楚的地方用“转写不清”或“记录未明确”表达。
 4. 不同实验或设备内容可以用简短小标题区分，但不要虚构课程内容。
 5. 输出一段连贯的中文课程转述，语言简洁，不要写成对话逐句记录；最多保留 8 个短段落。
@@ -90,7 +92,7 @@ def build_daily_course_prompt(
 {truncation_note}
 
 JSON格式：
-{{"title":"当天课程内容","course_content":"连贯的课程转述","highlights":["当天重点1","当天重点2"]}}"""
+{{"title":"{default_title}","course_content":"连贯的课程转述","highlights":["课程重点1","课程重点2"]}}"""
 
 
 def generate_daily_course(
@@ -125,4 +127,3 @@ def generate_daily_course(
         "provider": provider,
         "model": model,
     }
-

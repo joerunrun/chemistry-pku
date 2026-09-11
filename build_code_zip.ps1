@@ -12,13 +12,10 @@ if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) {
 }
 
 if (-not $OutputPath) {
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $OutputPath = Join-Path $projectRoot "code_deploy_$timestamp.zip"
+    $OutputPath = Join-Path $projectRoot "code_deploy.zip"
 }
 $absoluteOutput = [System.IO.Path]::GetFullPath($OutputPath)
-if (Test-Path -LiteralPath $absoluteOutput) {
-    throw "Output already exists; choose a new path: $absoluteOutput"
-}
+$temporaryOutput = "$absoluteOutput.tmp"
 
 $excludedDirectoryNames = @(
     ".git",
@@ -51,8 +48,11 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $outputParent = Split-Path -Parent $absoluteOutput
 New-Item -ItemType Directory -Force -Path $outputParent | Out-Null
+if (Test-Path -LiteralPath $temporaryOutput) {
+    Remove-Item -LiteralPath $temporaryOutput -Force
+}
 $archive = [System.IO.Compression.ZipFile]::Open(
-    $absoluteOutput,
+    $temporaryOutput,
     [System.IO.Compression.ZipArchiveMode]::Create
 )
 $count = 0
@@ -75,7 +75,7 @@ finally {
     $archive.Dispose()
 }
 
-$check = [System.IO.Compression.ZipFile]::OpenRead($absoluteOutput)
+$check = [System.IO.Compression.ZipFile]::OpenRead($temporaryOutput)
 try {
     $forbidden = @(
         $check.Entries |
@@ -91,6 +91,11 @@ try {
 finally {
     $check.Dispose()
 }
+
+if (Test-Path -LiteralPath $absoluteOutput) {
+    Remove-Item -LiteralPath $absoluteOutput -Force
+}
+Move-Item -LiteralPath $temporaryOutput -Destination $absoluteOutput
 
 $sizeMb = [math]::Round((Get-Item -LiteralPath $absoluteOutput).Length / 1MB, 2)
 Write-Host "Safe deployment archive created: $absoluteOutput"

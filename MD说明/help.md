@@ -139,3 +139,122 @@ D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SE
 D:\Android\SDK\platform-tools\adb.exe logcat -c
 D:\Android\SDK\platform-tools\adb.exe logcat | Select-String "Teacher|Recording|AndroidRuntime"
 ```
+
+## 8. 新眼镜接入校园网的完整流程
+
+下面以一副全新的 RayNeo ARGF20 为例。学生版和教师版包名不同，可以同时安装；WiFi 设置助手用于打开系统 WiFi 设置和内置校园网认证页面。当前眼镜编号范围为 01—12。
+
+### 8.1 用 USB 连接并确认硬件
+
+打开眼镜的 USB 调试，用数据线连接电脑，然后执行：
+
+```powershell
+D:\Android\SDK\platform-tools\adb.exe devices -l
+D:\Android\SDK\platform-tools\adb.exe shell settings get secure android_id
+```
+
+第一条命令应显示一台状态为 `device` 的 `RayNeoX3Pro / ARGF20`。第二条命令显示的是 ADB shell 读取到的 Android ID，仅用于辅助检查，不要直接拿它填写后台映射。
+
+后台实际使用的是 APK 上报的 `teacher_android_...`。最可靠的检查方法是让当前眼镜在本地模式拍摄并成功上传一张照片，然后在 PowerShell 中执行：
+
+```powershell
+$photo = Get-ChildItem D:\chemistry\chemistry_agent\chemistry\runtime_assets\teacher_photos -Filter photo.json -Recurse |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+(Get-Content $photo.FullName -Raw | ConvertFrom-Json).device_id
+```
+
+命令输出的 `teacher_android_...` 才是眼镜上传数据时携带的设备 ID，可用于后台眼镜编号校准。这条命令只读取最近一次成功保存到本地的教师照片，因此只代表最后上传的那副眼镜；如果本次上传失败，它会读到之前的旧照片。检查多副眼镜时，每次只操作一副，并在拍照成功后立即执行该命令。
+
+新版 APK 启动时会直接打印实际设备 ID。打开学生版或教师版 App 后执行：
+
+```powershell
+D:\Android\SDK\platform-tools\adb.exe logcat -d | Select-String "DeviceIdentity"
+```
+
+### 8.2 确认业务 App 使用校园网服务器
+
+打开：
+
+```text
+D:\Android\projects\app\src\main\res\values\glasses_config.xml
+```
+
+应保持：
+
+```xml
+<string name="glasses_connection_mode">network</string>
+<string name="glasses_service_base_url_network">http://162.105.209.134</string>
+```
+
+`network` 表示眼镜直接通过校园网访问服务器，不再依赖 USB 和 `adb reverse`。
+
+### 8.3 编译三个 APK
+
+先编译 WiFi 设置助手：
+
+```powershell
+cd D:\Android\WiFisetting
+$env:JAVA_HOME='D:\Android\studio\jbr'
+.\gradlew.bat :app:assembleDebug
+```
+
+再编译学生版和教师版：
+
+```powershell
+cd D:\Android\projects
+$env:JAVA_HOME='D:\Android\studio\jbr'
+.\gradlew.bat :app:assembleStudentDebug :app:assembleTeacherDebug
+```
+
+生成的 APK 分别是：
+
+```text
+D:\Android\WiFisetting\app\build\outputs\apk\debug\app-debug.apk
+D:\Android\projects\app\build\outputs\apk\student\debug\app-student-debug.apk
+D:\Android\projects\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
+```
+
+### 8.4 安装 WiFi 助手、学生版和教师版
+
+```powershell
+D:\Android\SDK\platform-tools\adb.exe install -r D:\Android\WiFisetting\app\build\outputs\apk\debug\app-debug.apk
+D:\Android\SDK\platform-tools\adb.exe install -r D:\Android\projects\app\build\outputs\apk\student\debug\app-student-debug.apk
+D:\Android\SDK\platform-tools\adb.exe install -r D:\Android\projects\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
+```
+
+三个命令都显示 `Success` 即安装完成。安装后眼镜应用列表中应出现“WiFi设置助手”“化学实验识别”和“教师实验助手”。
+
+### 8.5 连接 PKU 并由用户完成认证
+
+1. 戴上并解锁眼镜，进入“WiFi设置助手”。
+2. 选择“打开 WiFi 设置”，连接开放网络 `PKU`。
+3. 返回“WiFi设置助手”，选择“打开校园网认证”。
+4. 在内置认证页面中由实际用户输入自己的北大账号并完成认证；账号和密码不写入项目配置，也不由管理员预先填写。
+
+如果内置认证页面无法显示，可安装 `D:\rayneo-dev\browser.apk`，再从 WiFi 设置助手打开校园网认证页面。
+
+可用下面的命令检查无线连接：
+
+```powershell
+D:\Android\SDK\platform-tools\adb.exe shell cmd wifi status
+```
+
+出现 `Wifi is connected to "PKU"` 只表示已经连接无线接入点，并不等于完成门户认证。未认证时，访问服务器会被重定向到 `https://its.pku.edu.cn`；用户认证成功后才可正常访问课程助手服务器。
+
+### 8.6 在网页后台校准眼镜编号
+
+1. 确认服务器已经部署支持当前眼镜编号范围的代码。
+2. 让眼镜打开学生版或教师版并访问一次服务器，使后台发现它的稳定硬件编号。
+3. 管理员打开 `http://162.105.209.134/login`，点击管理员入口进入统一工作台。
+4. 在“眼镜编号校准”中找到新硬件，选择眼镜外壳所贴的 10 号并保存。
+
+编号只代表物理眼镜，不永久绑定学生或教师。学生和教师仍在下课后按实际使用时间认领数据。
+
+### 8.7 最终验收
+
+- 学生版能够进入课程助手并向 `http://162.105.209.134` 上传学生数据。
+- 教师版启动后能听到“助手就绪，请说指令”，并能上传教师录音、照片或录像。
+- 网页工作台能够按校准后的眼镜编号看到待认领数据。
+- 拔掉 USB 后仍能使用，说明当前运行的是校园网版本；如果只有插着 USB 才能工作，应重新检查 `glasses_connection_mode` 是否为 `network` 并重新编译安装。
