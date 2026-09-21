@@ -116,7 +116,7 @@ D:\Android\SDK\platform-tools\adb.exe reverse tcp:5080 tcp:5080
 4. 在 Android Studio 里点 Run，或命令行编译安装：
 
 ```powershell
-cd D:\Android\projects
+cd D:\chemistry\chemistry_agent\android\glasses-app
 $env:JAVA_HOME='D:\Android\studio\jbr'
 .\gradlew.bat :app:assembleDebug
 D:\Android\SDK\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app-debug.apk
@@ -135,7 +135,7 @@ http://127.0.0.1:5080
 最终给手机或眼镜安装时，使用这个 APK：
 
 ```text
-D:\Android\projects\app\build\outputs\apk\debug\app-debug.apk
+D:\chemistry\chemistry_agent\android\glasses-app\app\build\outputs\apk\debug\app-debug.apk
 ```
 
 如果目标设备不连 USB，只靠网络访问电脑服务，App 里的地址必须改成电脑的局域网 IP，例如：
@@ -156,11 +156,10 @@ http://电脑IPv4:5080
 
 
 如何无线 ？
-D:\Android\projects\app\src\main\res\values\glasses_config.xml  
+D:\chemistry\chemistry_agent\android\glasses-app\app\src\main\res\values\glasses_config.xml  
 
 <string name="glasses_service_base_url">http://172.20.10.2:5080</string>
 改成电脑ip
 
 
 D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SETTINGS
-

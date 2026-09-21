@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.MediaRecorder
 import android.os.Binder
 import android.os.Build
 import androidx.core.app.NotificationCompat
@@ -16,8 +17,10 @@ import java.io.File
 class RecordingService : LifecycleService() {
     companion object {
         const val ACTION_START_RECORDING = "com.example.zrgfirstapp.START_RECORDING"
+        const val ACTION_START_AUDIO_RECORDING = "com.example.zrgfirstapp.START_AUDIO_RECORDING"
         const val ACTION_START_CAPTURE_SESSION = "com.example.zrgfirstapp.START_CAPTURE_SESSION"
         const val ACTION_STOP_RECORDING = "com.example.zrgfirstapp.STOP_RECORDING"
+        const val ACTION_STOP_AUDIO_RECORDING = "com.example.zrgfirstapp.STOP_AUDIO_RECORDING"
         const val ACTION_START_TEACHER_SESSION = "com.example.zrgfirstapp.START_TEACHER_SESSION"
         const val ACTION_STOP_TEACHER_SESSION = "com.example.zrgfirstapp.STOP_TEACHER_SESSION"
         const val EXTRA_VIDEO_AUDIO_ENABLED = "com.example.zrgfirstapp.VIDEO_AUDIO_ENABLED"
@@ -34,6 +37,8 @@ class RecordingService : LifecycleService() {
     private var foregroundStarted = false
     private var teacherSessionActive = false
     private var lastStatus = "未记录"
+    private var audioRecorder: MediaRecorder? = null
+    private var audioRecordingFile: File? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -62,9 +67,14 @@ class RecordingService : LifecycleService() {
                 }
                 startRecording(audioEnabled)
             }
+            ACTION_START_AUDIO_RECORDING -> startAudioRecording()
             ACTION_START_CAPTURE_SESSION -> startCaptureSession()
             ACTION_STOP_RECORDING -> {
                 stopRecording()
+                if (!teacherSessionActive) stopSelf()
+            }
+            ACTION_STOP_AUDIO_RECORDING -> {
+                stopAudioRecording()
                 if (!teacherSessionActive) stopSelf()
             }
             ACTION_START_TEACHER_SESSION -> startTeacherSession()
@@ -78,6 +88,38 @@ class RecordingService : LifecycleService() {
         startAsForegroundIfNeeded(cameraAndMicrophoneForegroundType())
         lastStatus = "记录准备中"
         cameraSessionManager.startRecording()
+    }
+
+    @Suppress("DEPRECATION")
+    fun startAudioRecording() {
+        if (audioRecorder != null) return
+        startAsForegroundIfNeeded(microphoneForegroundType())
+        val file = File(cacheDir, "chem_audio_records/audio_${System.currentTimeMillis()}.m4a")
+        file.parentFile?.mkdirs()
+        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            MediaRecorder(this)
+        } else {
+            MediaRecorder()
+        }
+        try {
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            recorder.setAudioSamplingRate(16_000)
+            recorder.setAudioEncodingBitRate(64_000)
+            recorder.setOutputFile(file.absolutePath)
+            recorder.prepare()
+            recorder.start()
+            audioRecorder = recorder
+            audioRecordingFile = file
+            lastStatus = "录音中"
+            notifyStatus(lastStatus)
+        } catch (error: Exception) {
+            recorder.release()
+            file.delete()
+            lastStatus = "录音初始化失败"
+            notifyStatus(lastStatus)
+        }
     }
 
     fun startTeacherSession() {
@@ -123,6 +165,29 @@ class RecordingService : LifecycleService() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    fun stopAudioRecording(onStopped: ((List<File>) -> Unit)? = null) {
+        val recorder = audioRecorder
+        val file = audioRecordingFile
+        audioRecorder = null
+        audioRecordingFile = null
+        if (recorder != null) {
+            try {
+                recorder.stop()
+            } catch (_: RuntimeException) {
+                file?.delete()
+            }
+            recorder.release()
+        }
+        lastStatus = "未记录"
+        if (foregroundStarted && !teacherSessionActive) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundStarted = false
+        }
+        val files = if (file != null && file.isFile && file.length() > 0L) listOf(file) else emptyList()
+        onStopped?.invoke(files)
+    }
+
     fun captureStillImage(callback: (File?, Throwable?) -> Unit) {
         // Teacher listening starts as microphone-only. Promote the foreground
         // service before opening CameraX so a backgrounded Activity is still
@@ -141,7 +206,11 @@ class RecordingService : LifecycleService() {
         cameraSessionManager.captureStillImage(file, callback)
     }
 
-    fun recordingStatus(): String = cameraSessionManager.statusLabel.ifBlank { lastStatus }
+    fun recordingStatus(): String = if (audioRecorder != null) {
+        lastStatus
+    } else {
+        cameraSessionManager.statusLabel.ifBlank { lastStatus }
+    }
 
     fun getRecordedFiles(): List<File> = cameraSessionManager.getRecordedFiles()
 
@@ -166,8 +235,16 @@ class RecordingService : LifecycleService() {
 
     override fun onDestroy() {
         teacherSessionActive = false
+        stopAudioRecording()
         cameraSessionManager.shutdown()
         super.onDestroy()
+    }
+
+    private fun notifyStatus(status: String) {
+        if (foregroundStarted) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID, buildNotification(status))
+        }
     }
 
     private fun startAsForegroundIfNeeded(foregroundType: Int? = null) {

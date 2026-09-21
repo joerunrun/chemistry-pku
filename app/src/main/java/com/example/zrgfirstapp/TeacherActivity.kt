@@ -29,17 +29,17 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.ContextCompat.startForegroundService
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
-import kotlin.math.sqrt
 
 class TeacherActivity : AppCompatActivity() {
     private lateinit var gestureDetector: GestureDetector
@@ -53,18 +53,30 @@ class TeacherActivity : AppCompatActivity() {
     @Volatile private var continuousStopLatch: CountDownLatch? = null
     private var continuousFile: File? = null
     private var continuousTotalSamples = 0
-    private val ringBuffer = ByteArrayOutputStream()
-    private val ringLock = Any()
-    private val ringCapacityBytes = SAMPLE_RATE * 2 * 4 // 最近 4 秒 PCM
+    private val ringBuffer = PcmRingBuffer(SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * RING_SECONDS)
 
     // 唤醒/指令状态
     private enum class TeacherState { LISTENING, AWAKE, INSTRUCTION, RECORDING }
     private var teacherState = TeacherState.LISTENING
     private val operationToken = java.util.concurrent.atomic.AtomicInteger(0)
+    private val voiceEpoch = VoiceEpoch()
+    private val voiceRequestSequence = AtomicLong(0)
+    private val voiceWindowLimiter = LatestVoiceWindowLimiter(MAX_VOICE_REQUESTS)
+    private val voiceExecutor = Executors.newFixedThreadPool(MAX_VOICE_REQUESTS)
+    private val voiceConnections = mutableMapOf<Long, HttpURLConnection>()
+    private val voiceConnectionsLock = Any()
+    @Volatile private var voiceRecognitionPaused = false
     private var wakeCheckScheduled = false
     private var continuousRestartScheduled = false
     private var continuousRestartAttempts = 0
     private var videoRecordingActive = false
+    private var videoStartedAt: String? = null
+    private var awakeChoiceIndex = 0
+    private val awakeTimeoutRunnable = Runnable { handleAwakeTimeout() }
+    private val templeSingleTapRunnable = Runnable {
+        lastTempleKeyTapAt = 0L
+        handleTempleSingleTap()
+    }
 
     // 录像服务
     private var recordingService: RecordingService? = null
@@ -113,6 +125,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     private var lastTempleKeyTapAt = 0L
+    private var lastTempleTouchTapAt = 0L
     private var teacherConnectionReady = false
     private var teacherConnectionCheckInProgress = false
     private var teacherSessionStarted = false
@@ -120,6 +133,7 @@ class TeacherActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.i("DeviceIdentity", "hardware_id=$teacherDeviceId")
         // Keep the voice-only teacher page in the foreground on RayNeo. If
         // the display sleeps, LockScreenActivity takes input focus and the
         // temple double-tap never reaches this Activity.
@@ -135,11 +149,31 @@ class TeacherActivity : AppCompatActivity() {
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                if (!teacherConnectionReady) checkTeacherConnection()
+                lastTempleTouchTapAt = android.os.SystemClock.uptimeMillis()
+                mainHandler.removeCallbacks(templeSingleTapRunnable)
+                lastTempleKeyTapAt = 0L
+                handleTempleSingleTap()
                 return true
             }
             override fun onDoubleTap(e: MotionEvent): Boolean {
+                lastTempleTouchTapAt = android.os.SystemClock.uptimeMillis()
+                mainHandler.removeCallbacks(templeSingleTapRunnable)
+                lastTempleKeyTapAt = 0L
                 exitTeacherApp()
+                return true
+            }
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float,
+            ): Boolean {
+                if (e1 == null || teacherState != TeacherState.AWAKE) return false
+                val deltaX = e2.x - e1.x
+                if (kotlin.math.abs(deltaX) < SWIPE_THRESHOLD ||
+                    kotlin.math.abs(velocityX) < SWIPE_VELOCITY_THRESHOLD
+                ) return false
+                moveAwakeChoice(if (deltaX > 0) 1 else -1)
                 return true
             }
         })
@@ -162,6 +196,26 @@ class TeacherActivity : AppCompatActivity() {
             return true
         }
 
+        if (teacherState == TeacherState.AWAKE && event.keyCode in setOf(
+                KeyEvent.KEYCODE_DPAD_LEFT,
+                KeyEvent.KEYCODE_DPAD_UP,
+                KeyEvent.KEYCODE_PAGE_UP,
+            )
+        ) {
+            moveAwakeChoice(-1)
+            return true
+        }
+        if (teacherState == TeacherState.AWAKE && event.keyCode in setOf(
+                KeyEvent.KEYCODE_DPAD_RIGHT,
+                KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_PAGE_DOWN,
+                KeyEvent.KEYCODE_FORWARD,
+            )
+        ) {
+            moveAwakeChoice(1)
+            return true
+        }
+
         // RayNeo firmwares may expose temple taps as DPAD/ENTER or function keys.
         // Only a second tap within the normal double-tap window exits this voice-only page.
         if (event.keyCode in setOf(
@@ -179,10 +233,15 @@ class TeacherActivity : AppCompatActivity() {
             )
         ) {
             val now = android.os.SystemClock.uptimeMillis()
-            if (now - lastTempleKeyTapAt <= 500L) {
+            if (now - lastTempleTouchTapAt <= DOUBLE_TAP_WINDOW_MS) return true
+            if (now - lastTempleKeyTapAt <= DOUBLE_TAP_WINDOW_MS) {
+                mainHandler.removeCallbacks(templeSingleTapRunnable)
+                lastTempleKeyTapAt = 0L
                 exitTeacherApp()
             } else {
                 lastTempleKeyTapAt = now
+                mainHandler.removeCallbacks(templeSingleTapRunnable)
+                mainHandler.postDelayed(templeSingleTapRunnable, DOUBLE_TAP_WINDOW_MS)
             }
             return true
         }
@@ -196,17 +255,23 @@ class TeacherActivity : AppCompatActivity() {
     private fun exitTeacherApp() {
         if (teacherExitInProgress) return
         teacherExitInProgress = true
+        mainHandler.removeCallbacks(awakeTimeoutRunnable)
+        mainHandler.removeCallbacks(templeSingleTapRunnable)
+        advanceVoiceEpoch()
         operationToken.incrementAndGet()
         teacherState = TeacherState.INSTRUCTION
         val service = recordingService
         val hasActiveVideo = videoRecordingActive && service != null && serviceBound
+        val videoStartedAtForUpload = videoStartedAt
+        val videoEndedAtForUpload = UploadMetadata.nowIso()
         videoRecordingActive = false
+        videoStartedAt = null
 
         if (hasActiveVideo) {
             val completed = AtomicBoolean(false)
             fun finishVideoCleanup(files: List<File>) {
                 if (!completed.compareAndSet(false, true)) return
-                if (files.isNotEmpty()) uploadRecordFiles(files)
+                if (files.isNotEmpty()) uploadRecordFiles(files, videoStartedAtForUpload, videoEndedAtForUpload)
                 service.stopCaptureSessionIfIdle()
                 service.stopTeacherSession()
             }
@@ -256,6 +321,105 @@ class TeacherActivity : AppCompatActivity() {
                 visibility = View.VISIBLE
             }
         }
+    }
+
+    private fun handleTempleSingleTap() {
+        if (!teacherConnectionReady) {
+            checkTeacherConnection()
+            return
+        }
+        when (teacherState) {
+            TeacherState.LISTENING -> enterTeacherAwake()
+            TeacherState.AWAKE -> handleInstructionIntent(
+                org.json.JSONObject().put(
+                    "intent",
+                    if (awakeChoiceIndex == 0) "capture_photo" else "start_recording",
+                ),
+            )
+            TeacherState.RECORDING -> stopTeacherRecording()
+            TeacherState.INSTRUCTION -> Unit
+        }
+    }
+
+    private fun enterTeacherAwake(pendingIntent: String? = null) {
+        if (teacherExitInProgress || !teacherSessionStarted || teacherState != TeacherState.LISTENING) return
+        advanceVoiceEpoch()
+        val awakeToken = operationToken.incrementAndGet()
+        teacherState = TeacherState.AWAKE
+        awakeChoiceIndex = if (pendingIntent == "start_recording") 1 else 0
+        voiceRecognitionPaused = true
+        showAwakeChoices()
+        playPrompt("wake_response") {
+            if (teacherExitInProgress || teacherState != TeacherState.AWAKE ||
+                operationToken.get() != awakeToken
+            ) return@playPrompt
+            voiceRecognitionPaused = false
+            if (pendingIntent in setOf("capture_photo", "start_recording")) {
+                handleInstructionIntent(org.json.JSONObject().put("intent", pendingIntent))
+            } else {
+                refreshAwakeTimeout()
+                scheduleWakeCheck()
+            }
+        }
+    }
+
+    private fun showAwakeChoices() {
+        hideAllViews()
+        listOf(R.id.left_eye_panel, R.id.right_eye_panel).forEach { id ->
+            val panel = findViewById<View>(id) ?: return@forEach
+            panel.findViewById<android.widget.TextView>(R.id.title_text).apply {
+                text = "化小北"
+                visibility = View.VISIBLE
+            }
+            panel.findViewById<android.widget.TextView>(R.id.subtitle_text).apply {
+                text = "请选择功能"
+                visibility = View.VISIBLE
+            }
+            panel.findViewById<View>(R.id.options_row).visibility = View.VISIBLE
+            panel.findViewById<android.widget.Button>(R.id.primary_button).apply {
+                text = "拍照"
+                alpha = if (awakeChoiceIndex == 0) 1.0f else 0.62f
+                isSelected = awakeChoiceIndex == 0
+            }
+            panel.findViewById<android.widget.Button>(R.id.secondary_button).apply {
+                text = "录像"
+                alpha = if (awakeChoiceIndex == 1) 1.0f else 0.62f
+                isSelected = awakeChoiceIndex == 1
+            }
+            panel.findViewById<android.widget.TextView>(R.id.status_text).apply {
+                text = "左右滑动选择，单击确认；也可以直接说指令"
+                visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun moveAwakeChoice(delta: Int) {
+        if (teacherState != TeacherState.AWAKE) return
+        awakeChoiceIndex = if (delta == 0) awakeChoiceIndex else 1 - awakeChoiceIndex
+        showAwakeChoices()
+        refreshAwakeTimeout()
+    }
+
+    private fun refreshAwakeTimeout() {
+        mainHandler.removeCallbacks(awakeTimeoutRunnable)
+        if (teacherState == TeacherState.AWAKE) {
+            mainHandler.postDelayed(awakeTimeoutRunnable, AWAKE_TIMEOUT_MS)
+        }
+    }
+
+    private fun handleAwakeTimeout() {
+        if (teacherState != TeacherState.AWAKE || teacherExitInProgress) return
+        val timeoutToken = operationToken.incrementAndGet()
+        advanceVoiceEpoch()
+        voiceRecognitionPaused = true
+        hideAllViews()
+        teacherState = TeacherState.INSTRUCTION
+        playPrompt("unclear") { resumeListening(timeoutToken) }
+    }
+
+    private fun clearAwakeControls() {
+        mainHandler.removeCallbacks(awakeTimeoutRunnable)
+        hideAllViews()
     }
 
     private fun checkTeacherConnection() {
@@ -317,7 +481,7 @@ class TeacherActivity : AppCompatActivity() {
         }
     }
 
-    // ===== 单路持续录音：写 wav + 维护最近 4 秒环形缓冲 =====
+    // ===== 单路持续录音：写 wav + 维护最近 10 秒环形缓冲 =====
     @Suppress("MissingPermission")
     private fun startContinuousRecording() {
         if (teacherExitInProgress || continuousRunning) return
@@ -345,17 +509,16 @@ class TeacherActivity : AppCompatActivity() {
                 val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
                 val buffer = ShortArray(max(minBuf, 3200) / 2)
                 recorder.startRecording()
-                while (continuousRunning && teacherState != TeacherState.INSTRUCTION) {
+                while (continuousRunning) {
                     val file = File(cacheDir, "teacher_session_${System.currentTimeMillis()}.wav")
+                    val segmentStartedAt = UploadMetadata.nowIso()
                     continuousFile = file
                     continuousTotalSamples = 0
                     val segmentDeadline = System.currentTimeMillis() + CONTINUOUS_SEGMENT_MS
                     FileOutputStream(file).use { output ->
                         writeWavHeader(output, 0)
                         while (
-                            continuousRunning &&
-                            teacherState != TeacherState.INSTRUCTION &&
-                            System.currentTimeMillis() < segmentDeadline
+                            continuousRunning && System.currentTimeMillis() < segmentDeadline
                         ) {
                             val read = recorder.read(buffer, 0, buffer.size)
                             if (read > 0) {
@@ -366,7 +529,7 @@ class TeacherActivity : AppCompatActivity() {
                         }
                     }
                     rewriteWavHeader(file, continuousTotalSamples)
-                    if (file.length() > 44) uploadRecordFiles(listOf(file))
+                    if (file.length() > 44) uploadRecordFiles(listOf(file), segmentStartedAt, UploadMetadata.nowIso())
                 }
                 recorder.stop()
             } catch (exc: Exception) {
@@ -414,31 +577,17 @@ class TeacherActivity : AppCompatActivity() {
             bytes[i * 2] = (v and 0xff).toByte()
             bytes[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
         }
-        synchronized(ringLock) {
-            ringBuffer.write(bytes, 0, bytes.size)
-            val excess = ringBuffer.size() - ringCapacityBytes
-            if (excess > 0) {
-                val dropped = ringBuffer.toByteArray()
-                ringBuffer.reset()
-                ringBuffer.write(dropped, excess, dropped.size - excess)
-            }
-        }
+        ringBuffer.append(bytes)
     }
 
     private fun takeRingSnapshotSeconds(seconds: Int): ByteArray? {
-        val need = SAMPLE_RATE * 2 * seconds
-        synchronized(ringLock) {
-            val all = ringBuffer.toByteArray()
-            if (all.size < need) return null
-            return all.copyOfRange(all.size - need, all.size)
-        }
+        return ringBuffer.snapshot(SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * seconds)
     }
 
-    // ===== 唤醒/停止检测：每 3 秒取最近 3 秒 PCM 发服务端 =====
-    // LISTENING 状态检测唤醒词（sleep），RECORDING 状态检测停止录像（teacher_recording）
+    // ===== 无空档语音检测：每 2 秒取最近 5 秒 PCM，最多并发两个云端请求 =====
     private fun scheduleWakeCheck() {
         if (!continuousRunning) return
-        if (teacherState != TeacherState.LISTENING && teacherState != TeacherState.RECORDING) return
+        if (voiceContextForCurrentState() == null) return
         if (continuousRecorder == null) {
             continuousRunning = false
             startContinuousRecording()
@@ -448,69 +597,104 @@ class TeacherActivity : AppCompatActivity() {
         wakeCheckScheduled = true
         mainHandler.postDelayed({
             wakeCheckScheduled = false
-            if (teacherState != TeacherState.LISTENING && teacherState != TeacherState.RECORDING) return@postDelayed
-            val pcm = takeRingSnapshotSeconds(3) ?: run {
-                scheduleWakeCheck(); return@postDelayed
+            val context = voiceContextForCurrentState()
+            if (context == null || !continuousRunning) return@postDelayed
+            if (!voiceRecognitionPaused) {
+                val pcm = takeRingSnapshotSeconds(VOICE_WINDOW_SECONDS)
+                if (pcm != null && PcmAudioGate.hasMeaningfulAudio(pcm)) {
+                    enqueueVoiceWindow(pcm, context)
+                }
             }
-            val context = if (teacherState == TeacherState.RECORDING) "teacher_recording" else "sleep"
-            val file = File(cacheDir, "teacher_wake_${System.currentTimeMillis()}.pcm")
-            try { FileOutputStream(file).use { it.write(pcm) } } catch (_: Exception) {
-                scheduleWakeCheck(); return@postDelayed
-            }
-            submitVoiceIntent(file, context = context, isSleepMode = (context == "sleep"))
-        }, 3000L)
+            scheduleWakeCheck()
+        }, VOICE_WINDOW_STEP_MS)
     }
 
-    private fun submitVoiceIntent(file: File, context: String, isSleepMode: Boolean) {
-        val token = operationToken.incrementAndGet()
-        Thread {
+    private fun voiceContextForCurrentState(): String? = when (teacherState) {
+        TeacherState.LISTENING -> "teacher_sleep"
+        TeacherState.AWAKE -> "teacher_awake"
+        TeacherState.RECORDING -> "teacher_recording"
+        TeacherState.INSTRUCTION -> null
+    }
+
+    private fun enqueueVoiceWindow(pcm: ByteArray, context: String) {
+        val window = TeacherVoiceWindow(
+            epoch = voiceEpoch.current(),
+            sequence = voiceRequestSequence.incrementAndGet(),
+            context = context,
+            pcm = pcm,
+        )
+        if (context == "teacher_awake") refreshAwakeTimeout()
+        voiceWindowLimiter.offer(window)?.let(::submitVoiceWindow)
+    }
+
+    private fun submitVoiceWindow(window: TeacherVoiceWindow) {
+        voiceExecutor.execute {
+            val file = File(cacheDir, "teacher_voice_${window.sequence}.pcm")
             try {
+                FileOutputStream(file).use { it.write(window.pcm) }
                 val json = postMultipart(
                     "$baseUrl/api/glasses/voice/intent",
                     mapOf(
                         "model" to "qwen3.5-omni-flash-realtime",
-                        "context" to context,
+                        "context" to window.context,
                         "demo_options" to "",
                     ),
                     "audio",
                     file,
                     "application/octet-stream",
+                    onConnected = { connection ->
+                        synchronized(voiceConnectionsLock) {
+                            voiceConnections[window.sequence] = connection
+                        }
+                    },
                 )
-                if (context == "teacher_awake") {
-                    archiveTeacherCommandAudio(file)
-                }
-                runOnUiIfCurrent(token) {
-                    when {
-                        isSleepMode -> handleWakeResponse(json)
-                        context == "teacher_recording" -> handleStopRecordingIntent(json)
-                        else -> handleInstructionIntent(json)
-                    }
-                }
-            } catch (_: Exception) {
-                runOnUiIfCurrent(token) {
-                    when {
-                        isSleepMode -> scheduleWakeCheck()
-                        context == "teacher_recording" -> scheduleWakeCheck()
-                        else -> {
-                            playPrompt("unclear")
-                            resumeListening()
+                mainHandler.post {
+                    if (isCurrentVoiceWindow(window)) {
+                        when (window.context) {
+                            "teacher_sleep" -> handleWakeResponse(json)
+                            "teacher_awake" -> handleInstructionIntent(json)
+                            "teacher_recording" -> handleStopRecordingIntent(json)
                         }
                     }
                 }
+            } catch (exc: Exception) {
+                if (voiceEpoch.accepts(window.epoch)) {
+                    Log.w("TeacherVoice", "request ${window.sequence} failed: ${exc.message}")
+                }
             } finally {
+                synchronized(voiceConnectionsLock) {
+                    voiceConnections.remove(window.sequence)
+                }
                 file.delete()
+                voiceWindowLimiter.complete(window.sequence, voiceEpoch.current())
+                    ?.let(::submitVoiceWindow)
             }
-        }.start()
+        }
+    }
+
+    private fun isCurrentVoiceWindow(window: TeacherVoiceWindow): Boolean {
+        return !teacherExitInProgress && voiceEpoch.accepts(window.epoch) &&
+            voiceContextForCurrentState() == window.context
+    }
+
+    private fun advanceVoiceEpoch(): Int {
+        val epoch = voiceEpoch.advance()
+        voiceWindowLimiter.discardPending()
+        synchronized(voiceConnectionsLock) {
+            voiceConnections.values.forEach { connection ->
+                try { connection.disconnect() } catch (_: Exception) {}
+            }
+            voiceConnections.clear()
+        }
+        return epoch
     }
 
     private fun handleWakeResponse(json: org.json.JSONObject) {
-        val wake = json.optBoolean("wake", false)
-        if (wake) {
-            teacherState = TeacherState.AWAKE
-            playPrompt("wake_response") { startInstructionCapture() }
-        } else {
-            scheduleWakeCheck()
+        if (!json.optBoolean("wake", false)) return
+        val intent = json.optString("intent", "").takeIf {
+            it == "capture_photo" || it == "start_recording"
         }
+        enterTeacherAwake(intent)
     }
 
     // 录像中检测到停止意图
@@ -518,78 +702,43 @@ class TeacherActivity : AppCompatActivity() {
         val intent = json.optString("intent", "unclear")
         if (intent == "stop_recording") {
             stopTeacherRecording()
-        } else {
-            // 没听清停止，继续在录像状态监听
-            scheduleWakeCheck()
         }
     }
 
     private fun stopTeacherRecording() {
         videoRecordingActive = false
+        val videoStartedAtForUpload = videoStartedAt
+        val videoEndedAtForUpload = UploadMetadata.nowIso()
+        videoStartedAt = null
         teacherState = TeacherState.INSTRUCTION
+        voiceRecognitionPaused = true
+        advanceVoiceEpoch()
         val stopToken = operationToken.incrementAndGet()
-        stopContinuousRecording {
-            val service = recordingService
-            if (service != null && serviceBound) {
-                val completed = AtomicBoolean(false)
-                fun completeStop(files: List<File>) {
-                    if (!completed.compareAndSet(false, true)) return
-                    if (files.isNotEmpty()) uploadRecordFiles(files)
-                    service.stopCaptureSessionIfIdle()
-                    resumeAfterCameraSettle(stopToken, "recording_stop")
-                }
-                service.stopRecording { files -> completeStop(files) }
-                mainHandler.postDelayed({ completeStop(service.getRecordedFiles()) }, 8_000L)
-            } else {
+        val service = recordingService
+        if (service != null && serviceBound) {
+            val completed = AtomicBoolean(false)
+            fun completeStop(files: List<File>) {
+                if (!completed.compareAndSet(false, true)) return
+                if (files.isNotEmpty()) uploadRecordFiles(files, videoStartedAtForUpload, videoEndedAtForUpload)
+                service.stopCaptureSessionIfIdle()
                 resumeAfterCameraSettle(stopToken, "recording_stop")
             }
+            service.stopRecording { files -> completeStop(files) }
+            mainHandler.postDelayed({ completeStop(service.getRecordedFiles()) }, 8_000L)
+        } else {
+            resumeAfterCameraSettle(stopToken, "recording_stop")
         }
     }
 
-    // 唤醒后：停持续录音，录 3.5 秒短片段做主控指令识别（复用学生端 AWAKE_PROMPT）
-    @Suppress("MissingPermission")
-    private fun startInstructionCapture() {
-        teacherState = TeacherState.INSTRUCTION
-        stopContinuousRecording { captureInstructionClip() }
-    }
-
-    @Suppress("MissingPermission")
-    private fun captureInstructionClip() {
-        val token = operationToken.incrementAndGet()
-        val file = File(cacheDir, "teacher_intent_${System.currentTimeMillis()}.pcm")
-        val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
-        val bufferSize = max(minBuf, 3200)
-        val recorder = createRecorder()
-        Thread {
-            var captured = false
-            try {
-                FileOutputStream(file).use { output ->
-                    recorder.startRecording()
-                    val buffer = ByteArray(bufferSize)
-                    val deadline = System.currentTimeMillis() + 3500L
-                    while (System.currentTimeMillis() < deadline) {
-                        val read = recorder.read(buffer, 0, buffer.size)
-                        if (read > 0) output.write(buffer, 0, read)
-                    }
-                    recorder.stop()
-                }
-                captured = true
-            } catch (_: Exception) {
-                runOnUiIfCurrent(token) { resumeListening() }
-            } finally {
-                recorder.release()
-            }
-            if (captured) {
-                runOnUiIfCurrent(token) {
-                    submitVoiceIntent(file, context = "teacher_awake", isSleepMode = false)
-                }
-            }
-        }.start()
-    }
-
     private fun handleInstructionIntent(json: org.json.JSONObject) {
-        val actionToken = operationToken.incrementAndGet()
         val intent = json.optString("intent", "unclear")
+        if (intent !in setOf("capture_photo", "start_recording", "stop_recording")) {
+            return
+        }
+        clearAwakeControls()
+        voiceRecognitionPaused = true
+        advanceVoiceEpoch()
+        val actionToken = operationToken.incrementAndGet()
         when (intent) {
             "capture_photo" -> {
                 teacherState = TeacherState.INSTRUCTION
@@ -619,6 +768,7 @@ class TeacherActivity : AppCompatActivity() {
                 })
             }
             "start_recording" -> {
+                teacherState = TeacherState.INSTRUCTION
                 playPrompt("recording_start") {
                     if (teacherExitInProgress || operationToken.get() != actionToken) return@playPrompt
                     startForegroundService(
@@ -628,16 +778,15 @@ class TeacherActivity : AppCompatActivity() {
                     )
                     // 进入录像状态：恢复持续录音，唤醒检测切到检测"停止录像"
                     videoRecordingActive = true
+                    videoStartedAt = UploadMetadata.nowIso()
                     teacherState = TeacherState.RECORDING
-                    if (!continuousRunning) startContinuousRecording() else scheduleWakeCheck()
+                    voiceRecognitionPaused = false
+                    advanceVoiceEpoch()
+                    scheduleWakeCheck()
                 }
             }
             "stop_recording" -> {
                 stopTeacherRecording()
-            }
-            else -> {
-                playPrompt("unclear")
-                resumeListening(actionToken)
             }
         }
     }
@@ -649,7 +798,11 @@ class TeacherActivity : AppCompatActivity() {
     private fun resumeListening(expectedToken: Int?) {
         if (teacherExitInProgress) return
         if (expectedToken != null && operationToken.get() != expectedToken) return
+        mainHandler.removeCallbacks(awakeTimeoutRunnable)
+        hideAllViews()
         teacherState = TeacherState.LISTENING
+        voiceRecognitionPaused = false
+        advanceVoiceEpoch()
         if (!continuousRunning) startContinuousRecording()
         else scheduleWakeCheck()
     }
@@ -683,19 +836,26 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     // ===== 退出：停录音 + 上传持续录音 wav =====
-    private fun uploadRecordFiles(files: List<File>) {
+    private fun uploadRecordFiles(
+        files: List<File>,
+        startedAt: String? = null,
+        endedAt: String? = null,
+    ) {
         Thread {
             for (file in files) {
                 val isAudio = file.extension.lowercase() in listOf("wav", "m4a", "aac", "mp3")
                 val field = if (isAudio) "audio" else "video"
                 val mime = if (isAudio) "audio/wav" else "video/mp4"
                 try {
+                    val fields = linkedMapOf(
+                        "device_id" to teacherDeviceId,
+                        "experiment_type" to "teacher",
+                    )
+                    startedAt?.let { fields["started_at"] = it }
+                    endedAt?.let { fields["ended_at"] = it }
                     postMultipart(
                         "$baseUrl/api/glasses/teacher/records/upload",
-                        mapOf(
-                            "device_id" to teacherDeviceId,
-                            "experiment_type" to "teacher",
-                        ),
+                        fields,
                         field, file, mime,
                     )
                     if (!file.delete()) {
@@ -716,7 +876,7 @@ class TeacherActivity : AppCompatActivity() {
                     mapOf(
                         "device_id" to teacherDeviceId,
                         "experiment_type" to "teacher",
-                        "captured_at" to System.currentTimeMillis().toString(),
+                        "captured_at" to UploadMetadata.nowIso(),
                     ),
                     "photo",
                     file,
@@ -729,21 +889,6 @@ class TeacherActivity : AppCompatActivity() {
                 Log.w("TeacherPhoto", "upload fail ${file.name}: ${e.message}")
             }
         }.start()
-    }
-
-    private fun archiveTeacherCommandAudio(pcmFile: File) {
-        try {
-            val pcm = pcmFile.readBytes()
-            if (pcm.isEmpty()) return
-            val wavFile = File(cacheDir, "teacher_command_${System.currentTimeMillis()}.wav")
-            FileOutputStream(wavFile).use { output ->
-                output.write(buildWavHeader(pcm.size / 2))
-                output.write(pcm)
-            }
-            uploadRecordFiles(listOf(wavFile))
-        } catch (e: Exception) {
-            Log.w("TeacherRecord", "archive command audio failed: ${e.message}")
-        }
     }
 
     private fun runOnUiIfCurrent(token: Int, action: () -> Unit) {
@@ -788,6 +933,10 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(awakeTimeoutRunnable)
+        mainHandler.removeCallbacks(templeSingleTapRunnable)
+        advanceVoiceEpoch()
+        voiceExecutor.shutdownNow()
         continuousRunning = false
         try {
             continuousRecorder?.stop()
@@ -797,9 +946,12 @@ class TeacherActivity : AppCompatActivity() {
         // exitTeacherApp owns cleanup once exit has started. Do not stop the
         // service a second time from Activity teardown while CameraX is saving.
         if (!teacherExitInProgress) {
+            val videoStartedAtForUpload = videoStartedAt
+            val videoEndedAtForUpload = UploadMetadata.nowIso()
+            videoStartedAt = null
             if (videoRecordingActive) {
                 recordingService?.stopRecording { files ->
-                    if (files.isNotEmpty()) uploadRecordFiles(files)
+                    if (files.isNotEmpty()) uploadRecordFiles(files, videoStartedAtForUpload, videoEndedAtForUpload)
                     recordingService?.stopCaptureSessionIfIdle()
                     recordingService?.stopTeacherSession()
                     stopService(Intent(this, RecordingService::class.java))
@@ -819,6 +971,7 @@ class TeacherActivity : AppCompatActivity() {
     private fun postMultipart(
         urlText: String, fields: Map<String, String>,
         fileField: String, file: File, contentType: String = "application/octet-stream",
+        onConnected: ((HttpURLConnection) -> Unit)? = null,
     ): org.json.JSONObject {
         val boundary = "----TeacherBoundary${System.currentTimeMillis()}"
         val connection = (URL(urlText).openConnection() as HttpURLConnection).apply {
@@ -826,6 +979,7 @@ class TeacherActivity : AppCompatActivity() {
             connectTimeout = 10_000; readTimeout = 30_000
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
+        onConnected?.invoke(connection)
         java.io.DataOutputStream(connection.outputStream).use { out ->
             fields.forEach { (name, value) ->
                 out.writeBytes("--$boundary\r\n")
@@ -850,10 +1004,19 @@ class TeacherActivity : AppCompatActivity() {
         private const val SAMPLE_RATE = 16_000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
+        private const val PCM_BYTES_PER_SAMPLE = 2
+        private const val RING_SECONDS = 10
+        private const val VOICE_WINDOW_SECONDS = 5
+        private const val VOICE_WINDOW_STEP_MS = 2_000L
+        private const val MAX_VOICE_REQUESTS = 2
         private const val CONTINUOUS_SEGMENT_MS = 120_000L
         private const val CAMERA_SETTLE_DELAY_MS = 700L
         private const val PHOTO_CAPTURE_TIMEOUT_MS = 5_000L
         private const val SERVICE_WAIT_TIMEOUT_MS = 5_000L
+        private const val AWAKE_TIMEOUT_MS = 8_000L
+        private const val DOUBLE_TAP_WINDOW_MS = 500L
+        private const val SWIPE_THRESHOLD = 40
+        private const val SWIPE_VELOCITY_THRESHOLD = 40
 
         private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int) {
             val bytes = ByteArray(count * 2)

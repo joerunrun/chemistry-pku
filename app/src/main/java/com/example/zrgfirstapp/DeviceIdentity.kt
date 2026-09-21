@@ -8,7 +8,8 @@ import java.util.UUID
 
 /** Stable, app-local identifier used to separate uploads from multiple glasses. */
 object DeviceIdentity {
-    fun teacherId(context: Context): String {
+    /** Shared by student and teacher modes so one physical glass has one ID. */
+    fun hardwareId(context: Context): String {
         val androidId = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ANDROID_ID,
@@ -30,4 +31,6 @@ object DeviceIdentity {
                 .also { preferences.edit().putString("teacher_id", it).apply() }
         return generated
     }
+
+    fun teacherId(context: Context): String = hardwareId(context)
 }

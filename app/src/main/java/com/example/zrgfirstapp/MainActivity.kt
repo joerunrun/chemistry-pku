@@ -105,7 +105,8 @@ class MainActivity : AppCompatActivity() {
 
     private enum class AudioPermissionAction {
         NONE,
-        START_RECORDING,
+        START_AUDIO_RECORDING,
+        START_VIDEO_RECORDING,
         QA,
         VOICE_CONTROL,
     }
@@ -164,7 +165,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var gestureDetector: GestureDetector
     private val qaSampleRate = 16_000
     private val qaRecordDurationMs = 7_000L
-    private val voiceIntentRecordDurationMs = 3_500L
+    private val voiceIntentRecordDurationMs = 5_000L
     private val voiceIntentMinRms = 50.0
     private val voiceIntentMinSpeechChunks = 3
     private val actionMenuTimeoutMs = 8_000L
@@ -187,6 +188,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingCameraPermissionAction = CameraPermissionAction.NONE
     private var pendingAudioPermissionAction = AudioPermissionAction.NONE
     private var recordingRequested = false
+    private var recordingVideo = false
+    private var recordingStartedAt: String? = null
     private var standalonePhotoRequested = false
     private var recordingStatusText = "未记录"
     private var connectionStatusText = "未测试"
@@ -298,6 +301,7 @@ class MainActivity : AppCompatActivity() {
         if (!granted) {
             if (action == CameraPermissionAction.START_RECORDING) {
                 recordingRequested = false
+                recordingVideo = false
                 recordingStatusText = "未授权记录"
                 renderScreen()
             } else {
@@ -320,13 +324,23 @@ class MainActivity : AppCompatActivity() {
         pendingAudioPermissionAction = AudioPermissionAction.NONE
         if (granted) {
             when (action) {
-                AudioPermissionAction.START_RECORDING -> startRecordingService()
+                AudioPermissionAction.START_AUDIO_RECORDING -> startAudioRecordingService()
+                AudioPermissionAction.START_VIDEO_RECORDING -> startVideoRecordingService()
                 AudioPermissionAction.QA -> startAudioQuestionRecording()
                 AudioPermissionAction.VOICE_CONTROL -> startVoiceIntentLoop()
                 AudioPermissionAction.NONE -> Unit
             }
         } else {
-            showResult("Microphone permission denied.", "Permission denied")
+            if (action == AudioPermissionAction.START_AUDIO_RECORDING ||
+                action == AudioPermissionAction.START_VIDEO_RECORDING
+            ) {
+                recordingRequested = false
+                recordingVideo = false
+                recordingStatusText = "未授权记录"
+                renderScreen()
+            } else {
+                showResult("Microphone permission denied.", "Permission denied")
+            }
         }
     }
 
@@ -337,6 +351,7 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
+        android.util.Log.i("DeviceIdentity", "hardware_id=${DeviceIdentity.hardwareId(this)}")
         enableEdgeToEdge()
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
@@ -1599,7 +1614,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         when (intent) {
-            "start_recording" -> {
+            "start_audio_recording", "start_recording" -> {
+                enterAwakeModeNoTimeout()
+                ensureAudioRecordingPermissions()
+            }
+            "start_video_recording" -> {
                 enterAwakeModeNoTimeout()
                 ensureRecordingPermissions()
             }
@@ -2103,6 +2122,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun ensureAudioRecordingPermissions() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingAudioPermissionAction = AudioPermissionAction.START_AUDIO_RECORDING
+            requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        startAudioRecordingService()
+    }
+
     private fun ensureRecordingPermissions() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
@@ -2114,17 +2144,46 @@ class MainActivity : AppCompatActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            pendingAudioPermissionAction = AudioPermissionAction.START_RECORDING
+            pendingAudioPermissionAction = AudioPermissionAction.START_VIDEO_RECORDING
             requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
-        startRecordingService()
+        startVideoRecordingService()
     }
 
-    private fun startRecordingService() {
+    private fun startAudioRecordingService() {
+        passiveListenMode = PassiveListenMode.RECORD_STOP
+        enterAwakeModeNoTimeout()
+        recordingRequested = true
+        recordingVideo = false
+        recordingStatusText = "录音准备中"
+        focusIndex = 0
+        clearTaskOutput()
+        screenState = ScreenState.LIVE_MINIMAL
+        renderScreen()
+        playPrompt("recording_start") {
+            if (!recordingRequested) {
+                return@playPrompt
+            }
+            val intent = Intent(this, RecordingService::class.java)
+                .setAction(RecordingService.ACTION_START_AUDIO_RECORDING)
+            ContextCompat.startForegroundService(this, intent)
+            withRecordingService { service ->
+                recordingStartedAt = UploadMetadata.nowIso()
+                service.startAudioRecording()
+                recordingStatusText = service.recordingStatus()
+                startRecordingStatusSync()
+                renderScreen()
+                resumePassiveStopOnlyListening(PassiveListenMode.RECORD_STOP)
+            }
+        }
+    }
+
+    private fun startVideoRecordingService() {
         passiveListenMode = PassiveListenMode.RECORD_STOP
         enterAwakeModeNoTimeout()  // 录像期间保持苏醒
         recordingRequested = true
+        recordingVideo = true
         recordingStatusText = "记录准备中"
         focusIndex = 0
         clearTaskOutput()
@@ -2138,6 +2197,7 @@ class MainActivity : AppCompatActivity() {
                 .setAction(RecordingService.ACTION_START_RECORDING)
             ContextCompat.startForegroundService(this, intent)
             withRecordingService { service ->
+                recordingStartedAt = UploadMetadata.nowIso()
                 service.startRecording()
                 recordingStatusText = service.recordingStatus()
                 startRecordingStatusSync()
@@ -2153,9 +2213,22 @@ class MainActivity : AppCompatActivity() {
     ) {
         passiveListenMode = PassiveListenMode.NONE
         recordingRequested = false
+        val wasVideoRecording = recordingVideo
+        recordingVideo = false
+        val recordingEndedAt = UploadMetadata.nowIso()
+        val recordingStartedAtForUpload = recordingStartedAt
+        recordingStartedAt = null
         recordingStatusText = "未记录"
         mainHandler.removeCallbacks(recordingStatusRunnable)
-        fun finishStop() {
+        fun finishStop(files: List<File>) {
+            if (files.isNotEmpty()) {
+                uploadRecordFiles(
+                    files,
+                    recordingStartedAtForUpload,
+                    recordingEndedAt,
+                    audioOnly = !wasVideoRecording,
+                )
+            }
             if (announce) {
                 runOnUiThread {
                     playPrompt("recording_stop") {
@@ -2170,14 +2243,17 @@ class MainActivity : AppCompatActivity() {
         }
         val service = recordingService
         if (service == null) {
-            stopService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP_RECORDING))
-            finishStop()
+            val action = if (wasVideoRecording) {
+                RecordingService.ACTION_STOP_RECORDING
+            } else {
+                RecordingService.ACTION_STOP_AUDIO_RECORDING
+            }
+            stopService(Intent(this, RecordingService::class.java).setAction(action))
+            finishStop(emptyList())
             return
         }
-        service.stopRecording { files ->
-            if (files.isNotEmpty()) {
-                uploadRecordFiles(files)
-            } else {
+        val onStopped: (List<File>) -> Unit = { files ->
+            if (files.isEmpty()) {
                 android.util.Log.w("ChemRecord", "No finalized record files to upload")
             }
             if (serviceBound) {
@@ -2185,12 +2261,27 @@ class MainActivity : AppCompatActivity() {
                 serviceBound = false
                 recordingService = null
             }
-            stopService(Intent(this, RecordingService::class.java).setAction(RecordingService.ACTION_STOP_RECORDING))
-            finishStop()
+            val action = if (wasVideoRecording) {
+                RecordingService.ACTION_STOP_RECORDING
+            } else {
+                RecordingService.ACTION_STOP_AUDIO_RECORDING
+            }
+            stopService(Intent(this, RecordingService::class.java).setAction(action))
+            finishStop(files)
+        }
+        if (wasVideoRecording) {
+            service.stopRecording(onStopped)
+        } else {
+            service.stopAudioRecording(onStopped)
         }
     }
 
-    private fun uploadRecordFiles(files: List<File>) {
+    private fun uploadRecordFiles(
+        files: List<File>,
+        startedAt: String? = null,
+        endedAt: String? = null,
+        audioOnly: Boolean = false,
+    ) {
         Thread {
             for (file in files) {
                 try {
@@ -2204,10 +2295,12 @@ class MainActivity : AppCompatActivity() {
                         setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
                     }
                     java.io.DataOutputStream(connection.outputStream).use { out ->
-                        val fields = mapOf(
-                            "device_id" to android.os.Build.MODEL,
+                        val fields = linkedMapOf(
+                            "device_id" to DeviceIdentity.hardwareId(this),
                             "experiment_type" to selectedExperimentTypeValue(),
                         )
+                        startedAt?.let { fields["started_at"] = it }
+                        endedAt?.let { fields["ended_at"] = it }
                         for ((name, value) in fields) {
                             out.writeBytes("--$boundary\r\n")
                             out.writeBytes("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
@@ -2215,8 +2308,10 @@ class MainActivity : AppCompatActivity() {
                             out.writeBytes("\r\n")
                         }
                         out.writeBytes("--$boundary\r\n")
-                        out.writeBytes("Content-Disposition: form-data; name=\"video\"; filename=\"${file.name}\"\r\n")
-                        out.writeBytes("Content-Type: video/mp4\r\n\r\n")
+                        val partName = if (audioOnly) "audio" else "video"
+                        val contentType = if (audioOnly) "audio/mp4" else "video/mp4"
+                        out.writeBytes("Content-Disposition: form-data; name=\"$partName\"; filename=\"${file.name}\"\r\n")
+                        out.writeBytes("Content-Type: $contentType\r\n\r\n")
                         java.io.FileInputStream(file).use { it.copyTo(out) }
                         out.writeBytes("\r\n--$boundary--\r\n")
                         out.flush()
@@ -2493,9 +2588,9 @@ class MainActivity : AppCompatActivity() {
                     postMultipart(
                         "$baseUrl/api/glasses/photos/upload",
                         mapOf(
-                            "device_id" to android.os.Build.MODEL,
+                            "device_id" to DeviceIdentity.hardwareId(this),
                             "experiment_type" to selectedExperimentTypeValue(),
-                            "captured_at" to timestamp,
+                            "captured_at" to UploadMetadata.nowIso(),
                         ),
                         "photo",
                         file,
