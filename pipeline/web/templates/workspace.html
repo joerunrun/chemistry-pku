@@ -19,8 +19,8 @@
   </header>
 
   <nav class="tabs" aria-label="工作台功能">
-    {% if user %}<button data-tab="overview">概览</button><button data-tab="claims">数据认领</button><button data-tab="my-data">我的数据</button>{% endif %}
-    {% if user and user.role == 'teacher' %}<button data-tab="teacher-reports">课程整理</button><button data-tab="teacher-media">教师资料</button><button data-tab="student-data">学生数据</button><button data-tab="resources">演示与反馈</button>{% endif %}
+    {% if user %}<button data-tab="overview">概览</button>{% if user.role == 'teacher' %}<button data-tab="claims">我的眼镜</button>{% else %}<button data-tab="claims">数据认领</button><button data-tab="my-data">我的数据</button>{% endif %}{% endif %}
+    {% if user and user.role == 'teacher' %}<button data-tab="teacher-media">教师资料</button><button data-tab="teacher-reports">课程整理</button><button data-tab="student-data">学生数据</button><button data-tab="resources">演示与反馈</button>{% endif %}
     {% if admin_unlocked %}<button data-tab="admin-devices">眼镜校准</button><button data-tab="admin-identities">身份与角色</button><button data-tab="admin-media">全部资料</button><button data-tab="resources">演示与反馈</button><button data-tab="admin-tests">测试身份</button>{% endif %}
   </nav>
 
@@ -28,13 +28,25 @@
   <section class="panel" data-panel="overview">
     <h2>当前身份</h2>
     <p><span class="pill">{{ '教师' if user.role == 'teacher' else '学生' }}</span>　{{ user.identity_id[:2] }}***{{ user.identity_id[-2:] }}</p>
-    <p class="muted">门户身份已经生效。眼镜不会永久绑定到个人，每次下课后按实际使用时间认领。</p>
+    <p class="muted">{% if user.role == 'teacher' %}门户身份已经生效。选择当前使用的教师眼镜后，新上传的资料会自动归到你的账户；更换眼镜不会改变旧资料。{% else %}门户身份已经生效。下课后按实际使用时间认领实验数据。{% endif %}</p>
     <details><summary>查看本次门户保存的 userInfo</summary><pre id="profileData" class="profile">正在加载……</pre></details>
     <h3>系统中的 12 个眼镜</h3>
     <div class="glasses">{% for glass in glasses %}<div class="glass"><b>{{ glass.glass_number }}</b><span>{{ '已校准' if glass.device_id else '待校准' }}</span></div>{% endfor %}</div>
   </section>
 
   <section class="panel" data-panel="claims">
+    {% if user.role == 'teacher' %}
+    <div class="section-head"><h2>我的教师眼镜</h2><span id="teacherBindingBadge" class="pill">正在查询……</span></div>
+    <p class="muted">首次选择后，系统会根据眼镜硬件编号自动归属之后上传的录音、录像和照片。同一时间一副眼镜只能由一名教师使用。</p>
+    <div class="binding-card">
+      <label>当前使用眼镜
+        <select id="teacherBindingGlass"><option value="">请选择眼镜</option></select>
+      </label>
+      <div class="actions"><button id="saveTeacherBinding">保存选择</button><button id="openTeacherMedia" class="secondary">查看我的资料</button></div>
+    </div>
+    <div id="teacherBindingStatus" class="status"></div>
+    <details><summary>查看眼镜使用历史</summary><div id="teacherBindingHistory" class="item-list"></div></details>
+    {% else %}
     <div class="section-head"><h2 id="calendarMonthLabel">认领日历</h2><div class="actions"><button id="calendarPrev" class="secondary">上月</button><button id="calendarToday" class="secondary">本月</button><button id="calendarNext" class="secondary">下月</button></div></div>
     <p class="muted">点击日历条目查看详细时间，待认领数据可以直接带入认领。</p>
     <div class="legend"><span class="pending">待认领</span><span class="claimed">我的已认领</span></div>
@@ -52,9 +64,12 @@
     <div class="actions"><button id="previewClaim">预览匹配数据</button><button id="confirmClaim" disabled>确认认领</button><button id="claimLastHour" class="secondary">最近一小时</button><button id="claimOneHour" class="secondary">结束 = 开始 + 1 小时</button></div>
     <div id="claimStatus" class="status"></div><div id="claimPreview" class="item-list"></div>
     <h2>已认领记录</h2><div id="claimHistory" class="item-list">正在加载……</div>
+    {% endif %}
   </section>
 
+  {% if user.role != 'teacher' %}
   <section class="panel" data-panel="my-data"><h2>我的实验数据</h2><p class="muted">只显示已经通过眼镜编号和时间段认领到你名下的数据。</p><div id="ownData" class="item-list">正在加载……</div></section>
+  {% endif %}
   {% endif %}
 
   {% if user and user.role == 'teacher' %}
@@ -70,7 +85,22 @@
     <div id="reportStatus" class="status"></div><div id="reportSources" class="source-list"></div>
     <h3>已经生成的报告</h3><div id="reportList" class="item-list"></div>
   </section>
-  <section class="panel" data-panel="teacher-media"><div class="section-head"><h2>我的教师资料</h2><button id="refreshTeacherMedia" class="secondary">刷新</button></div><p class="muted">这里只显示你认领到自己名下的教师录音、录像和照片。</p><h3>音频记录</h3><div id="teacherAudio" class="item-list"></div><h3>实验录像</h3><div id="teacherVideos" class="item-list"></div><h3>拍摄照片</h3><div id="teacherPhotos" class="item-list"></div></section>
+  <section class="panel" data-panel="teacher-media">
+    <div class="section-head"><h2>我的教师资料</h2><button id="refreshTeacherMedia" class="secondary">刷新当前页</button></div>
+    <p class="muted">资料按上传时间从新到旧分页显示，包含语音转写、照片缩略图和音视频入口。</p>
+    <div id="teacherMediaBinding" class="status"></div>
+    <div class="form-grid teacher-media-filters">
+      <label>类型<select id="teacherMediaType"><option value="all">全部类型</option><option value="audio">录音</option><option value="video">录像</option><option value="photo">照片</option></select></label>
+      <label>开始日期<input id="teacherMediaStart" type="date"></label>
+      <label>结束日期<input id="teacherMediaEnd" type="date"></label>
+      <label>眼镜<select id="teacherMediaGlass"><option value="">全部使用过的眼镜</option>{% for glass in glasses %}<option value="{{ glass.glass_number }}">{{ glass.glass_number }}</option>{% endfor %}</select></label>
+      <label>实验<select id="teacherMediaExperiment"><option value="">全部实验</option></select></label>
+    </div>
+    <div class="actions"><button id="applyTeacherMediaFilters">查询</button><button id="clearTeacherMediaFilters" class="secondary">清除筛选</button></div>
+    <div id="teacherMediaStatus" class="status">切换到本页后加载资料。</div>
+    <div id="teacherMediaList" class="item-list"></div>
+    <div class="pagination"><button id="teacherMediaPrev" class="secondary">上一页</button><span id="teacherMediaPage">第 1 页</span><button id="teacherMediaNext" class="secondary">下一页</button></div>
+  </section>
   <section class="panel" data-panel="student-data"><h2>全部学生采集数据</h2><div id="studentData" class="item-list">正在加载……</div></section>
   {% endif %}
 
@@ -83,8 +113,23 @@
 
   {% if admin_unlocked %}
   <section class="panel" data-panel="admin-devices"><h2>眼镜编号校准（01—12）</h2><p class="muted">填写眼镜稳定硬件编号；这不会把眼镜永久绑定给个人。</p><div id="adminGlasses" class="card-grid"></div><div id="adminGlassStatus" class="status"></div></section>
-  <section class="panel" data-panel="admin-identities" id="admin-identities"><h2>身份与角色</h2><p class="muted">管理员设置会覆盖门户自动判断；“恢复门户判断”会重新使用最近一次门户身份。</p><div id="adminUserStatus" class="status"></div><div id="adminUsers" class="table-wrap"></div></section>
-  <section class="panel" data-panel="admin-media"><div class="section-head"><h2>全部学生和教师资料</h2><button id="refreshAdminMedia" class="secondary">刷新</button></div><h3>学生记录与照片</h3><div id="adminStudentMedia" class="item-list"></div><h3>教师记录与照片</h3><div id="adminTeacherMedia" class="item-list"></div></section>
+  <section class="panel" data-panel="admin-identities" id="admin-identities"><h2>身份、角色与教师眼镜</h2><p class="muted">管理员可以修改角色、安排或解除教师眼镜；同一副眼镜不能同时分给两名教师。</p><div id="adminUserStatus" class="status"></div><div id="adminUsers" class="table-wrap"></div></section>
+  <section class="panel" data-panel="admin-media">
+    <div class="section-head"><h2>全部学生和教师资料</h2><button id="refreshAdminMedia" class="secondary">刷新当前页</button></div>
+    <p class="muted">资料按页加载；照片显示小尺寸预览，视频点击后再打开。</p>
+    <div class="form-grid admin-media-filters">
+      <label>来源<select id="adminMediaRole"><option value="all">学生和教师</option><option value="student">学生</option><option value="teacher">教师</option></select></label>
+      <label>类型<select id="adminMediaType"><option value="all">全部类型</option><option value="audio">录音</option><option value="video">录像</option><option value="photo">照片</option></select></label>
+      <label>开始日期<input id="adminMediaStart" type="date"></label>
+      <label>结束日期<input id="adminMediaEnd" type="date"></label>
+      <label>眼镜<select id="adminMediaGlass"><option value="">全部眼镜</option>{% for glass in glasses %}<option value="{{ glass.glass_number }}">{{ glass.glass_number }}</option>{% endfor %}</select></label>
+      <label>实验<select id="adminMediaExperiment"><option value="">全部实验</option></select></label>
+    </div>
+    <div class="actions"><button id="applyAdminMediaFilters">查询</button><button id="clearAdminMediaFilters" class="secondary">清除筛选</button></div>
+    <div id="adminMediaStatus" class="status">切换到本页后加载资料。</div>
+    <div id="adminMediaList" class="item-list"></div>
+    <div class="pagination"><button id="adminMediaPrev" class="secondary">上一页</button><span id="adminMediaPage">第 1 页</span><button id="adminMediaNext" class="secondary">下一页</button></div>
+  </section>
   <section class="panel" data-panel="admin-tests" id="admin-tests"><h2>甲乙丙丁测试身份</h2><p class="muted">用于没有多套北大账号时验证学生和教师页面。</p><div id="testIdentities" class="card-grid"></div></section>
   {% endif %}
 </main>

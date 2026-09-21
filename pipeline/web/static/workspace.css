@@ -41,6 +41,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .glass b { display: block; font-size: 20px; }
 .form-grid { display: grid; gap: 12px; align-items: end; }
 .claim-form, .report-form { grid-template-columns: repeat(5, minmax(135px, 1fr)); }
+.teacher-media-filters { grid-template-columns: repeat(5, minmax(135px, 1fr)); }
+.admin-media-filters { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
 .form-grid label, .form-row label { display: grid; gap: 6px; color: var(--muted); font-size: 14px; }
 input, select, textarea { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--bg); font: inherit; }
 textarea { min-height: 110px; margin-top: 12px; resize: vertical; }
@@ -67,6 +69,9 @@ textarea { min-height: 110px; margin-top: 12px; resize: vertical; }
 .calendar-entry.claimed { border-color: #4ec8a8; background: #12352f; }
 .calendar-entry small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail { margin: 12px 0 26px; color: var(--muted); }
+.binding-card { display: grid; grid-template-columns: minmax(220px, 360px) 1fr; gap: 16px; align-items: end; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: #091724; }
+.binding-card label { display: grid; gap: 7px; color: var(--muted); }
+.binding-card .actions { margin: 0; }
 .table-wrap { overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
@@ -74,6 +79,8 @@ th { color: var(--muted); }
 video { width: min(320px, 100%); max-height: 190px; background: #000; border-radius: 8px; }
 .thumb { width: 180px; max-height: 120px; object-fit: contain; background: #000; border-radius: 8px; }
 .report-body { white-space: pre-wrap; color: #dceaf4; }
+.transcript { margin-top: 10px; padding: 10px; border-left: 3px solid var(--accent); background: #07131f; color: #dceaf4; white-space: pre-wrap; word-break: break-word; }
+.pagination { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 18px; }
 .badge { padding: 3px 7px; border-radius: 99px; background: #173b4a; color: var(--blue); font-size: 12px; }
-@media (max-width: 980px) { .claim-form, .report-form { grid-template-columns: repeat(2, 1fr); } .glasses, .card-grid { grid-template-columns: repeat(2, 1fr); } .calendar-cell { min-height: 86px; } }
-@media (max-width: 620px) { .shell { width: min(100% - 20px, 1240px); margin-top: 18px; } .topbar { align-items: flex-start; flex-direction: column; } .panel { padding: 16px; } .claim-form, .report-form, .glasses, .card-grid { grid-template-columns: 1fr; } .calendar-cell { min-height: 65px; padding: 4px; } .calendar-entry { font-size: 10px; } .calendar-entry small { display: none; } }
+@media (max-width: 980px) { .claim-form, .report-form, .teacher-media-filters, .admin-media-filters { grid-template-columns: repeat(2, 1fr); } .glasses, .card-grid { grid-template-columns: repeat(2, 1fr); } .calendar-cell { min-height: 86px; } }
+@media (max-width: 620px) { .shell { width: min(100% - 20px, 1240px); margin-top: 18px; } .topbar { align-items: flex-start; flex-direction: column; } .panel { padding: 16px; } .claim-form, .report-form, .teacher-media-filters, .admin-media-filters, .binding-card, .glasses, .card-grid { grid-template-columns: 1fr; } .calendar-cell { min-height: 65px; padding: 4px; } .calendar-entry { font-size: 10px; } .calendar-entry small { display: none; } }

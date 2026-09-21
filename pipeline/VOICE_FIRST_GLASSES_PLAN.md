@@ -564,7 +564,7 @@ python -m py_compile pipeline\web\app.py pipeline\voice_control\intent_omni.py
 眼镜端：
 
 ```powershell
-cd D:\Android\projects
+cd D:\chemistry\chemistry_agent\android\glasses-app
 $env:JAVA_HOME='D:\Android\studio\jbr'
 .\gradlew.bat :app:assembleDebug
 D:\Android\SDK\platform-tools\adb.exe install -r app\build\outputs\apk\debug\app-debug.apk

@@ -19,6 +19,7 @@ def secured(tmp_path, monkeypatch):
         "/api/glasses/health": "health", "/api/glasses/records/upload": "upload",
         "/pipeline": "pipeline", "/teacher-admin/api/derived/daily-course": "derived",
         "/api/workspace/admin/test-identities": "identities", "/new-unclassified": "new",
+        "/api/workspace/admin/media": "admin_media",
     }
     for path, endpoint in endpoints.items():
         app.add_url_rule(path, endpoint, lambda: {"ok": True}, methods=["GET", "POST", "DELETE"])
@@ -29,6 +30,7 @@ def secured(tmp_path, monkeypatch):
     ("/login", 200), ("/admin/api/feedback", 401), ("/admin/api/demo/videos", 401),
     ("/pipeline", 404), ("/teacher-admin/api/derived/daily-course", 410),
     ("/api/workspace/admin/test-identities", 401), ("/new-unclassified", 401),
+    ("/api/workspace/admin/media", 401),
     ("/api/glasses/health", 200),
 ])
 def test_anonymous_boundary(secured, path, status):

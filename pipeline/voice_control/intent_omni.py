@@ -74,6 +74,14 @@ SLEEP_MODE_PROMPT = """你是“化小北”眼镜助手的唤醒检测器。请
 只输出严格 JSON：{"wake": true/false, "transcript": "忠实转录的文字"}。
 """
 
+TEACHER_SLEEP_MODE_PROMPT = """你是“化小北”教师版眼镜助手的唤醒和快捷动作检测器。
+判断教师是否有意呼叫“小北助手/化小北”或明显近音。不要要求逐字完全一致。
+如果同一句话还明确要求拍照或开始录像，同时返回对应 intent；仅唤醒时 intent=null。
+旁人闲聊、偶然提到小北、没有呼叫助手的普通谈话、噪声或无法判断时返回 wake=false。
+只输出严格 JSON：
+{"wake": true/false, "intent": "capture_photo|start_recording|null", "transcript": "忠实转录的文字"}。
+"""
+
 _WAKE_NEAR_SOUND_PATTERN = re.compile(r"(?:小|晓)[北贝倍备背][助住柱][手守首]")
 _WAKE_ADDRESSES = ("小北", "小贝", "晓北", "化小北", "小北助理", "助手")
 _WAKE_ACTIONS = (
@@ -225,14 +233,28 @@ def classify_audio_intent(
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     ctx = (context or "").strip()
-    is_sleep_mode = ctx == "sleep"
+    is_teacher_sleep = ctx == "teacher_sleep"
+    is_sleep_mode = ctx in {"sleep", "teacher_sleep"}
     is_experiment_setup = ctx == "experiment_setup"
-    mode_name = "SLEEP" if is_sleep_mode else "EXPERIMENT_SETUP" if is_experiment_setup else "AWAKE"
+    mode_name = (
+        "TEACHER_SLEEP" if is_teacher_sleep
+        else "SLEEP" if is_sleep_mode
+        else "EXPERIMENT_SETUP" if is_experiment_setup
+        else "AWAKE"
+    )
 
     print(f"\n[voice_intent] === 开始处理 === mode={mode_name}, audio_size={len(audio_bytes)} bytes")
 
     if not audio_bytes:
         print(f"[voice_intent] 音频为空，返回默认结果")
+        if is_teacher_sleep:
+            return {
+                "wake": False,
+                "intent": None,
+                "transcript": "",
+                "decision_source": "text",
+                "timings": {},
+            }
         if is_sleep_mode:
             return {"wake": False, "transcript": "", "timings": {}}
         return _safe_intent("", "unclear", "我没有听清，请再说一遍。", 0.0)
@@ -250,7 +272,9 @@ def classify_audio_intent(
     # Keep passive states narrow at both session and response levels. Otherwise
     # the model still sees the full awake intent list and may emit unrelated
     # intents such as qa while a video is playing.
-    if is_sleep_mode:
+    if is_teacher_sleep:
+        system_prompt = TEACHER_SLEEP_MODE_PROMPT
+    elif is_sleep_mode:
         system_prompt = SLEEP_MODE_PROMPT
     elif ctx == "teacher_awake":
         system_prompt = TEACHER_AWAKE_PROMPT
@@ -263,7 +287,9 @@ def classify_audio_intent(
     print(f"[voice_intent] 使用 prompt: {mode_name}_MODE_PROMPT, context={ctx}")
 
     dashscope.api_key = config.api_key
-    callback = OmniIntentCallback(complete_on_transcript=is_sleep_mode)
+    # The legacy student sleep path keeps its fast transcript completion.
+    # Teacher sleep waits for model JSON unless deterministic text already wakes it.
+    callback = OmniIntentCallback(complete_on_transcript=(ctx == "sleep"))
     conv = OmniRealtimeConversation(
         model=config.model,
         callback=callback,
@@ -298,7 +324,13 @@ def classify_audio_intent(
 
         deadline = time.time() + config.timeout_seconds
         fallback_after_transcript_seconds = 2.0
+        quick_teacher_result: dict[str, Any] | None = None
         while not callback.done and time.time() < deadline:
+            if is_teacher_sleep and callback.transcript_completed_at is not None:
+                quick = _teacher_wake_from_transcript(callback.transcript)
+                if quick["wake"]:
+                    quick_teacher_result = quick
+                    break
             if (
                 not is_sleep_mode
                 and callback.transcript_completed_at is not None
@@ -308,13 +340,18 @@ def classify_audio_intent(
                 break
             time.sleep(0.05)
 
-        if not callback.done:
+        if is_teacher_sleep and quick_teacher_result is None and callback.transcript:
+            quick = _teacher_wake_from_transcript(callback.transcript)
+            if quick["wake"]:
+                quick_teacher_result = quick
+
+        if not callback.done and quick_teacher_result is None:
             if callback.transcript:
                 print(f"[voice_intent] 未收到模型回复，使用转写兜底: {callback.transcript!r}")
             else:
                 print(f"[voice_intent] ERROR: 超时")
                 raise TimeoutError(f"等待 Qwen Omni 指令解析超时，超过 {config.timeout_seconds} 秒。")
-        if callback.error:
+        if callback.error and quick_teacher_result is None:
             print(f"[voice_intent] ERROR: {callback.error}")
             raise AliyunError(callback.error)
 
@@ -327,7 +364,16 @@ def classify_audio_intent(
         print(f"[voice_intent] Omni 转写: {callback.transcript!r}")
         print(f"[voice_intent] Omni 回复: {callback.answer_text!r}")
 
-        if is_sleep_mode:
+        if is_teacher_sleep:
+            result = quick_teacher_result or _parse_teacher_wake_json(
+                callback.answer_text,
+                callback.transcript,
+            )
+            print(
+                f"[voice_intent] 解析结果: wake={result.get('wake')}, "
+                f"intent={result.get('intent')}, transcript={result.get('transcript')!r}"
+            )
+        elif is_sleep_mode:
             result = _parse_wake_json(callback.answer_text, callback.transcript)
             print(f"[voice_intent] 解析结果: wake={result.get('wake')}, transcript={result.get('transcript')!r}")
         else:
@@ -428,6 +474,16 @@ def _build_response_instruction(
     is_sleep_mode: bool = False,
     demo_options: str | None = None,
 ) -> str:
+    if (context or "").strip() == "teacher_sleep":
+        return (
+            "Teacher glasses wake detector for the Chinese assistant '化小北 / 小北助手'. "
+            "Return wake=true for an intentional call, including clear near-homophones. If the same "
+            "utterance clearly asks to take one photo, set intent=capture_photo; if it clearly asks "
+            "to start video recording, set intent=start_recording; otherwise set intent=null. Return "
+            "wake=false for unrelated speech or noise. Output strict JSON: "
+            '{"wake": true/false, "intent": "capture_photo|start_recording|null", '
+            '"transcript": "faithful recognized text"}.'
+        )
     if is_sleep_mode:
         return (
             "Wake detector for the Chinese assistant named '化小北 / 小北助手' "
@@ -519,6 +575,60 @@ def _parse_wake_json(text: str, fallback_transcript: str) -> dict[str, Any]:
     )
     wake = near_sound or addressed_activation
     return {"wake": wake, "transcript": transcript}
+
+
+def _teacher_wake_from_transcript(transcript: str) -> dict[str, Any]:
+    """Deterministic positive-only shortcut for teacher wake and one-shot actions."""
+    normalized = re.sub(r"[\s，。！？、,.!?：:；;‘’'\"“”_-]+", "", transcript).lower()
+    direct_call = (
+        bool(_WAKE_NEAR_SOUND_PATTERN.search(normalized))
+        or "xiaobeizhushou" in normalized
+        or "化小北" in normalized
+    )
+    addressed_activation = (
+        any(address in normalized for address in _WAKE_ADDRESSES)
+        and any(action in normalized for action in _WAKE_ACTIONS)
+    )
+    wake = direct_call or addressed_activation
+    intent: str | None = None
+    if wake and any(word in normalized for word in (
+        "拍张照片", "拍一张", "拍照", "帮我拍", "拍下来", "截个图", "保存照片",
+    )):
+        intent = "capture_photo"
+    elif wake and any(word in normalized for word in (
+        "开始录像", "开始录制", "录一段", "录一下", "录下来", "录像", "视频录制",
+        "记录这一段", "把这一段记录下来", "帮我存一下过程",
+    )):
+        intent = "start_recording"
+    return {
+        "wake": wake,
+        "intent": intent,
+        "transcript": transcript.strip(),
+        "decision_source": "text",
+    }
+
+
+def _parse_teacher_wake_json(text: str, fallback_transcript: str) -> dict[str, Any]:
+    """Combine deterministic wake matching with the teacher Omni decision."""
+    payload = _extract_json(text)
+    transcript = fallback_transcript.strip()
+    if payload is not None:
+        transcript = str(payload.get("transcript") or fallback_transcript or "").strip()
+
+    local = _teacher_wake_from_transcript(transcript)
+    model_wake = payload.get("wake") if payload is not None else None
+    model_intent = payload.get("intent") if payload is not None else None
+    if model_intent not in {"capture_photo", "start_recording"}:
+        model_intent = None
+
+    wake = bool(local["wake"] or model_wake is True)
+    intent = local["intent"] or (model_intent if wake else None)
+    return {
+        "wake": wake,
+        "intent": intent,
+        "transcript": transcript,
+        "decision_source": "text" if local["wake"] else "omni",
+    }
 
 
 def _parse_intent_json(

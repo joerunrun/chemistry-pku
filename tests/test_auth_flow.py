@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import pytest
 from flask.testing import FlaskClient
+from PIL import Image
 
 
 _RUNTIME_DIR = Path(tempfile.mkdtemp(prefix="chem_auth_test_"))
@@ -162,6 +163,167 @@ def test_discovered_device_assignment_updates_both_mappings() -> None:
     assert next(item for item in glasses if item["glass_number"] == "05")["device_id"] == device_id
     mappings = json.loads((_RUNTIME_DIR / "device_mappings.json").read_text(encoding="utf-8"))
     assert mappings[device_id] == "05"
+
+
+def test_admin_media_is_lazy_page_ready_and_includes_transcripts(monkeypatch) -> None:
+    client = app_module.app.test_client()
+    _unlock_admin(client)
+    monkeypatch.setattr(app_module._media_analysis_queue, "enqueue", lambda *_args, **_kwargs: None)
+    device_id = "student_android_admin_media_08"
+    experiment_type = "admin_media_pagination_test"
+    assert client.put("/admin/api/auth/glasses/08", json={"device_id": device_id}).status_code == 200
+
+    for index in range(21):
+        upload = client.post(
+            "/api/glasses/records/upload",
+            data={
+                "device_id": device_id,
+                "experiment_type": experiment_type,
+                "started_at": f"2026-09-{(index % 9) + 1:02d}T09:00:00+08:00",
+                "ended_at": f"2026-09-{(index % 9) + 1:02d}T09:10:00+08:00",
+                "audio": (BytesIO(b"test-audio"), "record.wav"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert upload.status_code == 201
+        record_dir = Path(upload.get_json()["record"]["path"])
+        (record_dir / "analysis.json").write_text(json.dumps({
+            "items": {"record_audio.wav": {
+                "kind": "audio", "status": "succeeded", "transcript": f"第 {index + 1} 条课堂转写",
+            }},
+        }, ensure_ascii=False), encoding="utf-8")
+
+    query = (
+        "/api/workspace/admin/media?source_role=student&media_type=audio"
+        f"&experiment_type={experiment_type}&glass_number=08&page_size=20"
+    )
+    first = client.get(f"{query}&page=1")
+    assert first.status_code == 200
+    first_data = first.get_json()
+    assert first_data["total"] == 21
+    assert first_data["pages"] == 2
+    assert len(first_data["items"]) == 20
+    assert all(item["transcript"].endswith("课堂转写") for item in first_data["items"])
+    assert all(item["glass_number"] == "08" for item in first_data["items"])
+    assert len(client.get(f"{query}&page=2").get_json()["items"]) == 1
+
+    image_bytes = BytesIO()
+    Image.new("RGB", (1200, 800), "white").save(image_bytes, format="JPEG")
+    image_bytes.seek(0)
+    photo = client.post(
+        "/api/glasses/photos/upload",
+        data={
+            "device_id": device_id,
+            "experiment_type": experiment_type,
+            "captured_at": "2026-09-11T09:00:00+08:00",
+            "photo": (image_bytes, "photo.jpg"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert photo.status_code == 201
+    photos = client.get(
+        "/api/workspace/admin/media?source_role=student&media_type=photo"
+        f"&experiment_type={experiment_type}&glass_number=08"
+    ).get_json()["items"]
+    assert len(photos) == 1
+    thumbnail = client.get(photos[0]["thumbnail_url"])
+    assert thumbnail.status_code == 200
+    assert thumbnail.content_type == "image/jpeg"
+
+    page = client.get("/workspace").get_data(as_text=True)
+    assert 'id="adminMediaList"' in page
+    assert 'id="adminStudentMedia"' not in page
+
+
+def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch) -> None:
+    admin = app_module.app.test_client()
+    _unlock_admin(admin)
+    device_id = "teacher_binding_device_12"
+    assert admin.put("/admin/api/auth/glasses/12", json={"device_id": device_id}).status_code == 200
+
+    teacher = app_module.app.test_client()
+    _login_test_identity(teacher, "ding")
+    monkeypatch.setattr(app_module._media_analysis_queue, "enqueue", lambda *_args, **_kwargs: None)
+    historical = teacher.post(
+        "/api/glasses/teacher/records/upload",
+        data={
+            "device_id": device_id,
+            "experiment_type": "distillation",
+            "audio": (BytesIO(b"historical-audio"), "historical.wav"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert historical.status_code == 201
+    historical_id = historical.get_json()["record"]["record_id"]
+
+    binding = teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12"})
+    assert binding.status_code == 200
+    assert binding.get_json()["binding"]["glass_number"] == "12"
+    assert binding.get_json()["backfill"]["item_count"] == 1
+    visible_ids = {
+        item["record_id"]
+        for item in teacher.get("/api/workspace/teacher/media?media_type=audio").get_json()["items"]
+    }
+    assert historical_id in visible_ids
+
+    other_teacher = app_module.app.test_client()
+    _login_test_identity(other_teacher, "bing")
+    conflict = other_teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12"})
+    assert conflict.status_code == 409
+
+    for index in range(2):
+        upload = teacher.post(
+            "/api/glasses/teacher/records/upload",
+            data={
+                "device_id": device_id,
+                "experiment_type": "distillation",
+                "audio": (BytesIO(b"test-audio"), f"lesson-{index}.wav"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert upload.status_code == 201
+        record = upload.get_json()["record"]
+        filename = record["files"][0]["filename"]
+        Path(record["path"], "analysis.json").write_text(json.dumps({
+            "items": {filename: {
+                "kind": "audio",
+                "status": "succeeded",
+                "transcript": f"绑定教师的第 {index + 1} 条转写",
+            }},
+        }, ensure_ascii=False), encoding="utf-8")
+
+    first_page = teacher.get("/api/workspace/teacher/media?media_type=audio&page=1&page_size=1")
+    assert first_page.status_code == 200
+    first_data = first_page.get_json()
+    assert first_data["total"] == 3
+    assert first_data["pages"] == 3
+    assert len(first_data["items"]) == 1
+    assert first_data["items"][0]["transcript"].startswith("绑定教师")
+    assert first_data["items"][0]["glass_number"] == "12"
+
+    image_bytes = BytesIO()
+    Image.new("RGB", (900, 600), "white").save(image_bytes, format="JPEG")
+    image_bytes.seek(0)
+    photo = teacher.post(
+        "/api/glasses/teacher/photos/upload",
+        data={
+            "device_id": device_id,
+            "experiment_type": "distillation",
+            "photo": (image_bytes, "photo.jpg"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert photo.status_code == 201
+    photo_items = teacher.get("/api/workspace/teacher/media?media_type=photo").get_json()["items"]
+    assert len(photo_items) == 1
+    assert teacher.get(photo_items[0]["thumbnail_url"]).status_code == 200
+
+    assert admin.put("/admin/api/auth/glasses/11", json={"device_id": "teacher_binding_device_11"}).status_code == 200
+    assert teacher.put("/api/workspace/teacher/binding", json={"glass_number": "11"}).status_code == 200
+    binding_state = teacher.get("/api/workspace/teacher/binding").get_json()
+    assert binding_state["binding"]["glass_number"] == "11"
+    assert len(binding_state["history"]) == 2
+    assert teacher.get("/api/workspace/teacher/media?media_type=audio").get_json()["total"] == 3
 
 
 def test_pending_claim_overview_disappears_after_claim() -> None:

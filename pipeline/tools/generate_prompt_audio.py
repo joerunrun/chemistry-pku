@@ -18,7 +18,7 @@ PROMPTS = {
     "demo_stop": "已停止播放。",
 }
 def default_output_dir() -> Path:
-    return Path(r"D:\Android\projects\app\src\main\res\raw")
+    return Path(r"D:\chemistry\chemistry_agent\android\glasses-app\app\src\main\res\raw")
 
 
 def main() -> None:

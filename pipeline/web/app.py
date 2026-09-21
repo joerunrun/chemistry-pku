@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
 import json
 import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import time
 import uuid
@@ -20,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 import cv2
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if PROJECT_ROOT not in sys.path:
@@ -44,6 +47,7 @@ from pipeline.web.pku_iaaa import client_ip, validate_token
 from pipeline.web.identity_store import (
     calibrate_glass,
     find_user,
+    glass_for_device,
     init_store,
     list_glasses,
     list_users,
@@ -59,6 +63,15 @@ from pipeline.web.claim_store import (
     init_claim_store,
     list_claims,
 )
+from pipeline.web.teacher_binding_store import (
+    TeacherBindingConflict,
+    active_teacher_binding,
+    end_teacher_binding,
+    init_teacher_binding_store,
+    list_teacher_bindings,
+    set_teacher_binding,
+    teacher_binding_for_glass_at,
+)
 from pipeline.resource_paths import runtime_asset_path
 from pipeline.web.security import install_security
 
@@ -69,6 +82,7 @@ install_security(app, lambda: _current_user(), lambda: _admin_is_unlocked(),
                  runtime_asset_path("auth", "device_credentials.json"))
 init_store()
 init_claim_store()
+init_teacher_binding_store()
 
 # 内存存储：session_id → detection 结果
 _detect_store: dict[str, dict] = {}
@@ -876,6 +890,57 @@ def _candidate_datetime(value: Any, *, fallback: datetime) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _auto_claim_teacher_upload(metadata: dict[str, Any], item_type: str) -> dict[str, Any] | None:
+    """Attach newly uploaded teacher media to the teacher using that glass."""
+    if metadata.get("record_role") != "teacher" or item_type not in {"record", "photo"}:
+        return None
+    device_id = str(metadata.get("device_id", "")).strip()
+    glass_number = glass_for_device(device_id) if device_id else None
+    if not glass_number and device_id:
+        glass_number = _normalize_glass_number(_load_device_mappings().get(device_id))
+    if not glass_number:
+        return None
+
+    created_at = _candidate_datetime(
+        metadata.get("created_at"), fallback=datetime.now(timezone.utc)
+    )
+    captured_at = _candidate_datetime(
+        metadata.get("started_at") or metadata.get("captured_at"),
+        fallback=created_at,
+    )
+    binding = teacher_binding_for_glass_at(glass_number, captured_at.isoformat())
+    if binding is None:
+        return None
+
+    ended_at = _candidate_datetime(metadata.get("ended_at"), fallback=captured_at)
+    if ended_at < captured_at:
+        ended_at = captured_at
+    item_id = str(metadata.get("record_id") or metadata.get("photo_id") or "").strip()
+    if not item_id:
+        return None
+    try:
+        return create_claim(
+            identity_id=str(binding["identity_id"]),
+            role="teacher",
+            glass_number=glass_number,
+            started_at=captured_at.isoformat(),
+            ended_at=ended_at.isoformat(),
+            items=[{
+                "item_type": item_type,
+                "item_id": item_id,
+                "source_role": "teacher",
+                "device_id": device_id,
+                "experiment_type": str(metadata.get("experiment_type", "")),
+                "item_created_at": created_at.isoformat(),
+            }],
+        )
+    except ClaimConflict:
+        return None
+    except (KeyError, ValueError, sqlite3.Error) as exc:
+        app.logger.warning("teacher upload auto-claim failed: %s", exc)
+        return None
+
+
 def _claim_candidate_items(
     glass_number: str,
     started_at: datetime,
@@ -930,6 +995,56 @@ def _claim_candidate_items(
             })
     candidates.sort(key=lambda item: item.get("started_at", ""))
     return candidates
+
+
+def _backfill_unclaimed_teacher_media(identity_id: str, glass_number: str) -> dict[str, Any]:
+    """Assign existing, unclaimed teacher media for a glass to its teacher."""
+    candidates = _claim_candidate_items(
+        glass_number,
+        datetime(1970, 1, 1, tzinfo=timezone.utc),
+        datetime.max.replace(tzinfo=timezone.utc),
+        source_role="teacher",
+    )
+    claimed = claimed_item_keys()
+    unclaimed = [
+        item for item in candidates
+        if (item["item_type"], "teacher", item["item_id"]) not in claimed
+    ]
+    claim_ids: list[str] = []
+    item_count = 0
+    for offset in range(0, len(unclaimed), 100):
+        batch = unclaimed[offset:offset + 100]
+        try:
+            claim = create_claim(
+                identity_id=identity_id,
+                role="teacher",
+                glass_number=glass_number,
+                started_at=min(item["started_at"] for item in batch),
+                ended_at=max(item["ended_at"] for item in batch),
+                items=batch,
+            )
+        except ClaimConflict:
+            current = claimed_item_keys()
+            batch = [
+                item for item in batch
+                if (item["item_type"], "teacher", item["item_id"]) not in current
+            ]
+            if not batch:
+                continue
+            try:
+                claim = create_claim(
+                    identity_id=identity_id,
+                    role="teacher",
+                    glass_number=glass_number,
+                    started_at=min(item["started_at"] for item in batch),
+                    ended_at=max(item["ended_at"] for item in batch),
+                    items=batch,
+                )
+            except ClaimConflict:
+                continue
+        claim_ids.append(str(claim["claim_id"]))
+        item_count += len(claim["items"])
+    return {"item_count": item_count, "claim_ids": claim_ids}
 
 
 def _claim_period(value: datetime) -> tuple[str, str]:
@@ -1278,7 +1393,10 @@ def admin_auth_users():
     required = _admin_required()
     if required:
         return required
-    return jsonify({"users": list_users()})
+    return jsonify({
+        "users": list_users(),
+        "teacher_bindings": list_teacher_bindings(active_only=True),
+    })
 
 
 @app.post("/admin/api/auth/users/<identity_id>/reset-role")
@@ -1310,7 +1428,38 @@ def workspace_admin_set_user_role(identity_id: str):
         return jsonify({"error": str(exc)}), 400
     if user is None:
         return jsonify({"error": "身份不存在"}), 404
+    if user.get("role") != "teacher":
+        end_teacher_binding(identity_id)
     return jsonify({"user": user})
+
+
+@app.put("/api/workspace/admin/users/<identity_id>/glass")
+def workspace_admin_set_teacher_glass(identity_id: str):
+    required = _admin_required()
+    if required:
+        return required
+    user = find_user(identity_id)
+    if user is None:
+        return jsonify({"error": "身份不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    raw_glass_number = str(payload.get("glass_number") or "").strip()
+    if not raw_glass_number:
+        ended = end_teacher_binding(identity_id)
+        return jsonify({"binding": None, "ended_binding": ended})
+    glass_number = _normalize_glass_number(raw_glass_number)
+    if not glass_number:
+        return jsonify({"error": "眼镜编号必须是 01 到 12"}), 400
+    if user.get("role") != "teacher":
+        return jsonify({"error": "只有教师身份可以绑定眼镜"}), 400
+    glass = next((item for item in list_glasses() if item["glass_number"] == glass_number), None)
+    if not glass or not glass.get("device_id"):
+        return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
+    try:
+        binding = set_teacher_binding(identity_id, glass_number)
+    except TeacherBindingConflict:
+        return jsonify({"error": "该眼镜已绑定给其他教师，请先解除原绑定"}), 409
+    backfill = _backfill_unclaimed_teacher_media(identity_id, glass_number)
+    return jsonify({"binding": binding, "backfill": backfill})
 
 
 @app.get("/admin/test-identities")
@@ -1639,6 +1788,74 @@ def _teacher_user_required() -> tuple[dict[str, Any] | None, Any | None]:
     if user.get("role") != "teacher":
         return None, (jsonify({"error": "只有教师可以使用该功能"}), 403)
     return user, None
+
+
+def _teacher_binding_payload(identity_id: str) -> dict[str, Any]:
+    binding = active_teacher_binding(identity_id=identity_id)
+    occupied = {
+        str(item["glass_number"]): str(item["identity_id"])
+        for item in list_teacher_bindings(active_only=True)
+    }
+    glasses = []
+    for glass in list_glasses():
+        number = str(glass["glass_number"])
+        owner = occupied.get(number)
+        glasses.append({
+            "glass_number": number,
+            "calibrated": bool(glass.get("device_id")),
+            "available": owner in {None, identity_id},
+            "current": bool(binding and binding.get("glass_number") == number),
+        })
+    history = [
+        item for item in list_teacher_bindings()
+        if item.get("identity_id") == identity_id
+    ]
+    return {"binding": binding, "glasses": glasses, "history": history}
+
+
+@app.get("/api/workspace/teacher/binding")
+def workspace_teacher_binding():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    identity_id = str(user["identity_id"])
+    binding = active_teacher_binding(identity_id=identity_id)
+    if binding:
+        _backfill_unclaimed_teacher_media(identity_id, str(binding["glass_number"]))
+    return jsonify(_teacher_binding_payload(identity_id))
+
+
+@app.put("/api/workspace/teacher/binding")
+def workspace_teacher_set_binding():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    payload = request.get_json(silent=True) or {}
+    raw_glass_number = str(payload.get("glass_number") or "").strip()
+    glass_number = _normalize_glass_number(raw_glass_number)
+    if not glass_number:
+        return jsonify({"error": "请选择 01 到 12 号眼镜"}), 400
+    glass = next((item for item in list_glasses() if item["glass_number"] == glass_number), None)
+    if not glass or not glass.get("device_id"):
+        return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
+    try:
+        identity_id = str(user["identity_id"])
+        set_teacher_binding(identity_id, glass_number)
+    except TeacherBindingConflict:
+        return jsonify({"error": "该眼镜已绑定给其他教师，请选择其他眼镜"}), 409
+    backfill = _backfill_unclaimed_teacher_media(identity_id, glass_number)
+    payload = _teacher_binding_payload(identity_id)
+    payload["backfill"] = backfill
+    return jsonify(payload)
+
+
+@app.delete("/api/workspace/teacher/binding")
+def workspace_teacher_end_binding():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    end_teacher_binding(str(user["identity_id"]))
+    return jsonify(_teacher_binding_payload(str(user["identity_id"])))
 
 
 def _parse_report_range(start_value: Any, end_value: Any) -> tuple[str, str, datetime, datetime]:
@@ -2490,7 +2707,13 @@ def _store_uploaded_record(record_root: Path, *, record_role: str):
         "files": files,
         "metadata": client_metadata,
     }
-    (record_dir / "record.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata_path = record_dir / "record.json"
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    automatic_claim = _auto_claim_teacher_upload(metadata, "record")
+    if automatic_claim:
+        metadata["owner_identity_id"] = automatic_claim["identity_id"]
+        metadata["automatic_claim_id"] = automatic_claim["claim_id"]
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     for file_info in files:
         file_path = record_dir / file_info["filename"]
         if file_path.suffix.lower() in {".wav", ".m4a", ".aac", ".mp3"}:
@@ -2505,6 +2728,117 @@ def admin_records():
     if required:
         return required
     return jsonify({"records": _list_records(_record_root(), "admin_download_record_file")})
+
+
+@app.get("/api/workspace/admin/media")
+def workspace_admin_media():
+    required = _admin_required()
+    if required:
+        return required
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+        page_size = min(50, max(1, int(request.args.get("page_size", "20"))))
+    except ValueError:
+        return jsonify({"error": "page 和 page_size 必须是整数"}), 400
+
+    source_role = request.args.get("source_role", "all").strip().lower()
+    media_type = request.args.get("media_type", "all").strip().lower()
+    if source_role not in {"all", "student", "teacher"}:
+        return jsonify({"error": "source_role 必须是 all、student 或 teacher"}), 400
+    if media_type not in {"all", "audio", "video", "photo"}:
+        return jsonify({"error": "media_type 必须是 all、audio、video 或 photo"}), 400
+
+    try:
+        start_date = _parse_optional_media_date(request.args.get("start_date", ""))
+        end_date = _parse_optional_media_date(request.args.get("end_date", ""))
+    except ValueError:
+        return jsonify({"error": "日期格式应为 YYYY-MM-DD"}), 400
+    if start_date and end_date and end_date < start_date:
+        return jsonify({"error": "结束日期不能早于开始日期"}), 400
+
+    raw_glass_number = request.args.get("glass_number", "").strip()
+    glass_number = _normalize_glass_number(raw_glass_number)
+    if raw_glass_number and not glass_number:
+        return jsonify({"error": "眼镜编号无效"}), 400
+
+    items = _list_workspace_admin_media(
+        source_role=source_role,
+        media_type=media_type,
+        start_date=start_date,
+        end_date=end_date,
+        glass_number=glass_number,
+        experiment_type=request.args.get("experiment_type", "").strip(),
+    )
+    total = len(items)
+    start = (page - 1) * page_size
+    return jsonify({
+        "items": items[start:start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "total": total,
+    })
+
+
+@app.get("/api/workspace/teacher/media")
+def workspace_teacher_media():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+        page_size = min(50, max(1, int(request.args.get("page_size", "20"))))
+    except ValueError:
+        return jsonify({"error": "page 和 page_size 必须是整数"}), 400
+
+    media_type = request.args.get("media_type", "all").strip().lower()
+    if media_type not in {"all", "audio", "video", "photo"}:
+        return jsonify({"error": "media_type 必须是 all、audio、video 或 photo"}), 400
+    try:
+        start_date = _parse_optional_media_date(request.args.get("start_date", ""))
+        end_date = _parse_optional_media_date(request.args.get("end_date", ""))
+    except ValueError:
+        return jsonify({"error": "日期格式应为 YYYY-MM-DD"}), 400
+    if start_date and end_date and end_date < start_date:
+        return jsonify({"error": "结束日期不能早于开始日期"}), 400
+    raw_glass_number = request.args.get("glass_number", "").strip()
+    glass_number = _normalize_glass_number(raw_glass_number)
+    if raw_glass_number and not glass_number:
+        return jsonify({"error": "眼镜编号无效"}), 400
+
+    identity_id = str(user["identity_id"])
+    owners = claim_item_owners()
+    items = _list_workspace_admin_media(
+        source_role="teacher",
+        media_type=media_type,
+        start_date=start_date,
+        end_date=end_date,
+        glass_number=glass_number,
+        experiment_type=request.args.get("experiment_type", "").strip(),
+    )
+    visible = []
+    for item in items:
+        item_id = str(item.get("photo_id") if item.get("item_type") == "photo" else item.get("record_id"))
+        item_kind = "photo" if item.get("item_type") == "photo" else "record"
+        owner = owners.get((item_kind, "teacher", item_id)) or {}
+        if owner.get("identity_id") != identity_id:
+            continue
+        if item_kind == "photo":
+            item["thumbnail_url"] = url_for(
+                "workspace_teacher_photo_thumbnail", photo_id=item_id
+            )
+        visible.append(item)
+
+    total = len(visible)
+    start = (page - 1) * page_size
+    return jsonify({
+        "items": visible[start:start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "pages": max(1, (total + page_size - 1) // page_size),
+        "total": total,
+        "binding": active_teacher_binding(identity_id=identity_id),
+    })
 
 
 @app.get("/admin/api/records/<record_id>/files/<filename>")
@@ -2649,10 +2983,19 @@ def _store_uploaded_photo(photo_root: Path, *, record_role: str):
         "original_filename": original_name,
         "size": photo_path.stat().st_size,
     }
-    (photo_dir / "photo.json").write_text(
+    metadata_path = photo_dir / "photo.json"
+    metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    automatic_claim = _auto_claim_teacher_upload(metadata, "photo")
+    if automatic_claim:
+        metadata["owner_identity_id"] = automatic_claim["identity_id"]
+        metadata["automatic_claim_id"] = automatic_claim["claim_id"]
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     _media_analysis_queue.enqueue(photo_dir, photo_path)
     return jsonify({"status": "ok", "photo": _photo_summary(photo_dir)}), 201
 
@@ -2728,6 +3071,49 @@ def teacher_admin_photo_file(photo_id: str):
     if not _teacher_media_access_allowed("photo", photo_id):
         return jsonify({"error": "无权访问该照片"}), 403
     return _send_photo_file(_teacher_photo_root(), photo_id)
+
+
+@app.get("/api/workspace/admin/media/photos/<source_role>/<photo_id>/thumbnail")
+def workspace_admin_photo_thumbnail(source_role: str, photo_id: str):
+    required = _admin_required()
+    if required:
+        return required
+    roots = {"student": _photo_root(), "teacher": _teacher_photo_root()}
+    root = roots.get(source_role)
+    if root is None:
+        return jsonify({"error": "invalid source role"}), 400
+    return _send_photo_thumbnail(root, photo_id)
+
+
+@app.get("/api/workspace/teacher/media/photos/<photo_id>/thumbnail")
+def workspace_teacher_photo_thumbnail(photo_id: str):
+    if not _teacher_media_access_allowed("photo", photo_id):
+        return jsonify({"error": "无权访问该照片"}), 403
+    return _send_photo_thumbnail(_teacher_photo_root(), photo_id)
+
+
+def _send_photo_thumbnail(root: Path, photo_id: str):
+    photo_dir = _resolve_photo_dir(root, photo_id)
+    if photo_dir is None:
+        return jsonify({"error": "photo not found"}), 404
+    photo_path = next(
+        (path for path in photo_dir.iterdir() if path.is_file() and path.suffix.lower() in _ALLOWED_PHOTO_SUFFIXES),
+        None,
+    )
+    if photo_path is None:
+        return jsonify({"error": "photo file not found"}), 404
+    try:
+        with Image.open(photo_path) as source:
+            preview = ImageOps.exif_transpose(source)
+            preview.thumbnail((480, 320), Image.Resampling.LANCZOS)
+            if preview.mode != "RGB":
+                preview = preview.convert("RGB")
+            output = BytesIO()
+            preview.save(output, format="JPEG", quality=78, optimize=True)
+            output.seek(0)
+    except (OSError, ValueError):
+        return jsonify({"error": "unable to create thumbnail"}), 422
+    return send_file(output, mimetype="image/jpeg", max_age=86400)
 
 
 @app.delete("/teacher-admin/api/photos/<photo_id>")
@@ -3844,6 +4230,128 @@ def _save_record_upload(uploaded, record_dir: Path, prefix: str) -> dict[str, An
         "size": target.stat().st_size,
         "content_type": uploaded.mimetype or mimetypes.guess_type(target.name)[0] or "",
     }
+
+
+def _parse_optional_media_date(value: str) -> date | None:
+    text = str(value or "").strip()
+    return datetime.strptime(text, "%Y-%m-%d").date() if text else None
+
+
+def _workspace_media_local_date(item: dict[str, Any], *, photo: bool = False) -> date:
+    raw = item.get("captured_at") if photo else item.get("started_at")
+    raw = raw or item.get("created_at")
+    fallback = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return _candidate_datetime(raw, fallback=fallback).astimezone(_BEIJING_TZ).date()
+
+
+def _record_file_analysis(record: dict[str, Any], filename: str) -> tuple[str, str]:
+    items = (record.get("analysis") or {}).get("items") or {}
+    analysis = items.get(filename) if isinstance(items, dict) else None
+    if not isinstance(analysis, dict):
+        return "", "not_started"
+    return str(analysis.get("transcript", "")).strip(), str(analysis.get("status", "not_started"))
+
+
+def _list_workspace_admin_media(
+    *,
+    source_role: str,
+    media_type: str,
+    start_date: date | None,
+    end_date: date | None,
+    glass_number: str,
+    experiment_type: str,
+) -> list[dict[str, Any]]:
+    device_glasses = {
+        str(glass.get("device_id", "")): str(glass.get("glass_number", ""))
+        for glass in list_glasses()
+        if glass.get("device_id")
+    }
+    roles = ("student", "teacher") if source_role == "all" else (source_role,)
+    items: list[dict[str, Any]] = []
+
+    for role in roles:
+        record_root = _record_root() if role == "student" else _teacher_record_root()
+        record_endpoint = "admin_download_record_file" if role == "student" else "teacher_admin_download_record_file"
+        if media_type != "photo":
+            for record in _list_records(record_root, record_endpoint):
+                item_date = _workspace_media_local_date(record)
+                item_glass = device_glasses.get(str(record.get("device_id", "")), "")
+                if start_date and item_date < start_date:
+                    continue
+                if end_date and item_date > end_date:
+                    continue
+                if glass_number and item_glass != glass_number:
+                    continue
+                if experiment_type and record.get("experiment_type") != experiment_type:
+                    continue
+                for file_info in record.get("files") or []:
+                    filename = str(file_info.get("filename", ""))
+                    suffix = Path(filename).suffix.lower()
+                    if suffix not in _ALLOWED_RECORD_SUFFIXES:
+                        continue
+                    item_type = "video" if suffix == ".mp4" else "audio"
+                    if media_type != "all" and media_type != item_type:
+                        continue
+                    transcript, analysis_status = _record_file_analysis(record, filename)
+                    items.append({
+                        "item_type": item_type,
+                        "source_role": role,
+                        "record_id": record.get("record_id", ""),
+                        "device_id": record.get("device_id", ""),
+                        "glass_number": item_glass,
+                        "experiment_type": record.get("experiment_type", ""),
+                        "created_at": record.get("created_at", ""),
+                        "started_at": record.get("started_at", ""),
+                        "ended_at": record.get("ended_at", ""),
+                        "filename": filename,
+                        "size": file_info.get("size", 0),
+                        "file_url": file_info.get("file_url", ""),
+                        "download_url": file_info.get("download_url", ""),
+                        "analysis_status": analysis_status,
+                        "transcript": transcript,
+                        "sort_at": record.get("started_at") or record.get("created_at", ""),
+                    })
+
+        if media_type in {"all", "photo"}:
+            photo_root = _photo_root() if role == "student" else _teacher_photo_root()
+            photo_endpoint = "admin_photo_file" if role == "student" else "teacher_admin_photo_file"
+            for photo in _list_photos(photo_root, photo_endpoint):
+                item_date = _workspace_media_local_date(photo, photo=True)
+                item_glass = device_glasses.get(str(photo.get("device_id", "")), "")
+                if start_date and item_date < start_date:
+                    continue
+                if end_date and item_date > end_date:
+                    continue
+                if glass_number and item_glass != glass_number:
+                    continue
+                if experiment_type and photo.get("experiment_type") != experiment_type:
+                    continue
+                photo_id = str(photo.get("photo_id", ""))
+                items.append({
+                    "item_type": "photo",
+                    "source_role": role,
+                    "photo_id": photo_id,
+                    "device_id": photo.get("device_id", ""),
+                    "glass_number": item_glass,
+                    "experiment_type": photo.get("experiment_type", ""),
+                    "created_at": photo.get("created_at", ""),
+                    "captured_at": photo.get("captured_at", ""),
+                    "filename": photo.get("filename", ""),
+                    "size": photo.get("size", 0),
+                    "file_url": photo.get("file_url", ""),
+                    "download_url": photo.get("download_url", ""),
+                    "thumbnail_url": url_for(
+                        "workspace_admin_photo_thumbnail",
+                        source_role=role,
+                        photo_id=photo_id,
+                    ),
+                    "sort_at": photo.get("captured_at") or photo.get("created_at", ""),
+                })
+
+    items.sort(key=lambda item: str(item.get("sort_at", "")), reverse=True)
+    for item in items:
+        item.pop("sort_at", None)
+    return items
 
 
 def _list_records(root: Path, download_endpoint: str) -> list[dict[str, Any]]:

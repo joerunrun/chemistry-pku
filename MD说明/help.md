@@ -57,7 +57,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\sync_to_code.ps1 -Apply
 ## 3. 编译和安装
 
 ```powershell
-cd D:\Android\projects
+cd D:\chemistry\chemistry_agent\android\glasses-app
 $env:JAVA_HOME='D:\Android\studio\jbr'
 .\gradlew.bat :app:assembleTeacherDebug
 D:\Android\SDK\platform-tools\adb.exe devices
@@ -113,7 +113,7 @@ ipconfig
 当前连接设备已安装教师包，但 ADB 显示的安装时间早于电脑最新构建，不能视为最新版本。重新构建并覆盖安装：
 
 ```powershell
-cd D:\Android\projects
+cd D:\chemistry\chemistry_agent\android\glasses-app
 $env:JAVA_HOME='D:\Android\studio\jbr'
 .\gradlew.bat :app:assembleTeacherDebug
 D:\Android\SDK\platform-tools\adb.exe install -r .\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
@@ -128,7 +128,7 @@ D:\Android\SDK\platform-tools\adb.exe shell dumpsys package com.example.zrgfirst
 最新教师 APK：
 
 ```text
-D:\Android\projects\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
+D:\chemistry\chemistry_agent\android\glasses-app\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
 ```
 
 ## 7. 常用 ADB
@@ -178,7 +178,7 @@ D:\Android\SDK\platform-tools\adb.exe logcat -d | Select-String "DeviceIdentity"
 打开：
 
 ```text
-D:\Android\projects\app\src\main\res\values\glasses_config.xml
+D:\chemistry\chemistry_agent\android\glasses-app\app\src\main\res\values\glasses_config.xml
 ```
 
 应保持：
@@ -195,7 +195,7 @@ D:\Android\projects\app\src\main\res\values\glasses_config.xml
 先编译 WiFi 设置助手：
 
 ```powershell
-cd D:\Android\WiFisetting
+cd D:\chemistry\chemistry_agent\android\wifi-setting
 $env:JAVA_HOME='D:\Android\studio\jbr'
 .\gradlew.bat :app:assembleDebug
 ```
@@ -203,7 +203,7 @@ $env:JAVA_HOME='D:\Android\studio\jbr'
 再编译学生版和教师版：
 
 ```powershell
-cd D:\Android\projects
+cd D:\chemistry\chemistry_agent\android\glasses-app
 $env:JAVA_HOME='D:\Android\studio\jbr'
 .\gradlew.bat :app:assembleStudentDebug :app:assembleTeacherDebug
 ```
@@ -211,17 +211,17 @@ $env:JAVA_HOME='D:\Android\studio\jbr'
 生成的 APK 分别是：
 
 ```text
-D:\Android\WiFisetting\app\build\outputs\apk\debug\app-debug.apk
-D:\Android\projects\app\build\outputs\apk\student\debug\app-student-debug.apk
-D:\Android\projects\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
+D:\chemistry\chemistry_agent\android\wifi-setting\app\build\outputs\apk\debug\app-debug.apk
+D:\chemistry\chemistry_agent\android\glasses-app\app\build\outputs\apk\student\debug\app-student-debug.apk
+D:\chemistry\chemistry_agent\android\glasses-app\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
 ```
 
 ### 8.4 安装 WiFi 助手、学生版和教师版
 
 ```powershell
-D:\Android\SDK\platform-tools\adb.exe install -r D:\Android\WiFisetting\app\build\outputs\apk\debug\app-debug.apk
-D:\Android\SDK\platform-tools\adb.exe install -r D:\Android\projects\app\build\outputs\apk\student\debug\app-student-debug.apk
-D:\Android\SDK\platform-tools\adb.exe install -r D:\Android\projects\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
+D:\Android\SDK\platform-tools\adb.exe install -r D:\chemistry\chemistry_agent\android\wifi-setting\app\build\outputs\apk\debug\app-debug.apk
+D:\Android\SDK\platform-tools\adb.exe install -r D:\chemistry\chemistry_agent\android\glasses-app\app\build\outputs\apk\student\debug\app-student-debug.apk
+D:\Android\SDK\platform-tools\adb.exe install -r D:\chemistry\chemistry_agent\android\glasses-app\app\build\outputs\apk\teacher\debug\app-teacher-debug.apk
 ```
 
 三个命令都显示 `Success` 即安装完成。安装后眼镜应用列表中应出现“WiFi设置助手”“化学实验识别”和“教师实验助手”。

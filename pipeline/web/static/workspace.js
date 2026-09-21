@@ -8,16 +8,19 @@
 
   const panels = [...document.querySelectorAll('[data-panel]')];
   const tabButtons = [...document.querySelectorAll('[data-tab]')];
+  const tabLoaders = {};
   function showTab(name, updateHash = true) {
     const target = panels.some(panel => panel.dataset.panel === name) ? name : panels[0]?.dataset.panel;
     if (!target) return;
     panels.forEach(panel => panel.classList.toggle('active', panel.dataset.panel === target));
     tabButtons.forEach(button => button.classList.toggle('active', button.dataset.tab === target));
     if (updateHash) history.replaceState(null, '', `#${target}`);
+    if (tabLoaders[target]) tabLoaders[target]();
   }
   tabButtons.forEach(button => button.addEventListener('click', () => showTab(button.dataset.tab)));
   const aliases = { admin: 'admin-devices', 'teacher-tools': 'teacher-reports' };
-  showTab(aliases[location.hash.slice(1)] || location.hash.slice(1), false);
+  const requestedTab = location.hash.slice(1);
+  showTab(aliases[requestedTab] || requestedTab, false);
 
   function localDate(value) { return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`; }
   function localTime(value) { return `${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}`; }
@@ -32,7 +35,7 @@
   }
 
   // User profile, claims, calendar and claimed data.
-  if (cfg.identityId) {
+  if (cfg.identityId && cfg.role !== 'teacher') {
     let matchedItems = [];
     let pendingGroups = [];
     let calendarEntries = [];
@@ -62,8 +65,8 @@
   }
 
   async function loadExperiments() {
-    if (!byId('reportExperiment') && !byId('videoExperiment')) return;
-    try { const data = await fetchJson('/api/glasses/health'); const options = (data.experiments || []).map(item => `<option value="${esc(item.value)}">${esc(item.label || item.value)}</option>`).join(''); if (byId('reportExperiment')) byId('reportExperiment').innerHTML = `<option value="">全部实验</option>${options}`; if (byId('videoExperiment')) byId('videoExperiment').innerHTML = options; } catch (error) { setStatus('reportStatus', error.message, true); }
+    if (!byId('reportExperiment') && !byId('videoExperiment') && !byId('adminMediaExperiment') && !byId('teacherMediaExperiment')) return;
+    try { const data = await fetchJson('/api/glasses/health'); const options = (data.experiments || []).map(item => `<option value="${esc(item.value)}">${esc(item.label || item.value)}</option>`).join(''); if (byId('reportExperiment')) byId('reportExperiment').innerHTML = `<option value="">全部实验</option>${options}`; if (byId('videoExperiment')) byId('videoExperiment').innerHTML = options; if (byId('adminMediaExperiment')) byId('adminMediaExperiment').innerHTML = `<option value="">全部实验</option>${options}`; if (byId('teacherMediaExperiment')) byId('teacherMediaExperiment').innerHTML = `<option value="">全部实验</option>${options}`; } catch (error) { setStatus('reportStatus', error.message, true); }
   }
 
   // Teacher scoped reports.
@@ -83,12 +86,102 @@
     const today = new Date(); byId('reportEndDate').value = localDate(today); byId('reportStartDate').value = localDate(new Date(today.getTime() - 6 * 86400000)); loadReports();
   }
 
-  function recordCards(records, deleteScope = '', roleLabel = '') {
-    return records.flatMap(record => (record.files || []).map(file => ({ record, file }))).map(({ record, file }) => `<article class="item"><div class="item-head"><b>${/\.mp4$/i.test(file.filename) ? '实验录像' : '音频记录'} ${roleLabel}</b><span class="badge">${esc(record.experiment_type || '未标记实验')}</span></div><div>${esc(record.created_at || '')} · ${esc(record.device_id || '')}</div>${/\.mp4$/i.test(file.filename) ? `<video controls preload="metadata" src="${esc(file.file_url)}"></video>` : ''}<div class="item-links"><a class="button secondary" href="${esc(file.download_url)}">下载 ${esc(file.filename)}</a>${deleteScope ? `<button class="danger" data-delete-record="${esc(record.record_id)}" data-delete-scope="${esc(deleteScope)}">删除整条记录</button>` : ''}</div></article>`).join('');
+  let teacherBinding = null;
+  async function loadTeacherBinding() {
+    const data = await fetchJson('/api/workspace/teacher/binding');
+    teacherBinding = data.binding || null;
+    const select = byId('teacherBindingGlass');
+    if (select) {
+      select.innerHTML = '<option value="">请选择眼镜</option>' + (data.glasses || []).map(glass => {
+        const note = !glass.calibrated ? '（待校准）' : !glass.available ? '（已被占用）' : '';
+        return `<option value="${esc(glass.glass_number)}" ${glass.current ? 'selected' : ''} ${!glass.calibrated || !glass.available ? 'disabled' : ''}>${esc(glass.glass_number)}号${note}</option>`;
+      }).join('');
+      byId('teacherBindingBadge').textContent = teacherBinding ? `${teacherBinding.glass_number}号眼镜` : '尚未选择';
+      byId('teacherBindingHistory').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article class="item"><b>${esc(item.glass_number)}号眼镜</b><div>${esc(item.started_at)} 至 ${esc(item.ended_at || '当前')}</div></article>`).join('') : '<span class="muted">还没有使用历史。</span>';
+    }
+    return data;
   }
-  function photoCards(photos, deleteScope = '', roleLabel = '') { return photos.map(photo => `<article class="item"><div class="item-head"><b>照片 ${roleLabel}</b><span class="badge">${esc(photo.experiment_type || '未标记实验')}</span></div><div>${esc(photo.created_at || '')} · ${esc(photo.device_id || '')}</div><a href="${esc(photo.file_url)}" target="_blank"><img class="thumb" src="${esc(photo.file_url)}" alt="实验照片"></a><div class="item-links"><a class="button secondary" href="${esc(photo.download_url)}">下载</a>${deleteScope ? `<button class="danger" data-delete-photo="${esc(photo.photo_id)}" data-delete-scope="${esc(deleteScope)}">删除</button>` : ''}</div></article>`).join(''); }
-  async function loadTeacherMedia() { if (!byId('teacherAudio')) return; try { const [recordsData, photosData] = await Promise.all([fetchJson('/teacher-admin/api/records'), fetchJson('/teacher-admin/api/photos')]); const records = recordsData.records || []; const audioRecords = records.map(record => ({ ...record, files: (record.files || []).filter(file => !/\.mp4$/i.test(file.filename)) })).filter(record => record.files.length); const videoRecords = records.map(record => ({ ...record, files: (record.files || []).filter(file => /\.mp4$/i.test(file.filename)) })).filter(record => record.files.length); byId('teacherAudio').innerHTML = recordCards(audioRecords, 'teacher') || '<span class="muted">没有音频记录。</span>'; byId('teacherVideos').innerHTML = recordCards(videoRecords, 'teacher') || '<span class="muted">没有实验录像。</span>'; byId('teacherPhotos').innerHTML = photoCards(photosData.photos || [], 'teacher') || '<span class="muted">没有照片。</span>'; } catch (error) { byId('teacherAudio').textContent = error.message; } }
-  if (byId('refreshTeacherMedia')) { byId('refreshTeacherMedia').onclick = loadTeacherMedia; loadTeacherMedia(); }
+
+  if (cfg.role === 'teacher') {
+    byId('saveTeacherBinding').onclick = async () => {
+      const glassNumber = byId('teacherBindingGlass').value;
+      if (!glassNumber) return setStatus('teacherBindingStatus', '请先选择一副已经校准的眼镜。', true);
+      const wasUnbound = !teacherBinding;
+      try {
+        const data = await fetchJson('/api/workspace/teacher/binding', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glassNumber }) });
+        teacherBinding = data.binding;
+        await loadTeacherBinding();
+        setStatus('teacherBindingStatus', `${glassNumber}号眼镜已经设为当前教师眼镜。`);
+        if (wasUnbound) showTab('teacher-media');
+      } catch (error) { setStatus('teacherBindingStatus', error.message, true); }
+    };
+    byId('openTeacherMedia').onclick = () => showTab('teacher-media');
+  }
+
+  function teacherMediaCard(item) {
+    const labels = { audio: '录音', video: '录像', photo: '照片' };
+    const when = item.started_at || item.captured_at || item.created_at || '';
+    const common = `<div>${esc(when)} · ${esc(item.glass_number ? `${item.glass_number}号眼镜` : '眼镜未校准')} · ${esc(item.experiment_type || '未标记实验')}</div><div class="muted">${esc(item.device_id || '')} · ${size(item.size)}</div>`;
+    let preview = '';
+    let links = '';
+    if (item.item_type === 'photo') {
+      preview = `<a href="${esc(item.file_url)}" target="_blank" rel="noopener"><img class="thumb" loading="lazy" decoding="async" src="${esc(item.thumbnail_url)}" alt="实验照片缩略图"></a>`;
+      links = `<a class="button secondary" href="${esc(item.file_url)}" target="_blank" rel="noopener">查看原图</a><a class="button secondary" href="${esc(item.download_url)}">下载</a><button class="danger" data-delete-photo="${esc(item.photo_id)}" data-delete-scope="teacher">删除</button>`;
+    } else {
+      links = `<a class="button secondary" href="${esc(item.file_url)}" target="_blank" rel="noopener">打开${labels[item.item_type]}</a><a class="button secondary" href="${esc(item.download_url)}">下载</a><button class="danger" data-delete-record="${esc(item.record_id)}" data-delete-scope="teacher">删除整条记录</button>`;
+      if (item.item_type === 'audio') {
+        const statusText = item.analysis_status === 'pending' ? '正在转写' : item.analysis_status === 'failed' ? '转写失败' : '暂无转写';
+        preview = item.transcript ? `<div class="transcript"><b>语音转写</b><br>${esc(item.transcript)}</div>` : `<div class="transcript muted">${statusText}</div>`;
+      }
+    }
+    return `<article class="item"><div class="item-head"><b>${labels[item.item_type] || '资料'}</b><span class="badge">${esc(item.filename || '')}</span></div>${common}${preview}<div class="item-links">${links}</div></article>`;
+  }
+
+  let teacherMediaPage = 1;
+  let teacherMediaPages = 1;
+  let teacherMediaLoaded = false;
+  let teacherMediaLoading = false;
+  function teacherMediaQuery(page) {
+    return new URLSearchParams({
+      page: String(page), page_size: '20', media_type: byId('teacherMediaType').value,
+      start_date: byId('teacherMediaStart').value, end_date: byId('teacherMediaEnd').value,
+      glass_number: byId('teacherMediaGlass').value, experiment_type: byId('teacherMediaExperiment').value,
+    });
+  }
+  async function loadTeacherMedia(page = teacherMediaPage) {
+    if (!byId('teacherMediaList') || teacherMediaLoading) return;
+    teacherMediaLoading = true;
+    setStatus('teacherMediaStatus', '正在加载当前页……');
+    try {
+      const data = await fetchJson(`/api/workspace/teacher/media?${teacherMediaQuery(page)}`);
+      teacherMediaPage = Number(data.page || 1);
+      teacherMediaPages = Number(data.pages || 1);
+      const items = data.items || [];
+      byId('teacherMediaList').innerHTML = items.length ? items.map(teacherMediaCard).join('') : '<span class="muted">当前条件下没有你的教师资料。</span>';
+      byId('teacherMediaPage').textContent = `第 ${teacherMediaPage} / ${teacherMediaPages} 页`;
+      byId('teacherMediaPrev').disabled = teacherMediaPage <= 1;
+      byId('teacherMediaNext').disabled = teacherMediaPage >= teacherMediaPages;
+      byId('teacherMediaBinding').textContent = data.binding ? `当前使用：${data.binding.glass_number}号眼镜；旧眼镜资料仍会保留。` : '尚未选择当前教师眼镜；已认领的旧资料仍可查看。';
+      setStatus('teacherMediaStatus', `共 ${Number(data.total || 0)} 条资料，当前显示 ${items.length} 条。`);
+      teacherMediaLoaded = true;
+    } catch (error) { setStatus('teacherMediaStatus', error.message, true); }
+    finally { teacherMediaLoading = false; }
+  }
+  if (cfg.role === 'teacher') {
+    tabLoaders['teacher-media'] = () => { if (!teacherMediaLoaded) loadTeacherMedia(1); };
+    byId('refreshTeacherMedia').onclick = () => loadTeacherMedia(teacherMediaPage);
+    byId('applyTeacherMediaFilters').onclick = () => loadTeacherMedia(1);
+    byId('clearTeacherMediaFilters').onclick = () => {
+      byId('teacherMediaType').value = 'all';
+      ['teacherMediaStart', 'teacherMediaEnd', 'teacherMediaGlass', 'teacherMediaExperiment'].forEach(id => { byId(id).value = ''; });
+      loadTeacherMedia(1);
+    };
+    byId('teacherMediaPrev').onclick = () => { if (teacherMediaPage > 1) loadTeacherMedia(teacherMediaPage - 1); };
+    byId('teacherMediaNext').onclick = () => { if (teacherMediaPage < teacherMediaPages) loadTeacherMedia(teacherMediaPage + 1); };
+    loadTeacherBinding().then(() => { if (!requestedTab) showTab(teacherBinding ? 'teacher-media' : 'claims'); }).catch(error => setStatus('teacherBindingStatus', error.message, true));
+    fetchJson('/api/auth/profile').then(data => { byId('profileData').textContent = data.profile ? JSON.stringify(data.profile, null, 2) : '尚未保存门户原始字段。'; }).catch(error => { byId('profileData').textContent = error.message; });
+    tabLoaders['student-data'] = async () => { try { const data = await fetchJson('/api/workspace/data'); byId('studentData').innerHTML = (data.student_items || []).length ? data.student_items.map(dataItem).join('') : '<span class="muted">还没有学生数据。</span>'; } catch (error) { byId('studentData').textContent = error.message; } };
+  }
 
   // Shared demo videos and feedback.
   async function loadVideos() { if (!byId('videoExperiment')?.value) return; try { const data = await fetchJson(`/admin/api/demo/videos?experiment_type=${encodeURIComponent(byId('videoExperiment').value)}`); byId('videoList').innerHTML = (data.videos || []).length ? data.videos.map(video => `<article class="item"><b>${esc(video.label || video.filename)}</b><div>${esc(video.experiment_label || video.experiment_type)} · ${size(video.size)}</div><div class="item-links"><a class="button secondary" href="/admin/api/demo/videos/${encodeURIComponent(video.id)}/download">下载</a><button class="danger" data-delete-demo="${esc(video.id)}">删除</button></div></article>`).join('') : '<span class="muted">这个实验还没有演示视频。</span>'; setStatus('videoStatus', `共 ${(data.videos || []).length} 个视频。`); } catch (error) { setStatus('videoStatus', error.message, true); } }
@@ -98,12 +191,109 @@
 
   // Administrator tools.
   async function loadAdminGlasses() { if (!byId('adminGlasses')) return; try { const data = await fetchJson('/admin/api/auth/glasses'); byId('adminGlasses').innerHTML = (data.glasses || []).map(glass => `<article class="mini-card"><b>${esc(glass.glass_number)} 号</b><input data-glass-device="${esc(glass.glass_number)}" value="${esc(glass.device_id || '')}" placeholder="稳定硬件 device_id"><button data-save-glass="${esc(glass.glass_number)}">保存校准</button></article>`).join(''); } catch (error) { setStatus('adminGlassStatus', error.message, true); } }
-  async function loadAdminUsers() { if (!byId('adminUsers')) return; try { const data = await fetchJson('/admin/api/auth/users'); byId('adminUserStatus').textContent = `共 ${(data.users || []).length} 个身份。`; byId('adminUsers').innerHTML = `<table><thead><tr><th>身份</th><th>门户判断</th><th>当前角色</th><th>来源</th><th>原始字段</th></tr></thead><tbody>${(data.users || []).map(user => `<tr><td>${esc(user.identity_id.startsWith('demo-') ? user.identity_id : `${user.identity_id.slice(0, 2)}***${user.identity_id.slice(-2)}`)}</td><td>${user.portal_role === 'student' ? '学生' : user.portal_role === 'teacher' ? '教师' : '未知'}</td><td><select data-user-role="${esc(user.identity_id)}"><option value="student" ${user.role === 'student' ? 'selected' : ''}>学生</option><option value="teacher" ${user.role === 'teacher' ? 'selected' : ''}>教师</option><option value="portal">恢复门户判断</option></select></td><td>${esc(user.role_source || '')}</td><td><details><summary>查看原始字段</summary><pre class="profile">${esc(user.profile ? JSON.stringify(user.profile, null, 2) : '尚未保存')}</pre></details></td></tr>`).join('')}</tbody></table>`; } catch (error) { byId('adminUserStatus').textContent = error.message; } }
-  async function loadAdminMedia() { if (!byId('adminStudentMedia')) return; try { const [sr, sp, tr, tp] = await Promise.all([fetchJson('/admin/api/records'), fetchJson('/admin/api/photos'), fetchJson('/teacher-admin/api/records'), fetchJson('/teacher-admin/api/photos')]); byId('adminStudentMedia').innerHTML = recordCards(sr.records || [], 'student', '· 学生') + photoCards(sp.photos || [], 'student', '· 学生') || '<span class="muted">没有学生资料。</span>'; byId('adminTeacherMedia').innerHTML = recordCards(tr.records || [], 'teacher', '· 教师') + photoCards(tp.photos || [], 'teacher', '· 教师') || '<span class="muted">没有教师资料。</span>'; } catch (error) { byId('adminStudentMedia').textContent = error.message; } }
+  async function loadAdminUsers() {
+    if (!byId('adminUsers')) return;
+    try {
+      const data = await fetchJson('/admin/api/auth/users');
+      const bindings = data.teacher_bindings || [];
+      const bindingByTeacher = Object.fromEntries(bindings.map(item => [item.identity_id, item.glass_number]));
+      const teacherByGlass = Object.fromEntries(bindings.map(item => [item.glass_number, item.identity_id]));
+      const glassOptions = user => cfg.glasses.map(glass => {
+        const occupiedBy = teacherByGlass[glass.glass_number];
+        const disabled = !glass.device_id || (occupiedBy && occupiedBy !== user.identity_id);
+        const note = !glass.device_id ? '（待校准）' : occupiedBy && occupiedBy !== user.identity_id ? '（已占用）' : '';
+        return `<option value="${esc(glass.glass_number)}" ${bindingByTeacher[user.identity_id] === glass.glass_number ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${esc(glass.glass_number)}号${note}</option>`;
+      }).join('');
+      byId('adminUserStatus').textContent = `共 ${(data.users || []).length} 个身份。`;
+      byId('adminUsers').innerHTML = `<table><thead><tr><th>身份</th><th>门户判断</th><th>当前角色</th><th>教师眼镜</th><th>来源</th><th>原始字段</th></tr></thead><tbody>${(data.users || []).map(user => `<tr><td>${esc(user.identity_id.startsWith('demo-') ? user.identity_id : `${user.identity_id.slice(0, 2)}***${user.identity_id.slice(-2)}`)}</td><td>${user.portal_role === 'student' ? '学生' : user.portal_role === 'teacher' ? '教师' : '未知'}</td><td><select data-user-role="${esc(user.identity_id)}"><option value="student" ${user.role === 'student' ? 'selected' : ''}>学生</option><option value="teacher" ${user.role === 'teacher' ? 'selected' : ''}>教师</option><option value="portal">恢复门户判断</option></select></td><td>${user.role === 'teacher' ? `<select data-user-glass="${esc(user.identity_id)}"><option value="">未绑定</option>${glassOptions(user)}</select>` : '—'}</td><td>${esc(user.role_source || '')}</td><td><details><summary>查看原始字段</summary><pre class="profile">${esc(user.profile ? JSON.stringify(user.profile, null, 2) : '尚未保存')}</pre></details></td></tr>`).join('')}</tbody></table>`;
+    } catch (error) { byId('adminUserStatus').textContent = error.message; }
+  }
+  let adminMediaPage = 1;
+  let adminMediaPages = 1;
+  let adminMediaLoaded = false;
+  let adminMediaLoading = false;
+  function adminMediaCard(item) {
+    const labels = { audio: '录音', video: '录像', photo: '照片' };
+    const role = item.source_role === 'teacher' ? '教师' : '学生';
+    const when = item.started_at || item.captured_at || item.created_at || '';
+    const glass = item.glass_number ? `${item.glass_number}号眼镜` : '眼镜未校准';
+    const common = `<div>${esc(when)} · ${esc(glass)} · ${esc(item.experiment_type || '未标记实验')}</div><div class="muted">${esc(item.device_id || '')} · ${size(item.size)}</div>`;
+    let preview = '';
+    let links = '';
+    if (item.item_type === 'photo') {
+      preview = `<a href="${esc(item.file_url)}" target="_blank" rel="noopener"><img class="thumb" loading="lazy" decoding="async" src="${esc(item.thumbnail_url)}" alt="实验照片缩略图"></a>`;
+      links = `<a class="button secondary" href="${esc(item.file_url)}" target="_blank" rel="noopener">查看原图</a><a class="button secondary" href="${esc(item.download_url)}">下载</a><button class="danger" data-delete-photo="${esc(item.photo_id)}" data-delete-scope="${esc(item.source_role)}">删除</button>`;
+    } else {
+      const openLabel = item.item_type === 'video' ? '打开录像' : '打开录音';
+      links = `<a class="button secondary" href="${esc(item.file_url)}" target="_blank" rel="noopener">${openLabel}</a><a class="button secondary" href="${esc(item.download_url)}">下载</a><button class="danger" data-delete-record="${esc(item.record_id)}" data-delete-scope="${esc(item.source_role)}">删除整条记录</button>`;
+      if (item.item_type === 'audio') {
+        const statusText = item.analysis_status === 'pending' ? '正在转写' : item.analysis_status === 'failed' ? '转写失败' : '暂无转写';
+        preview = item.transcript ? `<div class="transcript"><b>语音转写</b><br>${esc(item.transcript)}</div>` : `<div class="transcript muted">${statusText}</div>`;
+      }
+    }
+    return `<article class="item"><div class="item-head"><b>${labels[item.item_type] || '资料'} · ${role}</b><span class="badge">${esc(item.filename || '')}</span></div>${common}${preview}<div class="item-links">${links}</div></article>`;
+  }
+  function adminMediaQuery(page) {
+    return new URLSearchParams({
+      page: String(page), page_size: '20',
+      source_role: byId('adminMediaRole').value,
+      media_type: byId('adminMediaType').value,
+      start_date: byId('adminMediaStart').value,
+      end_date: byId('adminMediaEnd').value,
+      glass_number: byId('adminMediaGlass').value,
+      experiment_type: byId('adminMediaExperiment').value,
+    });
+  }
+  async function loadAdminMedia(page = adminMediaPage) {
+    if (!byId('adminMediaList') || adminMediaLoading) return;
+    adminMediaLoading = true;
+    setStatus('adminMediaStatus', '正在加载当前页……');
+    try {
+      const data = await fetchJson(`/api/workspace/admin/media?${adminMediaQuery(page)}`);
+      adminMediaPage = Number(data.page || 1);
+      adminMediaPages = Number(data.pages || 1);
+      const items = data.items || [];
+      byId('adminMediaList').innerHTML = items.length ? items.map(adminMediaCard).join('') : '<span class="muted">当前筛选条件下没有资料。</span>';
+      byId('adminMediaPage').textContent = `第 ${adminMediaPage} / ${adminMediaPages} 页`;
+      byId('adminMediaPrev').disabled = adminMediaPage <= 1;
+      byId('adminMediaNext').disabled = adminMediaPage >= adminMediaPages;
+      setStatus('adminMediaStatus', `共 ${Number(data.total || 0)} 条资料，当前显示 ${items.length} 条。`);
+      adminMediaLoaded = true;
+    } catch (error) {
+      setStatus('adminMediaStatus', error.message, true);
+    } finally {
+      adminMediaLoading = false;
+    }
+  }
   async function loadTestIdentities() { if (!byId('testIdentities')) return; try { const data = await fetchJson('/api/workspace/admin/test-identities'); byId('testIdentities').innerHTML = (data.identities || []).map(item => `<article class="mini-card"><b>${esc(item.name)}</b><div>${esc(item.identity_id)} · ${item.current_role === 'teacher' ? '教师' : '学生'}</div><form action="/admin/test-identities/${encodeURIComponent(item.key)}/login" method="post"><button>以此身份进入</button></form></article>`).join(''); } catch (error) { byId('testIdentities').textContent = error.message; } }
-  if (cfg.adminUnlocked) { loadAdminGlasses(); loadAdminUsers(); loadAdminMedia(); loadTestIdentities(); if (byId('refreshAdminMedia')) byId('refreshAdminMedia').onclick = loadAdminMedia; }
+  if (cfg.adminUnlocked) {
+    loadAdminGlasses();
+    loadAdminUsers();
+    loadTestIdentities();
+    tabLoaders['admin-media'] = () => { if (!adminMediaLoaded) loadAdminMedia(1); };
+    byId('refreshAdminMedia').onclick = () => loadAdminMedia(adminMediaPage);
+    byId('applyAdminMediaFilters').onclick = () => loadAdminMedia(1);
+    byId('clearAdminMediaFilters').onclick = () => {
+      ['adminMediaRole', 'adminMediaType'].forEach(id => { byId(id).value = 'all'; });
+      ['adminMediaStart', 'adminMediaEnd', 'adminMediaGlass', 'adminMediaExperiment'].forEach(id => { byId(id).value = ''; });
+      loadAdminMedia(1);
+    };
+    byId('adminMediaPrev').onclick = () => { if (adminMediaPage > 1) loadAdminMedia(adminMediaPage - 1); };
+    byId('adminMediaNext').onclick = () => { if (adminMediaPage < adminMediaPages) loadAdminMedia(adminMediaPage + 1); };
+    if (document.querySelector('[data-panel="admin-media"].active')) loadAdminMedia(1);
+  }
 
-  document.addEventListener('change', async event => { const id = event.target.dataset.userRole; if (!id) return; try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(id)}/role`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: event.target.value }) }); await loadAdminUsers(); } catch (error) { alert(error.message); } });
+  document.addEventListener('change', async event => {
+    const roleIdentity = event.target.dataset.userRole;
+    if (roleIdentity) {
+      try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(roleIdentity)}/role`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: event.target.value }) }); await loadAdminUsers(); } catch (error) { alert(error.message); }
+      return;
+    }
+    const glassIdentity = event.target.dataset.userGlass;
+    if (glassIdentity) {
+      try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(glassIdentity)}/glass`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: event.target.value }) }); await loadAdminUsers(); } catch (error) { alert(error.message); await loadAdminUsers(); }
+    }
+  });
   document.addEventListener('click', async event => {
     const number = event.target.dataset.saveGlass;
     if (number) { const input = document.querySelector(`[data-glass-device="${CSS.escape(number)}"]`); try { await fetchJson(`/admin/api/auth/glasses/${encodeURIComponent(number)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_id: input.value }) }); setStatus('adminGlassStatus', `${number} 号眼镜已保存。`); await loadAdminGlasses(); } catch (error) { setStatus('adminGlassStatus', error.message, true); } }
