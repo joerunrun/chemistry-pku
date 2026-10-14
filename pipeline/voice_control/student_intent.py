@@ -52,7 +52,13 @@ def parse_student_intent(text: str, transcript: str, context: str, recording_sta
         return result
     result["transcript"] = str(payload.get("transcript") or transcript)
     intent = payload.get("intent")
-    if intent not in INTENTS:
+    if not isinstance(intent, str) or intent not in INTENTS:
+        return result
+    if context == "student_setup" and intent not in {"select_experiment", "no_action"}:
+        return result
+    if context == "student_demo_select" and intent not in {"select_demo_video", "no_action"}:
+        return result
+    if context == "student_demo_playing" and intent not in {"stop_demo_video", "no_action"}:
         return result
     if intent == "select_experiment" and context != "student_setup":
         return result

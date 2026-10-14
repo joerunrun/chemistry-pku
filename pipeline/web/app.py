@@ -120,6 +120,7 @@ _vlm_semaphore = Semaphore(int(os.environ.get("CHEM_VLM_CONCURRENCY", "4")))
 _omni_semaphore = Semaphore(int(os.environ.get("CHEM_OMNI_CONCURRENCY", "4")))
 _media_analysis_queue = MediaAnalysisQueue()
 _device_mapping_lock = Lock()
+_student_upload_lock = Lock()
 _common_issue_lock = Lock()
 _common_issue_submitted: set[str] = set()
 _daily_course_lock = Lock()
@@ -2474,6 +2475,7 @@ def glasses_health():
             "qa",
             "qa_audio",
             "voice_intent",
+            "student_direct_control",
             "tts_audio",
             "demo_video",
             "teacher_speaker_verify",
@@ -2664,7 +2666,8 @@ def admin_delete_demo_video(video_id: str):
 
 @app.post("/api/glasses/records/upload")
 def glasses_upload_record():
-    return _store_uploaded_record(_record_root(), record_role="student")
+    with _student_upload_lock:
+        return _store_uploaded_record(_record_root(), record_role="student")
 
 
 @app.post("/api/glasses/teacher/records/upload")
@@ -2682,7 +2685,16 @@ def _store_uploaded_record(record_root: Path, *, record_role: str):
     device_id = _safe_text_field(request.form.get("device_id"), "unknown_device")
     experiment_type = _safe_text_field(request.form.get("experiment_type"), "unknown_experiment")
     record_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    record_dir = record_root / now.strftime("%Y%m%d") / record_id
+    client_id = request.form.get("client_record_id", "").strip() if record_role == "student" else ""
+    if client_id and not re.fullmatch(r"\d{8}_[0-9a-f]{32}", client_id):
+        return jsonify({"error": "invalid client_record_id"}), 400
+    record_id = client_id or record_id
+    record_dir = record_root / (client_id[:8] if client_id else now.strftime("%Y%m%d")) / record_id
+    if client_id and (record_dir / "record.json").is_file():
+        existing = json.loads((record_dir / "record.json").read_text(encoding="utf-8"))
+        if existing.get("device_id") != device_id:
+            return jsonify({"error": "record ID belongs to another device"}), 409
+        return jsonify({"status": "ok", "record": _record_summary(record_dir)}), 201
     record_dir.mkdir(parents=True, exist_ok=True)
 
     files: list[dict[str, Any]] = []
@@ -2940,7 +2952,8 @@ def teacher_admin_delete_record(record_id: str):
 
 @app.post("/api/glasses/photos/upload")
 def glasses_upload_photo():
-    return _store_uploaded_photo(_photo_root(), record_role="student")
+    with _student_upload_lock:
+        return _store_uploaded_photo(_photo_root(), record_role="student")
 
 
 @app.post("/api/glasses/teacher/photos/upload")
@@ -2960,7 +2973,16 @@ def _store_uploaded_photo(photo_root: Path, *, record_role: str):
 
     now = datetime.now(timezone.utc)
     photo_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    photo_dir = photo_root / now.strftime("%Y%m%d") / photo_id
+    client_id = request.form.get("client_record_id", "").strip() if record_role == "student" else ""
+    if client_id and not re.fullmatch(r"\d{8}_[0-9a-f]{32}", client_id):
+        return jsonify({"error": "invalid client_record_id"}), 400
+    photo_id = client_id or photo_id
+    photo_dir = photo_root / (client_id[:8] if client_id else now.strftime("%Y%m%d")) / photo_id
+    if client_id and (photo_dir / "photo.json").is_file():
+        existing = json.loads((photo_dir / "photo.json").read_text(encoding="utf-8"))
+        if existing.get("device_id") != _safe_text_field(request.form.get("device_id"), "unknown_device"):
+            return jsonify({"error": "photo ID belongs to another device"}), 409
+        return jsonify({"status": "ok", "photo": _photo_summary(photo_dir)}), 201
     photo_dir.mkdir(parents=True, exist_ok=True)
     photo_path = photo_dir / f"photo{suffix}"
     try:
@@ -2977,7 +2999,7 @@ def _store_uploaded_photo(photo_root: Path, *, record_role: str):
             request.form.get("experiment_type"),
             "unknown_experiment",
         ),
-        "captured_at": request.form.get("captured_at", ""),
+        "captured_at": request.form.get("captured_at") or request.form.get("started_at", ""),
         "created_at": now.isoformat(),
         "filename": photo_path.name,
         "original_filename": original_name,

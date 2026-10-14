@@ -374,6 +374,12 @@ def classify_audio_intent(
 
         if is_student:
             result = parse_student_intent(callback.answer_text, callback.transcript, ctx, recording_state)
+            if result["intent"] == "select_experiment":
+                experiment = _match_experiment_type(result["transcript"]) or result["slots"].get("experiment_type")
+                if experiment in SUPPORTED_EXPERIMENTS:
+                    result["slots"]["experiment_type"] = experiment
+                else:
+                    result["intent"] = "no_action"
         elif is_teacher_sleep:
             result = quick_teacher_result or _parse_teacher_wake_json(
                 callback.answer_text,
