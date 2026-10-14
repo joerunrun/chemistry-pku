@@ -239,11 +239,13 @@ class MainActivity : Activity(), SensorEventListener {
                     paint.color = color
                     canvas.drawText(value, w * 0.5f, h * y, paint)
                 }
-                text(if (BuildConfig.CURSOR_MODE) "B · 十字边沿测试" else "A · 头部动作测试", 0.13f, 0.038f)
-                text(status, 0.70f, 0.030f, Color.rgb(110, 240, 215))
-                text("触发次数：$count", 0.78f, 0.034f)
-                text("左右 %.1f°   上下 %.1f°".format(yaw, pitch), 0.84f, 0.025f)
-                text("单击回正校准 · 双击退出", 0.91f, 0.025f)
+                if (!BuildConfig.CURSOR_MODE) {
+                    text("A · 头部动作测试", 0.13f, 0.038f)
+                    text(status, 0.70f, 0.030f, Color.rgb(110, 240, 215))
+                    text("触发次数：$count", 0.78f, 0.034f)
+                    text("左右 %.1f°   上下 %.1f°".format(yaw, pitch), 0.84f, 0.025f)
+                    text("单击回正校准 · 双击退出", 0.91f, 0.025f)
+                }
                 val success = SystemClock.elapsedRealtime() < successUntil
                 if (!BuildConfig.CURSOR_MODE || visibleTarget || success) {
                     val tx = w * 0.80f
