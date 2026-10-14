@@ -1,9 +1,7 @@
 ﻿package com.example.zrgfirstapp
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.ComponentName
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
@@ -12,18 +10,12 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.media.MediaPlayer
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.provider.MediaStore
 import android.util.Base64
 import android.view.GestureDetector
 import android.view.Gravity
@@ -49,16 +41,11 @@ import java.io.BufferedReader
 import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlin.math.abs
-import kotlin.math.max
 
 class MainActivity : AppCompatActivity() {
     private enum class ScreenState {
@@ -111,11 +98,6 @@ class MainActivity : AppCompatActivity() {
         VOICE_CONTROL,
     }
 
-    private enum class VoiceMode {
-        SLEEP,  // 沉睡模式：只检测唤醒词"小北"
-        AWAKE,  // 苏醒模式：识别完整指令
-    }
-
     private enum class PassiveListenMode {
         NONE,
         DEMO_STOP,
@@ -147,7 +129,7 @@ class MainActivity : AppCompatActivity() {
         get() = listOf(leftPanel, rightPanel)
 
     private val connectionMode: String by lazy {
-        getString(R.string.glasses_connection_mode).trim().lowercase()
+        if (BuildConfig.STUDENT_TEST) "usb" else getString(R.string.glasses_connection_mode).trim().lowercase()
     }
     private val baseUrl: String by lazy {
         val urlRes = if (connectionMode == "network") {
@@ -163,19 +145,11 @@ class MainActivity : AppCompatActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var gestureDetector: GestureDetector
-    private val qaSampleRate = 16_000
-    private val qaRecordDurationMs = 7_000L
-    private val voiceIntentRecordDurationMs = 5_000L
-    private val voiceIntentMinRms = 50.0
-    private val voiceIntentMinSpeechChunks = 3
     private val actionMenuTimeoutMs = 8_000L
     private val captureCountdownMs = 2_500L
-    private val awakeTimeoutMs = 15_000L
 
     private var screenState = ScreenState.WELCOME
-    private var voiceMode = VoiceMode.SLEEP
     private var passiveListenMode = PassiveListenMode.NONE
-    private var awakeDeadlineMs = 0L
     private var focusIndex = 0
     private var selectedMode = Mode.EXPERIMENT
     private var selectedExperimentType = ExperimentType.DISTILLATION
@@ -189,7 +163,6 @@ class MainActivity : AppCompatActivity() {
     private var pendingAudioPermissionAction = AudioPermissionAction.NONE
     private var recordingRequested = false
     private var recordingVideo = false
-    private var recordingStartedAt: String? = null
     private var standalonePhotoRequested = false
     private var recordingStatusText = "未记录"
     private var connectionStatusText = "未测试"
@@ -199,10 +172,15 @@ class MainActivity : AppCompatActivity() {
     private var voiceControlPausedUntilMs = 0L
     private var recordingService: RecordingService? = null
     private var serviceBound = false
-    private var audioRecord: AudioRecord? = null
-    private var isAudioRecording = false
-    private var isVoiceIntentRecording = false
-    private var recognizedQuestion = ""
+    private var serviceBindRequested = false
+    private var studentQuestionPending = false
+    private var studentCommandsEnabled = false
+    private var studentRequestInFlight = false
+    private val studentPendingUtterances = java.util.ArrayDeque<StudentUtterance>()
+    private var studentCommandSource: StudentUtterance? = null
+    private var studentRecentDialogue = ""
+    private var studentDialogueUntil = 0L
+    private var studentForeground = false
     private var assistantPlayer: MediaPlayer? = null
     private var assistantAudioFile: File? = null
     private data class DemoVideo(
@@ -244,6 +222,26 @@ class MainActivity : AppCompatActivity() {
             val service = (binder as RecordingService.LocalBinder).service()
             recordingService = service
             serviceBound = true
+            serviceBindRequested = false
+            recordingRequested = service.studentState != StudentRecordState.IDLE
+            recordingVideo = service.studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING)
+            service.onStudentUtterance = { acceptStudentUtterance(it) }
+            service.onStudentError = { error ->
+                recordingStatusText = error
+                if (studentForeground) showResult(error, "记录异常")
+            }
+            service.onStudentState = { state, status ->
+                val wasPreparing = recordingStatusText.contains("准备")
+                recordingRequested = state != StudentRecordState.IDLE
+                recordingVideo = state in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING)
+                recordingStatusText = status
+                if (studentForeground) {
+                    renderScreen()
+                    if (wasPreparing && state in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING)) {
+                        playPrompt("recording_start") { startVoiceIntentLoop() }
+                    }
+                }
+            }
             recordingStatusText = service.recordingStatus()
             startRecordingStatusSync()
             val actions = pendingServiceActions.toList()
@@ -254,6 +252,7 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             recordingService = null
             serviceBound = false
+            serviceBindRequested = false
             if (recordingRequested) {
                 recordingStatusText = "记录异常"
                 renderScreen()
@@ -352,6 +351,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         android.util.Log.i("DeviceIdentity", "hardware_id=${DeviceIdentity.hardwareId(this)}")
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
@@ -370,12 +370,6 @@ class MainActivity : AppCompatActivity() {
     }
 
 
-    override fun onResume() {
-        super.onResume()
-        if (screenState == ScreenState.LIVE_MINIMAL) {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
-        }
-    }
     private fun bindViews() {
         leftPanel = bindPanel(findViewById(R.id.left_eye_panel))
         rightPanel = bindPanel(findViewById(R.id.right_eye_panel))
@@ -847,8 +841,6 @@ class MainActivity : AppCompatActivity() {
         focusIndex = 0
         clearTaskOutput()
         voiceControlEnabled = voiceIntentSupported
-        voiceMode = VoiceMode.AWAKE
-        awakeDeadlineMs = Long.MAX_VALUE
         lastStatusText = "请直接说：减压蒸馏、光度计或电解实验"
         lastResultText = "无需说小北助手。"
         screenState = ScreenState.EXPERIMENT_SETUP
@@ -859,8 +851,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun finishExperimentSetup() {
-        voiceMode = VoiceMode.SLEEP
-        awakeDeadlineMs = 0L
         enterLiveMinimal()
         playPrompt("assistant_ready")
     }
@@ -869,8 +859,6 @@ class MainActivity : AppCompatActivity() {
         if (screenState != ScreenState.EXPERIMENT_SETUP) {
             screenState = ScreenState.EXPERIMENT_SETUP
         }
-        voiceMode = VoiceMode.AWAKE
-        awakeDeadlineMs = Long.MAX_VALUE
         lastStatusText = "请选择今天的实验"
         lastResultText = "可以说：减压蒸馏、光度计、电解实验或TLC。"
         renderScreen()
@@ -893,8 +881,6 @@ class MainActivity : AppCompatActivity() {
         focusIndex = 0
         clearTaskOutput()
         voiceControlPausedUntilMs = 0L
-        voiceMode = VoiceMode.SLEEP  // 重置为沉睡模式
-        awakeDeadlineMs = 0L
         screenState = ScreenState.LIVE_MINIMAL
         renderScreen()
         mainHandler.post { startVoiceIntentLoop() }
@@ -985,7 +971,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun clearTaskOutput() {
         shownPreviewDataUrl = null
-        recognizedQuestion = ""
         activeTaskTitle = ""
         lastStatusText = "前后滑动选择，单击确认"
         lastResultText = ""
@@ -1089,33 +1074,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun startVoiceQuestionFlow() {
         stopVoiceIntentRecording()
-        clearTaskOutput()
+        selectedMode = Mode.QA
+        studentQuestionPending = true
         operationToken += 1
-        activeTaskTitle = "语音问答"
-        if (!qaAudioSupported) {
-            showResult(
-                "当前电脑端服务不支持语音问答音频接口。请停止旧服务后重新启动：python -m pipeline.web.app --host 0.0.0.0 --port 5080",
-                "服务版本过旧",
-            )
-            return
-        }
-        lastStatusText = "正在准备录音..."
-        lastResultText = "请在提示后说出你的问题。"
         screenState = ScreenState.QA_RECORDING
+        lastStatusText = "请说出你的问题"
+        lastResultText = ""
         renderScreen()
-        playPrompt("qa_start") {
-            if (screenState != ScreenState.QA_RECORDING) {
-                return@playPrompt
-            }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED
-            ) {
-                startAudioQuestionRecording()
-            } else {
-                pendingAudioPermissionAction = AudioPermissionAction.QA
-                requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
-            }
-        }
+        playPrompt("qa_start") { startVoiceIntentLoop() }
     }
 
     private fun renderDemoPlayingScreen() {
@@ -1140,385 +1106,98 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    @SuppressLint("MissingPermission")
     private fun startAudioQuestionRecording() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            pendingAudioPermissionAction = AudioPermissionAction.QA
-            requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
-            return
-        }
-
-        stopAudioQuestionRecording()
-        val token = operationToken
-        val minBufferSize = AudioRecord.getMinBufferSize(
-            qaSampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        if (minBufferSize <= 0) {
-            showResult("当前设备无法初始化麦克风录音。", "录音失败")
-            return
-        }
-
-        val bufferSize = max(minBufferSize, 3200)
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            qaSampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize,
-        )
-        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            recorder.release()
-            showResult("麦克风初始化失败，请稍后重试。", "录音失败")
-            return
-        }
-
-        audioRecord = recorder
-        isAudioRecording = true
-        val outputFile = File(cacheDir, "qa_audio_${System.currentTimeMillis()}.pcm")
-        Thread {
-            var bytesWritten = 0
-            try {
-                FileOutputStream(outputFile).use { output ->
-                    recorder.startRecording()
-                    runOnUiIfCurrent(token) {
-                        lastStatusText = "正在录音"
-                        lastResultText = "请说出你的问题，录音约 7 秒。"
-                        renderScreen()
-                    }
-                    val buffer = ByteArray(bufferSize)
-                    val deadline = System.currentTimeMillis() + qaRecordDurationMs
-                    while (
-                        token == operationToken &&
-                        isAudioRecording &&
-                        System.currentTimeMillis() < deadline
-                    ) {
-                        val read = recorder.read(buffer, 0, buffer.size)
-                        if (read > 0) {
-                            output.write(buffer, 0, read)
-                            bytesWritten += read
-                        }
-                    }
-                }
-                if (token == operationToken && bytesWritten > 0) {
-                    runOnUiIfCurrent(token) {
-                        lastStatusText = "正在理解你的问题..."
-                        lastResultText = ""
-                        screenState = ScreenState.RUNNING
-                        renderScreen()
-                    }
-                    submitAudioQuestion(outputFile, token)
-                } else if (token == operationToken) {
-                    runOnUiIfCurrent(token) {
-                        showResult("没有录到有效语音，请重新提问。", "录音失败")
-                    }
-                }
-            } catch (exc: Exception) {
-                if (token == operationToken) {
-                    runOnUiIfCurrent(token) {
-                        showResult(exc.message ?: "录音失败", "录音失败")
-                    }
-                }
-            } finally {
-                try {
-                    recorder.stop()
-                } catch (_: IllegalStateException) {
-                    // Recorder may already be stopped during cancellation.
-                }
-                recorder.release()
-                if (audioRecord === recorder) {
-                    audioRecord = null
-                }
-                isAudioRecording = false
-            }
-        }.start()
+        studentQuestionPending = true
+        startVoiceIntentLoop()
     }
 
     private fun stopAudioQuestionRecording() {
-        isAudioRecording = false
-        audioRecord?.let { recorder ->
-            try {
-                recorder.stop()
-            } catch (_: IllegalStateException) {
-                // Ignore invalid stop calls during lifecycle cancellation.
-            }
-        }
-        audioRecord = null
+        studentQuestionPending = false
     }
 
-
     private fun startVoiceIntentLoop() {
-        if (!voiceControlEnabled || !voiceIntentSupported || !screenState.allowsVoiceIntent()) {
-            return
-        }
-        if (isVoiceIntentRecording) {
-            return
-        }
-        if (isAudioRecording || assistantPlayer != null) {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
-            return
-        }
-        val waitMs = voiceControlPausedUntilMs - System.currentTimeMillis()
-        if (waitMs > 0) {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, waitMs)
-            return
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!studentForeground || !voiceControlEnabled || !voiceIntentSupported ||
+            (!screenState.allowsVoiceIntent() && !recordingRequested)) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingAudioPermissionAction = AudioPermissionAction.VOICE_CONTROL
             requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
-        recordVoiceIntentOnce()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun recordVoiceIntentOnce() {
-        if (!screenState.allowsVoiceIntent() || isVoiceIntentRecording) {
+        val wait = voiceControlPausedUntilMs - System.currentTimeMillis()
+        if (assistantPlayer != null || wait > 0) {
+            mainHandler.postDelayed({ startVoiceIntentLoop() }, maxOf(wait, 300L))
             return
         }
-        // 苏醒模式超时检查
-        if (voiceMode == VoiceMode.AWAKE && System.currentTimeMillis() > awakeDeadlineMs) {
-            playPrompt("sleep_timeout")
-            returnToSleep()
-            return
+        studentCommandsEnabled = true
+        if (recordingService == null) {
+            ContextCompat.startForegroundService(this, Intent(this, RecordingService::class.java)
+                .setAction(RecordingService.ACTION_START_STUDENT_SESSION))
         }
-        val token = operationToken
-        val returnState = screenState
-        val capturedPassiveMode = passiveListenMode
-        val capturedContext = when (capturedPassiveMode) {
-            PassiveListenMode.DEMO_STOP -> "demo_playing"
-            PassiveListenMode.RECORD_STOP -> "recording_stop_only"
-            PassiveListenMode.DEMO_SELECT -> "demo_select"
-            PassiveListenMode.NONE -> voiceContextValue()
+        withRecordingService { service ->
+            if (service.startStudentSession()) service.acceptStudentCommands = studentCommandsEnabled && studentForeground
         }
-        val capturedIsSleepMode = capturedContext == "sleep"
-        val minBufferSize = AudioRecord.getMinBufferSize(
-            qaSampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        if (minBufferSize <= 0) {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 1_000L)
-            return
-        }
-        val bufferSize = max(minBufferSize, 3200)
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            qaSampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize,
-        )
-        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            recorder.release()
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 1_000L)
-            return
-        }
-
-        audioRecord = recorder
-        isVoiceIntentRecording = true
-        val outputFile = File(cacheDir, "voice_intent_${System.currentTimeMillis()}.pcm")
-        Thread {
-            var bytesWritten = 0
-            var speechChunks = 0
-            var rmsSum = 0.0
-            var rmsCount = 0
-            var submitted = false
-            try {
-                FileOutputStream(outputFile).use { output ->
-                    recorder.startRecording()
-                    val buffer = ByteArray(bufferSize)
-                    val deadline = System.currentTimeMillis() + voiceIntentRecordDurationMs
-                    while (
-                        token == operationToken &&
-                        screenState == returnState &&
-                        isVoiceIntentRecording &&
-                        System.currentTimeMillis() < deadline
-                    ) {
-                        val read = recorder.read(buffer, 0, buffer.size)
-                        if (read > 0) {
-                            output.write(buffer, 0, read)
-                            bytesWritten += read
-                            val rms = calculatePcm16Rms(buffer, read)
-                            rmsSum += rms
-                            rmsCount += 1
-                            if (rms >= voiceIntentMinRms) {
-                                speechChunks += 1
-                            }
-                        }
-                    }
-                }
-                val averageRms = if (rmsCount > 0) rmsSum / rmsCount else 0.0
-                // 沉睡模式降低阈值，更容易触发唤醒词检测
-                val minChunks = if (capturedIsSleepMode) 1 else voiceIntentMinSpeechChunks
-                val minAvgRms = if (capturedIsSleepMode) voiceIntentMinRms * 0.20 else voiceIntentMinRms * 0.45
-                val hasSpeech = bytesWritten > 0 &&
-                    speechChunks >= minChunks &&
-                    averageRms >= minAvgRms
-                if (token == operationToken && hasSpeech) {
-                    submitted = true
-                    // 苏醒模式下显示识别状态
-                    if (
-                        !capturedIsSleepMode &&
-                        capturedPassiveMode == PassiveListenMode.NONE &&
-                        capturedContext != "experiment_setup"
-                    ) {
-                        runOnUiIfCurrent(token) {
-                            activeTaskTitle = "语音控制"
-                            lastStatusText = "正在识别指令"
-                            lastResultText = ""
-                            screenState = ScreenState.VOICE_LISTENING
-                            renderScreen()
-                        }
-                    }
-                    submitVoiceIntent(outputFile, token, capturedIsSleepMode, capturedContext, capturedPassiveMode)
-                } else if (token == operationToken) {
-                    if (capturedContext == "experiment_setup") {
-                        runOnUiIfCurrent(token) {
-                            retryExperimentSetup()
-                        }
-                    } else {
-                        mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
-                    }
-                }
-            } catch (_: Exception) {
-                if (token == operationToken) {
-                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 1_000L)
-                }
-            } finally {
-                try {
-                    recorder.stop()
-                } catch (_: IllegalStateException) {
-                    // Recorder may already be stopped during cancellation.
-                }
-                recorder.release()
-                if (audioRecord === recorder) {
-                    audioRecord = null
-                }
-                isVoiceIntentRecording = false
-                if (!submitted) {
-                    outputFile.delete()
-                }
-            }
-        }.start()
     }
 
     private fun stopVoiceIntentRecording() {
-        isVoiceIntentRecording = false
-        if (isAudioRecording) {
+        studentCommandsEnabled = recordingRequested && studentForeground
+        studentPendingUtterances.clear()
+        recordingService?.acceptStudentCommands = studentCommandsEnabled && assistantPlayer == null
+    }
+
+    private fun acceptStudentUtterance(utterance: StudentUtterance) {
+        if (!studentForeground || !studentCommandsEnabled || assistantPlayer != null ||
+            (!screenState.allowsVoiceIntent() && !recordingRequested)) return
+        if (studentRequestInFlight) {
+            // Bound queued decisions while the microphone/archive keep running.
+            if (studentPendingUtterances.size == 4) studentPendingUtterances.removeFirst()
+            studentPendingUtterances.addLast(utterance)
             return
         }
-        audioRecord?.let { recorder ->
-            try {
-                recorder.stop()
-            } catch (_: IllegalStateException) {
-                // Ignore invalid stop calls during lifecycle cancellation.
-            }
-            recorder.release()
-        }
-        audioRecord = null
-    }
-
-    private fun calculatePcm16Rms(buffer: ByteArray, length: Int): Double {
-        var index = 0
-        var count = 0
-        var sum = 0.0
-        while (index + 1 < length) {
-            val sample = ((buffer[index + 1].toInt() shl 8) or (buffer[index].toInt() and 0xff)).toShort().toInt()
-            sum += sample.toDouble() * sample.toDouble()
-            count += 1
-            index += 2
-        }
-        return if (count > 0) Math.sqrt(sum / count.toDouble()) else 0.0
-    }
-
-    private fun submitVoiceIntent(file: File, token: Int, isSleepMode: Boolean, context: String, passiveMode: PassiveListenMode) {
+        studentRequestInFlight = true
+        val token = operationToken
+        val context = voiceContextValue()
+        val state = recordingService?.studentState?.name ?: "IDLE"
+        val dialogue = if (System.currentTimeMillis() < studentDialogueUntil) studentRecentDialogue else ""
+        val file = File(cacheDir, "student_intent_${System.nanoTime()}.pcm")
         Thread {
             try {
-                val json = postMultipart(
-                    "$baseUrl/api/glasses/voice/intent",
-                    mapOf(
-                        "model" to "qwen3.5-omni-flash-realtime",
-                        "context" to context,
-                        "demo_options" to demoOptionsForVoice(),
-                    ),
-                    "audio",
-                    file,
-                    "application/octet-stream",
-                )
+                file.writeBytes(utterance.pcm)
+                val json = postMultipart("$baseUrl/api/glasses/voice/intent", mapOf(
+                    "context" to context, "recording_state" to state, "recent_dialogue" to dialogue,
+                    "demo_options" to demoOptionsForVoice(), "timeout_seconds" to "8",
+                    "model" to "qwen3.5-omni-flash-realtime",
+                ), "audio", file, "application/octet-stream")
                 runOnUiIfCurrent(token) {
-                    if (isSleepMode) {
-                        handleWakeResponse(json)
-                    } else {
-                        handleAwakeIntent(json, context, passiveMode)
+                    if (studentForeground && state == (recordingService?.studentState?.name ?: "IDLE") &&
+                        json.optString("intent", "no_action") !in setOf("no_action", "unclear", "unknown")) {
+                        studentRecentDialogue = json.optString("transcript").take(700)
+                        studentDialogueUntil = System.currentTimeMillis() + 10_000L
+                        studentCommandSource = utterance
+                        handleStudentIntent(json, context, passiveListenMode)
+                        studentCommandSource = null
                     }
                 }
-            } catch (_: Exception) {
-                runOnUiIfCurrent(token) {
-                    if (isSleepMode) {
-                        mainHandler.postDelayed({ startVoiceIntentLoop() }, 800L)
-                    } else if (isPassiveListenMode(passiveMode)) {
-                        resumePassiveStopOnlyListening(passiveMode)
-                    } else if (context == "experiment_setup") {
-                        retryExperimentSetup()
-                    } else {
-                        playPrompt("unclear")
-                        returnToSleep()
-                    }
-                }
+            } catch (error: Exception) {
+                android.util.Log.w("StudentVoice", "Intent request failed; continue listening", error)
             } finally {
                 file.delete()
+                mainHandler.post {
+                    studentRequestInFlight = false
+                    if (token != operationToken) studentPendingUtterances.clear()
+                    val pending = studentPendingUtterances.pollFirst()
+                    if (pending != null) acceptStudentUtterance(pending)
+                }
             }
         }.start()
     }
 
-    private fun handleWakeResponse(json: JSONObject) {
-        val wake = json.optBoolean("wake", false)
-        if (wake) {
-            enterAwakeMode()
-        } else {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
-        }
-    }
 
-    private fun enterAwakeMode() {
-        voiceMode = VoiceMode.AWAKE
-        awakeDeadlineMs = System.currentTimeMillis() + awakeTimeoutMs
-        playPrompt("wake_response") {
-            startVoiceIntentLoop()
-        }
-    }
-
-    private fun enterAwakeModeNoTimeout() {
-        voiceMode = VoiceMode.AWAKE
-        awakeDeadlineMs = Long.MAX_VALUE
-    }
-
-    private fun returnToSleep() {
-        passiveListenMode = PassiveListenMode.NONE
-        voiceMode = VoiceMode.SLEEP
-        awakeDeadlineMs = 0L
-        mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
-    }
-
-    private fun voiceContextValue(): String {
-        return when {
-            screenState == ScreenState.EXPERIMENT_SETUP -> "experiment_setup"
-            recordingRequested -> "recording_stop_only"
-            screenState == ScreenState.DEMO_SELECT -> "demo_select"
-            screenState == ScreenState.DEMO_PLAYING -> "demo_playing"
-            voiceMode == VoiceMode.SLEEP -> "sleep"
-            selectedMode == Mode.QA -> "qa"
-            selectedMode == Mode.SAFETY -> "safety"
-            selectedMode == Mode.OVERLAY_TEST -> "overlay_test"
-            selectedMode == Mode.EXPERIMENT -> "experiment_${selectedExperimentTypeValue()}"
-            else -> "VOICE_IDLE"
-        }
+    private fun voiceContextValue(): String = when {
+        screenState == ScreenState.EXPERIMENT_SETUP -> "student_setup"
+        studentQuestionPending -> "student_question"
+        screenState == ScreenState.DEMO_SELECT -> "student_demo_select"
+        screenState == ScreenState.DEMO_PLAYING -> "student_demo_playing"
+        else -> "student_idle"
     }
 
     private fun demoOptionsForVoice(): String {
@@ -1542,7 +1221,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         passiveListenMode = mode
-        enterAwakeModeNoTimeout()
+        startVoiceIntentLoop()
         when (mode) {
             PassiveListenMode.DEMO_STOP -> {
                 if (activeDemoVideo != null) {
@@ -1572,12 +1251,14 @@ class MainActivity : AppCompatActivity() {
         mainHandler.postDelayed({ enterLiveMinimal() }, delayMs)
     }
 
-    private fun handleAwakeIntent(json: JSONObject, context: String, passiveMode: PassiveListenMode) {
-        val intent = json.optString("intent", "unclear")
+    private fun handleStudentIntent(json: JSONObject, context: String, passiveMode: PassiveListenMode) {
+        val intent = json.optString("intent", "no_action")
+        if (intent in setOf("no_action", "unclear", "unknown")) return
+        if (recordingRequested && !screenState.allowsVoiceIntent() && intent != "stop_recording") return
         val slots = json.optJSONObject("slots")
         val experimentType = slots?.optString("experiment_type", "") ?: ""
 
-        if (context == "experiment_setup") {
+        if (context == "student_setup") {
             if (intent == "select_experiment" && experimentType.isNotBlank()) {
                 selectedMode = Mode.EXPERIMENT
                 selectedExperimentType = experimentTypeFromValue(experimentType)
@@ -1597,15 +1278,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        if (passiveMode == PassiveListenMode.RECORD_STOP) {
-            if (intent == "stop_recording") {
-                stopRecordingService(announce = true, returnToLive = true)
-            } else {
-                resumePassiveStopOnlyListening(passiveMode)
-            }
-            return
-        }
-
         if (passiveMode == PassiveListenMode.DEMO_SELECT) {
             if (intent != "select_demo_video") {
                 resumePassiveStopOnlyListening(passiveMode)
@@ -1615,11 +1287,11 @@ class MainActivity : AppCompatActivity() {
 
         when (intent) {
             "start_audio_recording", "start_recording" -> {
-                enterAwakeModeNoTimeout()
+                startVoiceIntentLoop()
                 ensureAudioRecordingPermissions()
             }
             "start_video_recording" -> {
-                enterAwakeModeNoTimeout()
+                startVoiceIntentLoop()
                 ensureRecordingPermissions()
             }
             "stop_recording" -> {
@@ -1642,7 +1314,8 @@ class MainActivity : AppCompatActivity() {
                 startCaptureCountdown()
             }
             "qa" -> {
-                startVoiceQuestionFlow()
+                val question = json.optString("question").ifBlank { json.optString("transcript") }
+                if (question.isNotBlank()) submitTextQuestion(question)
             }
             "demo_guide" -> {
                 startDemoGuide()
@@ -1661,31 +1334,13 @@ class MainActivity : AppCompatActivity() {
             "stop_demo_video" -> {
                 stopDemoPlayback(announce = true, returnToLive = true)
             }
-            "unclear" -> {
-                if (isPassiveListenMode(passiveMode)) {
-                    resumePassiveStopOnlyListening(passiveMode)
-                } else {
-                    // 自然语言分类后，unknown/unclear 不应让用户过早被踢回睡眠。
-                    // 每次 unknown/unclear 都刷新 15s 苏醒窗口，只有真静默 15s 才回睡眠。
-                    awakeDeadlineMs = System.currentTimeMillis() + awakeTimeoutMs
-                    playPrompt("unclear")
-                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
-                }
-            }
-            else -> {
-                if (isPassiveListenMode(passiveMode)) {
-                    resumePassiveStopOnlyListening(passiveMode)
-                } else {
-                    awakeDeadlineMs = System.currentTimeMillis() + awakeTimeoutMs
-                    playPrompt("unclear")
-                    mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
-                }
-            }
+            else -> Unit
         }
     }
 
     private fun ScreenState.allowsVoiceIntent(): Boolean {
-        return this == ScreenState.LIVE_MINIMAL ||
+        return this == ScreenState.QA_RECORDING ||
+            this == ScreenState.LIVE_MINIMAL ||
             this == ScreenState.EXPERIMENT_SETUP ||
             this == ScreenState.DEMO_SELECT ||
             this == ScreenState.DEMO_PLAYING ||
@@ -1731,7 +1386,7 @@ class MainActivity : AppCompatActivity() {
     private fun enterDemoSelect() {
         operationToken += 1
         passiveListenMode = PassiveListenMode.DEMO_SELECT
-        enterAwakeModeNoTimeout()  // 选择视频期间保持苏醒
+        startVoiceIntentLoop()  // 选择视频期间保持苏醒
         activeTaskTitle = "演示指引"
         val options = demoVideos.mapIndexed { index, video -> "${index + 1}. ${demoDisplayLabel(video)}" }
         lastStatusText = "请说视频序号或名称"
@@ -1764,7 +1419,7 @@ class MainActivity : AppCompatActivity() {
             screenState = ScreenState.DEMO_SELECT
             renderScreen()
             passiveListenMode = PassiveListenMode.DEMO_SELECT
-            enterAwakeModeNoTimeout()
+            startVoiceIntentLoop()
             mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
             return
         }
@@ -1887,7 +1542,7 @@ class MainActivity : AppCompatActivity() {
         stopAssistantAudio()
         stopVoiceIntentRecording()
         passiveListenMode = PassiveListenMode.DEMO_STOP
-        enterAwakeModeNoTimeout()  // 视频播放期间保持苏醒
+        startVoiceIntentLoop()  // 视频播放期间保持苏醒
         activeDemoVideo = video
         activeTaskTitle = "演示指引"
         lastStatusText = "视频加载中"
@@ -1955,6 +1610,7 @@ class MainActivity : AppCompatActivity() {
         voiceControlPausedUntilMs = System.currentTimeMillis() + 2_500L
         val player = MediaPlayer.create(this, resId) ?: return
         player.setVolume(1.0f, 1.0f)
+        recordingService?.acceptStudentCommands = false
         assistantPlayer = player
         player.setOnCompletionListener {
             stopAssistantAudio()
@@ -2031,6 +1687,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 prepare()
             }
+            recordingService?.acceptStudentCommands = false
             assistantPlayer = player
             voiceControlPausedUntilMs = System.currentTimeMillis() + 2_500L
             player.start()
@@ -2083,6 +1740,7 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
             }
+            recordingService?.acceptStudentCommands = false
             assistantPlayer = player
             mainHandler.postDelayed(resultReturnRunnable, estimatedMs + 1200L)
             player.prepareAsync()
@@ -2103,6 +1761,8 @@ class MainActivity : AppCompatActivity() {
             player.release()
         }
         assistantPlayer = null
+        if (studentRecentDialogue.isNotBlank()) studentDialogueUntil = System.currentTimeMillis() + 10_000L
+        if (studentForeground && studentCommandsEnabled) startVoiceIntentLoop()
         assistantAudioFile?.delete()
         assistantAudioFile = null
     }
@@ -2151,186 +1811,46 @@ class MainActivity : AppCompatActivity() {
         startVideoRecordingService()
     }
 
-    private fun startAudioRecordingService() {
-        passiveListenMode = PassiveListenMode.RECORD_STOP
-        enterAwakeModeNoTimeout()
-        recordingRequested = true
-        recordingVideo = false
-        recordingStatusText = "录音准备中"
-        focusIndex = 0
-        clearTaskOutput()
-        screenState = ScreenState.LIVE_MINIMAL
-        renderScreen()
-        playPrompt("recording_start") {
-            if (!recordingRequested) {
-                return@playPrompt
-            }
-            val intent = Intent(this, RecordingService::class.java)
-                .setAction(RecordingService.ACTION_START_AUDIO_RECORDING)
-            ContextCompat.startForegroundService(this, intent)
-            withRecordingService { service ->
-                recordingStartedAt = UploadMetadata.nowIso()
-                service.startAudioRecording()
-                recordingStatusText = service.recordingStatus()
-                startRecordingStatusSync()
-                renderScreen()
-                resumePassiveStopOnlyListening(PassiveListenMode.RECORD_STOP)
-            }
-        }
-    }
+    private fun startAudioRecordingService() { startStudentRecord(false) }
+    private fun startVideoRecordingService() { startStudentRecord(true) }
 
-    private fun startVideoRecordingService() {
-        passiveListenMode = PassiveListenMode.RECORD_STOP
-        enterAwakeModeNoTimeout()  // 录像期间保持苏醒
-        recordingRequested = true
-        recordingVideo = true
-        recordingStatusText = "记录准备中"
-        focusIndex = 0
-        clearTaskOutput()
-        screenState = ScreenState.LIVE_MINIMAL
-        renderScreen()
-        playPrompt("recording_start") {
-            if (!recordingRequested) {
-                return@playPrompt
-            }
-            val intent = Intent(this, RecordingService::class.java)
-                .setAction(RecordingService.ACTION_START_RECORDING)
-            ContextCompat.startForegroundService(this, intent)
-            withRecordingService { service ->
-                recordingStartedAt = UploadMetadata.nowIso()
-                service.startRecording()
-                recordingStatusText = service.recordingStatus()
-                startRecordingStatusSync()
-                renderScreen()
-                resumePassiveStopOnlyListening(PassiveListenMode.RECORD_STOP)
-            }
-        }
-    }
-
-    private fun stopRecordingService(
-        announce: Boolean = false,
-        returnToLive: Boolean = false,
-    ) {
+    private fun startStudentRecord(video: Boolean) {
+        if (recordingRequested || recordingService?.studentState?.let { it != StudentRecordState.IDLE } == true) return
+        operationToken += 1
         passiveListenMode = PassiveListenMode.NONE
-        recordingRequested = false
-        val wasVideoRecording = recordingVideo
-        recordingVideo = false
-        val recordingEndedAt = UploadMetadata.nowIso()
-        val recordingStartedAtForUpload = recordingStartedAt
-        recordingStartedAt = null
-        recordingStatusText = "未记录"
-        mainHandler.removeCallbacks(recordingStatusRunnable)
-        fun finishStop(files: List<File>) {
-            if (files.isNotEmpty()) {
-                uploadRecordFiles(
-                    files,
-                    recordingStartedAtForUpload,
-                    recordingEndedAt,
-                    audioOnly = !wasVideoRecording,
-                )
+        recordingRequested = true
+        recordingVideo = video
+        recordingStatusText = if (video) "录像准备中" else "录音准备中"
+        screenState = ScreenState.LIVE_MINIMAL
+        renderScreen()
+        val source = studentCommandSource
+        ContextCompat.startForegroundService(this, Intent(this, RecordingService::class.java)
+            .setAction(RecordingService.ACTION_START_STUDENT_SESSION))
+        withRecordingService { service ->
+            val started = service.startStudentRecording(video, baseUrl, selectedExperimentTypeValue(), source)
+            if (!started) {
+                recordingRequested = false
+                recordingVideo = false
+                recordingStatusText = "未开始记录"
             }
-            if (announce) {
-                runOnUiThread {
-                    playPrompt("recording_stop") {
-                        if (returnToLive) {
-                            enterLiveMinimal()
-                        }
-                    }
-                }
-            } else if (returnToLive) {
-                runOnUiThread { enterLiveMinimal() }
-            }
-        }
-        val service = recordingService
-        if (service == null) {
-            val action = if (wasVideoRecording) {
-                RecordingService.ACTION_STOP_RECORDING
-            } else {
-                RecordingService.ACTION_STOP_AUDIO_RECORDING
-            }
-            stopService(Intent(this, RecordingService::class.java).setAction(action))
-            finishStop(emptyList())
-            return
-        }
-        val onStopped: (List<File>) -> Unit = { files ->
-            if (files.isEmpty()) {
-                android.util.Log.w("ChemRecord", "No finalized record files to upload")
-            }
-            if (serviceBound) {
-                unbindService(serviceConnection)
-                serviceBound = false
-                recordingService = null
-            }
-            val action = if (wasVideoRecording) {
-                RecordingService.ACTION_STOP_RECORDING
-            } else {
-                RecordingService.ACTION_STOP_AUDIO_RECORDING
-            }
-            stopService(Intent(this, RecordingService::class.java).setAction(action))
-            finishStop(files)
-        }
-        if (wasVideoRecording) {
-            service.stopRecording(onStopped)
-        } else {
-            service.stopAudioRecording(onStopped)
+            startRecordingStatusSync()
+            startVoiceIntentLoop()
+            renderScreen()
         }
     }
 
-    private fun uploadRecordFiles(
-        files: List<File>,
-        startedAt: String? = null,
-        endedAt: String? = null,
-        audioOnly: Boolean = false,
-    ) {
-        Thread {
-            for (file in files) {
-                try {
-                    val boundary = "----ChemRecordBoundary${System.currentTimeMillis()}"
-                    val url = URL("$baseUrl/api/glasses/records/upload")
-                    val connection = (url.openConnection() as java.net.HttpURLConnection).apply {
-                        requestMethod = "POST"
-                        doOutput = true
-                        connectTimeout = 15_000
-                        readTimeout = 120_000
-                        setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-                    }
-                    java.io.DataOutputStream(connection.outputStream).use { out ->
-                        val fields = linkedMapOf(
-                            "device_id" to DeviceIdentity.hardwareId(this),
-                            "experiment_type" to selectedExperimentTypeValue(),
-                        )
-                        startedAt?.let { fields["started_at"] = it }
-                        endedAt?.let { fields["ended_at"] = it }
-                        for ((name, value) in fields) {
-                            out.writeBytes("--$boundary\r\n")
-                            out.writeBytes("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
-                            out.write(value.toByteArray(Charsets.UTF_8))
-                            out.writeBytes("\r\n")
-                        }
-                        out.writeBytes("--$boundary\r\n")
-                        val partName = if (audioOnly) "audio" else "video"
-                        val contentType = if (audioOnly) "audio/mp4" else "video/mp4"
-                        out.writeBytes("Content-Disposition: form-data; name=\"$partName\"; filename=\"${file.name}\"\r\n")
-                        out.writeBytes("Content-Type: $contentType\r\n\r\n")
-                        java.io.FileInputStream(file).use { it.copyTo(out) }
-                        out.writeBytes("\r\n--$boundary--\r\n")
-                        out.flush()
-                    }
-                    val code = connection.responseCode
-                    connection.disconnect()
-                    if (code in 200..299) {
-                        android.util.Log.i("ChemRecord", "Uploaded ${file.name}")
-                        if (!file.delete()) {
-                            android.util.Log.w("ChemRecord", "Uploaded but could not delete ${file.name}")
-                        }
-                    } else {
-                        android.util.Log.w("ChemRecord", "Upload failed ${file.name}: HTTP $code")
-                    }
-                } catch (e: Exception) {
-                    android.util.Log.w("ChemRecord", "Upload error ${file.name}: ${e.message}")
-                }
+    private fun stopRecordingService(announce: Boolean = false, returnToLive: Boolean = false) {
+        val service = recordingService ?: return
+        if (service.studentState in setOf(StudentRecordState.IDLE, StudentRecordState.STOPPING)) return
+        operationToken += 1
+        studentPendingUtterances.clear()
+        passiveListenMode = PassiveListenMode.NONE
+        service.stopStudentRecording {
+            if (studentForeground) {
+                if (returnToLive) enterLiveMinimal()
+                if (announce) playDynamicPrompt(recordingStatusText) { startVoiceIntentLoop() }
             }
-        }.start()
+        }
     }
 
     private fun startRecordingStatusSync() {
@@ -2345,6 +1865,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
         pendingServiceActions += action
+        if (serviceBindRequested) return
+        serviceBindRequested = true
         bindService(
             Intent(this, RecordingService::class.java),
             serviceConnection,
@@ -2373,11 +1895,12 @@ class MainActivity : AppCompatActivity() {
                         if (feature == "qa_audio") {
                             qaAudioSupported = true
                         }
-                        if (feature == "voice_intent") {
+                        if (feature == "student_direct_control") {
                             voiceIntentSupported = true
                         }
                     }
                 }
+                if (!voiceIntentSupported) throw IOException("请先更新后端，再使用学生自然语音控制版本。")
                 runOnUiIfCurrent(token) {
                     connectionStatusText = "连接正常"
                     lastStatusText = "连接正常"
@@ -2512,12 +2035,6 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             service.stopCaptureSessionIfIdle()
-            if (serviceBound) {
-                unbindService(serviceConnection)
-                serviceBound = false
-                recordingService = null
-            }
-            stopService(Intent(this, RecordingService::class.java))
         }
 
         mainHandler.postDelayed({
@@ -2554,123 +2071,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveStandalonePhoto(file: File) {
-        Thread {
-            var galleryUri: Uri? = null
-            var uploadSucceeded = false
-            try {
-                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, "CHEM_$timestamp.jpg")
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        put(
-                            MediaStore.Images.Media.RELATIVE_PATH,
-                            "${Environment.DIRECTORY_PICTURES}/ChemistryGlasses",
-                        )
-                        put(MediaStore.Images.Media.IS_PENDING, 1)
-                    }
-                }
-                val uri = contentResolver.insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    values,
-                ) ?: throw IOException("无法创建相册文件")
-                galleryUri = uri
-                contentResolver.openOutputStream(uri)?.use { output ->
-                    FileInputStream(file).use { input -> input.copyTo(output) }
-                } ?: throw IOException("无法写入相册文件")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    contentResolver.update(uri, values, null, null)
-                }
-                var uploadError: String? = null
+        withRecordingService { service ->
+            Thread {
                 try {
-                    postMultipart(
-                        "$baseUrl/api/glasses/photos/upload",
-                        mapOf(
-                            "device_id" to DeviceIdentity.hardwareId(this),
-                            "experiment_type" to selectedExperimentTypeValue(),
-                            "captured_at" to UploadMetadata.nowIso(),
-                        ),
-                        "photo",
-                        file,
-                        "image/jpeg",
-                    )
-                    uploadSucceeded = true
-                } catch (exc: Exception) {
-                    uploadError = exc.message ?: "服务器上传失败"
+                    service.saveStudentPhoto(file, baseUrl, selectedExperimentTypeValue())
+                    runOnUiThread { showResult("照片已保存在眼镜上，等待上传。", "拍照完成") }
+                } catch (error: Exception) {
+                    runOnUiThread { showResult(error.message ?: "照片保存失败", "拍照失败") }
                 }
-                runOnUiThread {
-                    if (uploadError == null) {
-                        showResult(
-                            "照片已上传到管理网站，眼镜本地副本已删除。",
-                            "拍照完成",
-                        )
-                    } else {
-                        showResult(
-                            "照片未上传，暂时保留在眼镜上：$uploadError",
-                            "拍照完成",
-                        )
-                    }
-                }
-            } catch (exc: Exception) {
-                runOnUiThread {
-                    showResult(exc.message ?: "照片保存失败", "拍照失败")
-                }
-            } finally {
-                if (uploadSucceeded) {
-                    galleryUri?.let { uri ->
-                        if (contentResolver.delete(uri, null, null) == 0) {
-                            android.util.Log.w("ChemPhoto", "Uploaded but could not remove gallery item: $uri")
-                        }
-                    }
-                    if (!file.delete()) {
-                        android.util.Log.w("ChemPhoto", "Uploaded but could not delete ${file.name}")
-                    }
-                }
-            }
-        }.start()
+            }.start()
+        }
     }
 
-    private fun testConnection() {
-        val token = startRunning("正在测试连接...", "")
+    private fun submitTextQuestion(question: String) {
+        studentQuestionPending = false
+        stopVoiceIntentRecording()
+        val token = startRunning("正在回答你的问题...", question)
         Thread {
             try {
-                val json = getJson("$baseUrl/api/glasses/health")
-                val defaultModel = json.optString("default_model", "")
+                val json = postJson("$baseUrl/api/glasses/qa", JSONObject().put("question", question))
+                val answer = json.optString("answer", "")
                 runOnUiIfCurrent(token) {
-                    showResult("服务在线\n默认模型：$defaultModel", "连接正常")
+                    studentRecentDialogue = "用户：$question\n助手：${answer.take(700)}"
+                    showResult(answer, "问答完成")
                 }
-            } catch (exc: Exception) {
-                runOnUiIfCurrent(token) {
-                    showResult(exc.message ?: "连接失败", "连接失败")
-                }
+            } catch (error: Exception) {
+                runOnUiIfCurrent(token) { showResult(error.message ?: "问答失败", "问答失败") }
             }
         }.start()
-    }
-
-    private fun submitAudioQuestion(file: File, token: Int) {
-        try {
-            val json = postMultipart(
-                "$baseUrl/api/glasses/qa/audio",
-                mapOf("model" to "qwen3.5-omni-plus-realtime"),
-                "audio",
-                file,
-                "application/octet-stream",
-            )
-            val transcript = json.optString("transcript", "").ifBlank { "未返回转写文本" }
-            val answer = json.optString("answer_text", "").ifBlank { "AI 没有返回内容。" }
-            val audioDataUrl = json.optString("answer_audio_data_url", "")
-            runOnUiIfCurrent(token) {
-                showResult("Q: $transcript\n\nA: $answer", "QA done", audioDataUrl)
-            }
-        } catch (exc: Exception) {
-            runOnUiIfCurrent(token) {
-                showResult(exc.message ?: "问答失败", "问答失败")
-            }
-        } finally {
-            file.delete()
-        }
     }
 
     private fun submitImage(file: File) {
@@ -2904,6 +2332,19 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
+    override fun onResume() {
+        super.onResume()
+        studentForeground = true
+        if (::leftPanel.isInitialized) startVoiceIntentLoop()
+    }
+
+    override fun onPause() {
+        studentForeground = false
+        operationToken += 1
+        stopVoiceIntentRecording()
+        super.onPause()
+    }
+
     override fun onStop() {
         if (screenState == ScreenState.QA_RECORDING) {
             stopAudioQuestionRecording()
@@ -2911,6 +2352,7 @@ class MainActivity : AppCompatActivity() {
         if (recordingRequested && !isChangingConfigurations) {
             stopRecordingService()
         }
+        if (!isChangingConfigurations) recordingService?.stopStudentSession()
         super.onStop()
     }
 
@@ -2925,7 +2367,12 @@ class MainActivity : AppCompatActivity() {
         stopAssistantAudio()
         if (isFinishing) {
             stopRecordingService()
-        } else if (serviceBound) {
+            recordingService?.stopStudentSession()
+        }
+        recordingService?.onStudentUtterance = null
+        recordingService?.onStudentState = null
+        recordingService?.onStudentError = null
+        if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
             recordingService = null

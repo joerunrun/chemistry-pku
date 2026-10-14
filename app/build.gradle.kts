@@ -27,6 +27,8 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        manifestPlaceholders["applicationLabel"] = "@string/app_name"
+        buildConfigField("boolean", "STUDENT_TEST", "false")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -35,7 +37,15 @@ android {
     productFlavors {
         create("student") {
             dimension = "role"
+            versionCode = 2
+            versionName = "2.0-student"
             buildConfigField("String", "APP_MODE", "\"student\"")
+            if (providers.gradleProperty("studentTest").isPresent) {
+                applicationIdSuffix = ".naturaltest"
+                versionNameSuffix = "-naturaltest"
+                buildConfigField("boolean", "STUDENT_TEST", "true")
+                manifestPlaceholders["applicationLabel"] = "学生自然语音测试"
+            }
         }
         create("teacher") {
             dimension = "role"

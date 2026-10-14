@@ -52,6 +52,7 @@ class CameraSessionManager(
     // Student recordings keep the camera audio track. Teacher mode supplies
     // its own AudioRecord stream so CameraX must not open a second mic input.
     private var videoAudioEnabled = true
+    private var studentOutputDirectory: File? = null
     private var currentStatus = "未记录"
     private val savedSegments = mutableListOf<File>()
     private val stopCallbacks = mutableListOf<(List<File>) -> Unit>()
@@ -62,6 +63,8 @@ class CameraSessionManager(
     fun setVideoAudioEnabled(enabled: Boolean) {
         videoAudioEnabled = enabled
     }
+
+    fun setStudentOutputDirectory(directory: File) { studentOutputDirectory = directory }
 
     fun ensureCamera(onReady: () -> Unit, onError: (Throwable) -> Unit) {
         val cameraReady = imageCapture != null &&
@@ -288,6 +291,7 @@ class CameraSessionManager(
 
     private fun scheduleSegmentRollover() {
         mainHandler.removeCallbacksAndMessages(null)
+        if (studentOutputDirectory != null) return
         mainHandler.postDelayed({
             if (recordingDesired) {
                 activeRecording?.stop()
@@ -298,7 +302,7 @@ class CameraSessionManager(
     private data class PrivateFileOutput(val file: File, val options: FileOutputOptions)
 
     private fun nextPrivateFileOutputOptions(): PrivateFileOutput {
-        val dir = File(
+        val dir = studentOutputDirectory ?: File(
             context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir,
             "ChemistryRecords",
         )
@@ -310,6 +314,7 @@ class CameraSessionManager(
     }
 
     private fun cleanupOldPrivateSegments() {
+        if (studentOutputDirectory != null) return
         val dir = File(
             context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir,
             "ChemistryRecords",

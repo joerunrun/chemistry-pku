@@ -6,8 +6,9 @@ import java.util.Locale
 
 /** Timestamp format shared by the student and teacher upload clients. */
 object UploadMetadata {
-    fun nowIso(): String = SimpleDateFormat(
+    fun nowIso(): String = isoAt(System.currentTimeMillis())
+    fun isoAt(timeMillis: Long): String = SimpleDateFormat(
         "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
         Locale.US,
-    ).format(Date())
+    ).format(Date(timeMillis))
 }

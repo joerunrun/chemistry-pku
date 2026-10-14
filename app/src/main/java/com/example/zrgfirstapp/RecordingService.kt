@@ -7,21 +7,23 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.media.MediaRecorder
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import java.io.File
 
+internal enum class StudentRecordState { IDLE, STARTING_AUDIO, STARTING_VIDEO, AUDIO_RECORDING, VIDEO_RECORDING, STOPPING }
+
 class RecordingService : LifecycleService() {
     companion object {
         const val ACTION_START_RECORDING = "com.example.zrgfirstapp.START_RECORDING"
-        const val ACTION_START_AUDIO_RECORDING = "com.example.zrgfirstapp.START_AUDIO_RECORDING"
         const val ACTION_START_CAPTURE_SESSION = "com.example.zrgfirstapp.START_CAPTURE_SESSION"
         const val ACTION_STOP_RECORDING = "com.example.zrgfirstapp.STOP_RECORDING"
-        const val ACTION_STOP_AUDIO_RECORDING = "com.example.zrgfirstapp.STOP_AUDIO_RECORDING"
         const val ACTION_START_TEACHER_SESSION = "com.example.zrgfirstapp.START_TEACHER_SESSION"
+        const val ACTION_START_STUDENT_SESSION = "com.example.zrgfirstapp.START_STUDENT_SESSION"
         const val ACTION_STOP_TEACHER_SESSION = "com.example.zrgfirstapp.STOP_TEACHER_SESSION"
         const val EXTRA_VIDEO_AUDIO_ENABLED = "com.example.zrgfirstapp.VIDEO_AUDIO_ENABLED"
         private const val CHANNEL_ID = "chem_recording"
@@ -37,16 +39,44 @@ class RecordingService : LifecycleService() {
     private var foregroundStarted = false
     private var teacherSessionActive = false
     private var lastStatus = "未记录"
-    private var audioRecorder: MediaRecorder? = null
-    private var audioRecordingFile: File? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private val studentStore by lazy { StudentRecordStore(this) }
+    private var studentAudio: StudentAudioCapture? = null
+    private var studentDir: File? = null
+    private var studentShutdownRequested = false
+    private var studentRecovered = false
+    internal var studentState = StudentRecordState.IDLE
+        private set
+    internal var onStudentUtterance: ((StudentUtterance) -> Unit)? = null
+    internal var onStudentState: ((StudentRecordState, String) -> Unit)? = null
+    internal var onStudentError: ((String) -> Unit)? = null
+    internal var acceptStudentCommands: Boolean
+        get() = studentAudio?.acceptCommands == true
+        set(value) { studentAudio?.acceptCommands = value }
+    private val retryStudentUploads = object : Runnable {
+        override fun run() { studentStore.retry(); handler.postDelayed(this, 30_000L) }
+    }
 
     override fun onCreate() {
         super.onCreate()
         cameraSessionManager = CameraSessionManager(this, this) { status ->
-            lastStatus = status
+            if (studentAudio == null || studentState !in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.STOPPING)) lastStatus = status
+            if (studentAudio != null && studentState == StudentRecordState.STARTING_VIDEO) {
+                if (status == "记录中") {
+                    val dir = studentDir!!
+                    if (studentAudio!!.beginArchive(File(dir, "record_audio.wav"))) {
+                        studentStore.markStarted(dir, System.currentTimeMillis())
+                        setStudentState(StudentRecordState.VIDEO_RECORDING, "录像中")
+                    } else stopStudentRecording(reason = "audio_failed")
+                } else if (status.contains("异常") || status.contains("失败")) {
+                    stopStudentRecording(reason = "camera_failed")
+                }
+            } else if (studentState == StudentRecordState.VIDEO_RECORDING && status.contains("异常")) {
+                stopStudentRecording(reason = "camera_failed")
+            }
             if (foregroundStarted) {
                 val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                manager.notify(NOTIFICATION_ID, buildNotification(status))
+                manager.notify(NOTIFICATION_ID, buildNotification(lastStatus))
             }
         }
     }
@@ -67,17 +97,13 @@ class RecordingService : LifecycleService() {
                 }
                 startRecording(audioEnabled)
             }
-            ACTION_START_AUDIO_RECORDING -> startAudioRecording()
             ACTION_START_CAPTURE_SESSION -> startCaptureSession()
             ACTION_STOP_RECORDING -> {
                 stopRecording()
                 if (!teacherSessionActive) stopSelf()
             }
-            ACTION_STOP_AUDIO_RECORDING -> {
-                stopAudioRecording()
-                if (!teacherSessionActive) stopSelf()
-            }
             ACTION_START_TEACHER_SESSION -> startTeacherSession()
+            ACTION_START_STUDENT_SESSION -> startStudentSession()
             ACTION_STOP_TEACHER_SESSION -> stopTeacherSession()
         }
         return Service.START_STICKY
@@ -90,36 +116,117 @@ class RecordingService : LifecycleService() {
         cameraSessionManager.startRecording()
     }
 
-    @Suppress("DEPRECATION")
-    fun startAudioRecording() {
-        if (audioRecorder != null) return
+    internal fun startStudentSession(): Boolean {
+        studentShutdownRequested = false
+        if (studentAudio != null) return true
         startAsForegroundIfNeeded(microphoneForegroundType())
-        val file = File(cacheDir, "chem_audio_records/audio_${System.currentTimeMillis()}.m4a")
-        file.parentFile?.mkdirs()
-        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
-            MediaRecorder()
-        }
+        val capture = StudentAudioCapture(
+            onUtterance = { phrase -> handler.post { onStudentUtterance?.invoke(phrase) } },
+            onError = { error -> handler.post {
+                if (studentState != StudentRecordState.IDLE) stopStudentRecording(reason = "microphone_failed")
+                studentAudio?.stop()
+                studentAudio = null
+                onStudentError?.invoke(error.message ?: "麦克风采集中断")
+            } },
+        )
+        studentAudio = capture
+        if (!capture.start()) { studentAudio = null; return false }
+        studentShutdownRequested = false
+        if (!studentRecovered) { studentStore.recover(); studentRecovered = true }
+        handler.removeCallbacks(retryStudentUploads)
+        handler.post(retryStudentUploads)
+        lastStatus = "助手监听中"
+        return true
+    }
+
+    internal fun startStudentRecording(video: Boolean, baseUrl: String, experiment: String, source: StudentUtterance?): Boolean {
+        if (studentState != StudentRecordState.IDLE || !startStudentSession()) return false
+        val dir = studentStore.create(if (video) "video" else "audio", baseUrl, DeviceIdentity.hardwareId(this), experiment)
+        studentDir = dir
+        setStudentState(if (video) StudentRecordState.STARTING_VIDEO else StudentRecordState.STARTING_AUDIO, "记录准备中")
         try {
-            recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            recorder.setAudioSamplingRate(16_000)
-            recorder.setAudioEncodingBitRate(64_000)
-            recorder.setOutputFile(file.absolutePath)
-            recorder.prepare()
-            recorder.start()
-            audioRecorder = recorder
-            audioRecordingFile = file
-            lastStatus = "录音中"
-            notifyStatus(lastStatus)
+            if (video) {
+                startAsForegroundIfNeeded(cameraAndMicrophoneForegroundType())
+                cameraSessionManager.setVideoAudioEnabled(false)
+                cameraSessionManager.setStudentOutputDirectory(dir)
+                cameraSessionManager.startRecording()
+            } else {
+                check(studentAudio!!.beginArchive(File(dir, "record_audio.wav"), source)) { "无法开始录音" }
+                studentStore.markStarted(dir, System.currentTimeMillis() - studentAudio!!.archiveLeadInMs)
+                setStudentState(StudentRecordState.AUDIO_RECORDING, "录音中")
+            }
+            return true
         } catch (error: Exception) {
-            recorder.release()
-            file.delete()
-            lastStatus = "录音初始化失败"
-            notifyStatus(lastStatus)
+            studentAudio?.endArchive()
+            studentStore.fail(dir)
+            studentDir = null
+            setStudentState(StudentRecordState.IDLE, "记录启动失败")
+            onStudentError?.invoke(error.message ?: "记录启动失败")
+            return false
         }
+    }
+
+    internal fun stopStudentRecording(reason: String = "user", onSaved: ((Boolean) -> Unit)? = null) {
+        val dir = studentDir ?: return
+        if (studentState == StudentRecordState.STOPPING) return
+        val video = studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING)
+        setStudentState(StudentRecordState.STOPPING, "正在保存记录")
+        val endedAt = UploadMetadata.nowIso()
+        val audio = studentAudio?.endArchive() ?: File(dir, "record_audio.wav").takeIf { it.length() > 44 }
+        fun finish(files: List<File>) {
+            Thread {
+                var movie = files.firstOrNull()
+                var separateAudio = false
+                if (movie != null && audio != null) {
+                    val output = File(dir, "record_video.mp4")
+                    try { StudentVideoAudio.merge(movie, audio, output); movie = output }
+                    catch (error: Exception) {
+                        android.util.Log.w("StudentRecord", "Video audio merge failed; keeping both originals", error)
+                        separateAudio = true
+                    }
+                }
+                val persisted = runCatching { studentStore.ready(dir, audio, movie, reason = reason, endedAt = endedAt) }
+                val saved = audio != null || movie != null
+                handler.post {
+                    studentDir = null
+                    setStudentState(StudentRecordState.IDLE, when {
+                        persisted.isFailure -> "文件已保留，保存清单失败"
+                        !saved -> "没有可保存的记录"
+                        separateAudio -> "已保存在眼镜上，视频音轨分开保存"
+                        else -> "已保存在眼镜上，等待上传"
+                    })
+                    onSaved?.invoke(saved)
+                    if (studentShutdownRequested) stopStudentSession()
+                }
+            }.start()
+        }
+        if (video) cameraSessionManager.stopRecording { finish(it) } else finish(emptyList())
+    }
+
+    internal fun saveStudentPhoto(file: File, baseUrl: String, experiment: String) {
+        val dir = studentStore.create("photo", baseUrl, DeviceIdentity.hardwareId(this), experiment)
+        val saved = File(dir, "photo.jpg")
+        file.copyTo(saved, overwrite = true)
+        studentStore.ready(dir, null, null, photo = saved)
+        file.delete()
+    }
+
+    internal fun stopStudentSession() {
+        studentShutdownRequested = true
+        if (studentState != StudentRecordState.IDLE) { stopStudentRecording(reason = "app_exit"); return }
+        studentAudio?.stop()
+        studentAudio = null
+        onStudentUtterance = null
+        handler.removeCallbacks(retryStudentUploads)
+        cameraSessionManager.shutdown()
+        stopSelf()
+    }
+
+    private fun setStudentState(state: StudentRecordState, status: String) {
+        studentState = state
+        lastStatus = status
+        notifyStatus(status)
+        onStudentState?.invoke(state, status)
     }
 
     fun startTeacherSession() {
@@ -165,34 +272,11 @@ class RecordingService : LifecycleService() {
         }
     }
 
-    @Suppress("DEPRECATION")
-    fun stopAudioRecording(onStopped: ((List<File>) -> Unit)? = null) {
-        val recorder = audioRecorder
-        val file = audioRecordingFile
-        audioRecorder = null
-        audioRecordingFile = null
-        if (recorder != null) {
-            try {
-                recorder.stop()
-            } catch (_: RuntimeException) {
-                file?.delete()
-            }
-            recorder.release()
-        }
-        lastStatus = "未记录"
-        if (foregroundStarted && !teacherSessionActive) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            foregroundStarted = false
-        }
-        val files = if (file != null && file.isFile && file.length() > 0L) listOf(file) else emptyList()
-        onStopped?.invoke(files)
-    }
-
     fun captureStillImage(callback: (File?, Throwable?) -> Unit) {
         // Teacher listening starts as microphone-only. Promote the foreground
         // service before opening CameraX so a backgrounded Activity is still
         // allowed to access the camera on stricter RayNeo builds.
-        if (teacherSessionActive) {
+        if (teacherSessionActive || studentAudio != null) {
             try {
                 startAsForegroundIfNeeded(cameraAndMicrophoneForegroundType())
             } catch (error: Throwable) {
@@ -206,7 +290,7 @@ class RecordingService : LifecycleService() {
         cameraSessionManager.captureStillImage(file, callback)
     }
 
-    fun recordingStatus(): String = if (audioRecorder != null) {
+    fun recordingStatus(): String = if (studentAudio != null) {
         lastStatus
     } else {
         cameraSessionManager.statusLabel.ifBlank { lastStatus }
@@ -219,6 +303,10 @@ class RecordingService : LifecycleService() {
             return
         }
         cameraSessionManager.shutdown()
+        if (studentAudio != null) {
+            startAsForegroundIfNeeded(microphoneForegroundType())
+            return
+        }
         if (teacherSessionActive) {
             // Keep microphone listening active, but release the camera type
             // immediately after the still image is complete.
@@ -234,8 +322,9 @@ class RecordingService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(retryStudentUploads)
+        studentAudio?.stop()
         teacherSessionActive = false
-        stopAudioRecording()
         cameraSessionManager.shutdown()
         super.onDestroy()
     }

@@ -43,6 +43,8 @@ internal class StudentAudioCapture(
     private var totalSamples = 0L
     private var archive: RandomAccessFile? = null
     private var archiveFile: File? = null
+    var archiveLeadInMs = 0L
+        private set
 
     @SuppressLint("MissingPermission")
     fun start(): Boolean {
@@ -98,8 +100,10 @@ internal class StudentAudioCapture(
             if (source != null) {
                 val tailSize = ((totalSamples - source.endedAtSample).coerceAtLeast(0) * 2).toInt()
                 val tail = if (tailSize == 0) ByteArray(0) else ring.snapshot(tailSize)
-                if (tail != null) { output.write(source.pcm); output.write(tail) }
+                output.write(source.pcm)
+                if (tail != null) output.write(tail)
             }
+            archiveLeadInMs = (output.length() - 44) * 1000L / 32_000L
             archive = output
             archiveFile = file
             return true
