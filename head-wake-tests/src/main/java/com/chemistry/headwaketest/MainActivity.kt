@@ -247,17 +247,22 @@ class MainActivity : Activity(), SensorEventListener {
                     text("单击回正校准 · 双击退出", 0.91f, 0.025f)
                 }
                 val success = SystemClock.elapsedRealtime() < successUntil
-                if (!BuildConfig.CURSOR_MODE || visibleTarget || success) {
+                run {
                     val tx = w * 0.80f
                     val ty = h * 0.25f
-                    val radius = unit * 0.065f
+                    val active = !BuildConfig.CURSOR_MODE || visibleTarget || success
+                    val radius = unit * if (active) 0.065f else 0.025f
                     paint.style = Paint.Style.STROKE
-                    paint.strokeWidth = unit * 0.004f
-                    paint.color = if (trigger.progress > 0f || success) Color.rgb(100, 255, 200) else Color.WHITE
+                    paint.strokeWidth = unit * if (active) 0.004f else 0.002f
+                    paint.color = when {
+                        trigger.progress > 0f || success -> Color.rgb(100, 255, 200)
+                        active -> Color.WHITE
+                        else -> Color.rgb(170, 200, 210)
+                    }
                     canvas.drawCircle(tx, ty, radius, paint)
                     paint.style = Paint.Style.FILL
                     paint.textAlign = Paint.Align.CENTER
-                    paint.textSize = unit * 0.052f
+                    paint.textSize = radius * 0.8f
                     canvas.drawText("北", tx, ty - (paint.ascent() + paint.descent()) / 2f, paint)
                     if (trigger.progress > 0f) {
                         paint.style = Paint.Style.STROKE
