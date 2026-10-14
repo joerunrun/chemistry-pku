@@ -4,6 +4,7 @@ import android.app.Activity
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.drawable.ColorDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -65,12 +66,15 @@ class MainActivity : Activity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        window.decorView.setBackgroundColor(Color.TRANSPARENT)
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or
             View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         volumeControlStream = AudioManager.STREAM_MUSIC
         tone = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 70) }.getOrNull()
         panel = TestView()
+        panel.setBackgroundColor(Color.TRANSPARENT)
         setContentView(panel)
         touch = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent) = true
@@ -195,8 +199,7 @@ class MainActivity : Activity(), SensorEventListener {
             hit = visibleTarget && hypot((cx - 0.80f) * eyeWidth, (cy - 0.25f) * eyeHeight) <=
                 radius * if (trigger.progress > 0f) 1.8f else 1.5f
         } else {
-            hit = if (trigger.progress > 0f) yaw in 10f..30f && pitch in 6f..24f
-                else yaw in 12f..28f && pitch in 8f..22f
+            hit = GestureTarget.contains(yaw, pitch, trigger.progress > 0f)
         }
         if (trigger.update(neutral, hit, now)) {
             count++
@@ -209,7 +212,7 @@ class MainActivity : Activity(), SensorEventListener {
             !trigger.armed -> "请回正头部保持片刻"
             trigger.progress > 0f -> "保持姿态，等待 3 秒"
             BuildConfig.CURSOR_MODE -> "转向右上方，让十字对准出现的图标"
-            else -> "向右转并抬头，保持 3 秒"
+            else -> "轻向右转、稍抬头，保持 3 秒"
         }
         panel.invalidate()
     }

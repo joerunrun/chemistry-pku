@@ -1,5 +1,11 @@
 package com.chemistry.headwaketest
 
+internal object GestureTarget {
+    fun contains(yaw: Float, pitch: Float, holding: Boolean): Boolean =
+        if (holding) yaw in 6f..60f && pitch in 1f..50f
+        else yaw in 8f..55f && pitch in 3f..45f
+}
+
 /** Requires a return to neutral between activations. Times use a monotonic clock. */
 internal class DwellTrigger {
     var armed = false

@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DwellTriggerTest {
+    @Test fun gestureAcceptsSmallMovementAndOvershootButRejectsOtherDirections() {
+        assertTrue(GestureTarget.contains(9f, 4f, false))
+        assertTrue(GestureTarget.contains(40f, 25f, false))
+        assertTrue(GestureTarget.contains(7f, 2f, true))
+        assertFalse(GestureTarget.contains(7f, 2f, false))
+        assertFalse(GestureTarget.contains(-15f, 10f, false))
+        assertFalse(GestureTarget.contains(15f, -10f, true))
+        assertFalse(GestureTarget.contains(0f, 0f, true))
+    }
+
     private fun ready() = DwellTrigger().apply {
         update(true, false, 0)
         update(true, false, 400)
