@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
 class TeacherActivity : AppCompatActivity() {
+    private lateinit var headWake: TeacherHeadWake
     private lateinit var gestureDetector: GestureDetector
     private val mainHandler = Handler(Looper.getMainLooper())
     private var activePlayer: MediaPlayer? = null
@@ -145,6 +146,13 @@ class TeacherActivity : AppCompatActivity() {
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
         findViewById<View>(R.id.main).setBackgroundColor(Color.TRANSPARENT)
+        headWake = TeacherHeadWake(this,
+            canWake = {
+                teacherConnectionReady && teacherSessionStarted && !teacherExitInProgress &&
+                    teacherState == TeacherState.LISTENING && !voiceRecognitionPaused
+            },
+            wake = { enterTeacherAwake() },
+        )
 
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
@@ -180,6 +188,16 @@ class TeacherActivity : AppCompatActivity() {
         hideAllViews()
 
         checkTeacherConnection()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        headWake.start()
+    }
+
+    override fun onPause() {
+        headWake.stop()
+        super.onPause()
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
