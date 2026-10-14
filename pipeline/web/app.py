@@ -3319,6 +3319,8 @@ def glasses_voice_intent():
                 demo_options=demo_options,
                 model=model or None,
                 timeout_seconds=timeout_seconds,
+                recording_state=request.form.get("recording_state", "IDLE"),
+                recent_dialogue=request.form.get("recent_dialogue", ""),
             )
         finally:
             _omni_semaphore.release()
