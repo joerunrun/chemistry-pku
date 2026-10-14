@@ -1,5 +1,13 @@
 package com.chemistry.headwaketest
 
+internal object CursorTarget {
+    const val SMALL_RADIUS = 0.025f
+    const val LARGE_RADIUS = 0.065f
+
+    fun contains(distance: Float, unit: Float, expanded: Boolean): Boolean =
+        unit > 0f && distance <= unit * if (expanded) LARGE_RADIUS else SMALL_RADIUS
+}
+
 internal object GestureTarget {
     fun contains(yaw: Float, pitch: Float, holding: Boolean): Boolean =
         if (holding) yaw in 6f..60f && pitch in 1f..50f

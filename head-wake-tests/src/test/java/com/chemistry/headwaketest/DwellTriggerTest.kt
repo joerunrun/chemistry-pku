@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DwellTriggerTest {
+    @Test fun cursorMustEnterSmallIconBeforeUsingExpandedArea() {
+        assertFalse(CursorTarget.contains(20f, 480f, false))
+        assertTrue(CursorTarget.contains(12f, 480f, false))
+        assertTrue(CursorTarget.contains(20f, 480f, true))
+        assertFalse(CursorTarget.contains(32f, 480f, true))
+        assertFalse(CursorTarget.contains(0f, 0f, false))
+    }
+
     @Test fun gestureAcceptsSmallMovementAndOvershootButRejectsOtherDirections() {
         assertTrue(GestureTarget.contains(9f, 4f, false))
         assertTrue(GestureTarget.contains(40f, 25f, false))

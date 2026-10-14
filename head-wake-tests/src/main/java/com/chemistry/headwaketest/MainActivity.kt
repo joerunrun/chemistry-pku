@@ -191,13 +191,13 @@ class MainActivity : Activity(), SensorEventListener {
         if (BuildConfig.CURSOR_MODE) {
             val cx = cursorX()
             val cy = cursorY()
-            if (trigger.armed && cx >= 0.72f && cy <= 0.35f) visibleTarget = true
-            if (cx < 0.65f || cy > 0.42f || !trigger.armed) visibleTarget = false
             val eyeWidth = panel.width / 2f
             val eyeHeight = panel.height.toFloat()
-            val radius = min(eyeWidth, eyeHeight) * 0.065f
-            hit = visibleTarget && hypot((cx - 0.80f) * eyeWidth, (cy - 0.25f) * eyeHeight) <=
-                radius * if (trigger.progress > 0f) 1.8f else 1.5f
+            val distance = hypot((cx - 0.80f) * eyeWidth, (cy - 0.25f) * eyeHeight)
+            visibleTarget = trigger.armed && CursorTarget.contains(
+                distance, min(eyeWidth, eyeHeight), visibleTarget,
+            )
+            hit = visibleTarget
         } else {
             hit = GestureTarget.contains(yaw, pitch, trigger.progress > 0f)
         }
@@ -251,7 +251,7 @@ class MainActivity : Activity(), SensorEventListener {
                     val tx = w * 0.80f
                     val ty = h * 0.25f
                     val active = !BuildConfig.CURSOR_MODE || visibleTarget || success
-                    val radius = unit * if (active) 0.065f else 0.025f
+                    val radius = unit * if (active) CursorTarget.LARGE_RADIUS else CursorTarget.SMALL_RADIUS
                     paint.style = Paint.Style.STROKE
                     paint.strokeWidth = unit * if (active) 0.004f else 0.002f
                     paint.color = when {
