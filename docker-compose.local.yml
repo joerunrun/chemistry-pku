@@ -1,0 +1,21 @@
+name: chemistry-local-test
+
+services:
+  chemistry-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chemistry-local-test
+    env_file:
+      - .env
+    environment:
+      CHEM_RUNTIME_ASSETS_DIR: /app/runtime_assets
+      CHEM_TRUST_PROXY: "0"
+      CHEM_GLASSES_JOB_WORKERS: "1"
+      CHEM_MEDIA_ANALYSIS_WORKERS: "1"
+      WEB_WORKERS: "1"
+      PKU_IAAA_REDIRECT_URL: ""
+    ports:
+      - "127.0.0.1:5081:5080"
+    volumes:
+      - ./.local_docker_test/runtime_assets:/app/runtime_assets

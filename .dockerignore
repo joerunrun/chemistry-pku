@@ -1,5 +1,9 @@
 .git
 .gitignore
+code/
+.local_docker_test/
+code/
+.local_docker_test/
 __pycache__/
 *.pyc
 .pytest_cache/

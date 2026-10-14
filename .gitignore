@@ -16,3 +16,5 @@ runtime_assets/
 pipeline/speaker_verify/models/
 pipeline/speaker_verify/data/
 code/
+.local_docker_test/
+.local_docker_test/
