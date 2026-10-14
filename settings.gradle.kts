@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "zrgfirstapp"
 include(":app")
+include(":head-wake-tests")
