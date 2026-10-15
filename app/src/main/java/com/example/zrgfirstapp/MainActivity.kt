@@ -152,6 +152,7 @@ class MainActivity : AppCompatActivity() {
     private var recordingRequested = false
     private var recordingVideo = false
     private var standalonePhotoRequested = false
+    private var pendingCheckRequest = ""
     private var recordingStatusText = "未记录"
     private var connectionStatusText = "未测试"
     private var qaAudioSupported = false
@@ -1143,7 +1144,8 @@ class MainActivity : AppCompatActivity() {
             }
             "experiment_check" -> {
                 selectedMode = Mode.EXPERIMENT
-                startCaptureCountdown()
+                startCaptureCountdown(checkRequest = slots?.optString("check_request", "").orEmpty()
+                    .ifBlank { json.optString("transcript") })
             }
             "qa" -> {
                 val question = json.optString("question").ifBlank { json.optString("transcript") }
@@ -1734,8 +1736,9 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun startCaptureCountdown(photoOnly: Boolean = false) {
+    private fun startCaptureCountdown(photoOnly: Boolean = false, checkRequest: String = "") {
         stopVoiceIntentRecording()
+        pendingCheckRequest = checkRequest
         standalonePhotoRequested = photoOnly
         val token = operationToken + 1
         operationToken = token
@@ -1909,12 +1912,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun submitImage(file: File) {
         val token = startRunning("正在分析实验照片...", "")
+        val checkRequest = pendingCheckRequest
         Thread {
             try {
                 val fields = linkedMapOf(
                     "mode" to selectedModeValue(),
                     "provider" to "qiniu",
                     "model" to "google/gemini-3.5-flash",
+                    "check_request" to checkRequest,
                 )
                 val json = postMultipart(
                     "$baseUrl/api/glasses/jobs",
