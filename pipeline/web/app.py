@@ -3480,6 +3480,7 @@ def create_glasses_job():
             experiment_type=experiment_type,
             provider=provider,
             model=model,
+            check_request=request.form.get("check_request", "").strip()[:4000],
         )
         return jsonify({
             "job_id": job_id,
@@ -3814,6 +3815,7 @@ def _submit_glasses_job(
     experiment_type: str,
     provider: str,
     model: str,
+    check_request: str = "",
 ) -> str:
     with _glasses_lock:
         pending = sum(1 for j in _glasses_jobs.values() if j.get("status") in ("queued", "running"))
@@ -3843,6 +3845,7 @@ def _submit_glasses_job(
         experiment_type,
         provider,
         model,
+        check_request,
     )
     return job_id
 
@@ -3894,19 +3897,15 @@ def _run_glasses_job(
     experiment_type: str,
     provider: str,
     model: str,
+    check_request: str = "",
 ) -> None:
     _update_glasses_job(job_id, status="running", stage="upload", message="Image accepted.")
     try:
         _update_glasses_job(job_id, stage="processing", message="Running check.")
         if mode == "general_check":
-            from pipeline.common.vlm_client import build_image_part_from_bytes, build_text_part, call_vlm, create_vlm
+            from pipeline.qa.photo_check import check_photo
 
-            client = create_vlm(provider, model)
-            analysis, elapsed = call_vlm(client, [
-                {"role": "system", "content": "你是小北化学实验助手。根据学生现场照片检查可见的装置连接、操作和安全问题，不预设实验种类。只根据照片中看得到的证据判断，不臆测操作过程、试剂或实验目标。优先指出最需要纠正的问题，给出简短具体的改正建议；无法确定时说明限制。用适合眼镜播报的简短中文回答。"},
-                {"role": "user", "content": [build_text_part("请帮我检查并纠正照片中的实验。"), build_image_part_from_bytes(image_bytes, client)]},
-            ])
-            result = {"analysis_text": analysis, "mode": mode, "timings": {"vlm": elapsed}}
+            result = check_photo(image_bytes, check_request, provider=provider, model=model)
         else:
             from pipeline.experiments.runner import run_experiment_check
 
