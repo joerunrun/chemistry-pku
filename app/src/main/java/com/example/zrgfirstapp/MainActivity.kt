@@ -1150,7 +1150,7 @@ class MainActivity : AppCompatActivity() {
                 if (question.isNotBlank()) submitTextQuestion(question)
             }
             "demo_guide" -> {
-                startDemoGuide()
+                startDemoGuide(slots?.optString("video_query", "").orEmpty())
             }
             "select_demo_video" -> {
                 val index = if (slots?.has("video_index") == true && !slots.isNull("video_index")) {
@@ -1178,13 +1178,14 @@ class MainActivity : AppCompatActivity() {
             this == ScreenState.VOICE_LISTENING
     }
 
-    private fun startDemoGuide() {
+    private fun startDemoGuide(query: String = "", requestedIndex: Int? = null) {
         stopVoiceIntentRecording()
+        demoVideos = emptyList()
         val token = startRunning("正在读取演示视频...", "")
         activeTaskTitle = "演示指引"
         Thread {
             try {
-                val json = getJson("$baseUrl/api/glasses/demo/videos")
+                val json = getJson("$baseUrl/api/glasses/demo/videos?q=${Uri.encode(query)}")
                 val videosJson = json.optJSONArray("videos")
                 val videos = mutableListOf<DemoVideo>()
                 if (videosJson != null) {
@@ -1192,18 +1193,22 @@ class MainActivity : AppCompatActivity() {
                         val item = videosJson.optJSONObject(i) ?: continue
                         val id = item.optString("id", "")
                         val label = item.optString("label", "")
-                        val streamUrl = item.optString("stream_url", "")
-                        if (id.isNotBlank() && label.isNotBlank() && streamUrl.isNotBlank()) {
-                            videos += DemoVideo(id, label, resolveUrl(streamUrl))
+                        val streamUrl = if (item.isNull("stream_url")) "" else item.optString("stream_url", "")
+                        if (id.isNotBlank() && label.isNotBlank()) {
+                            videos += DemoVideo(id, label, if (streamUrl.isBlank()) "" else resolveUrl(streamUrl))
                         }
                     }
                 }
                 runOnUiIfCurrent(token) {
                     if (videos.isEmpty()) {
-                        showResult("当前实验没有可播放的演示视频。", "演示指引")
+                        showResult("没有找到相关视频，或资料库暂时无法连接。", "演示指引")
                     } else {
                         demoVideos = videos
-                        enterDemoSelect()
+                        when {
+                            requestedIndex != null -> selectAndPlayDemoVideo(requestedIndex, query)
+                            videos.size == 1 -> playDemoVideo(videos.first())
+                            else -> enterDemoSelect()
+                        }
                     }
                 }
             } catch (exc: Exception) {
@@ -1219,7 +1224,9 @@ class MainActivity : AppCompatActivity() {
         passiveListenMode = PassiveListenMode.DEMO_SELECT
         startVoiceIntentLoop()  // 选择视频期间保持苏醒
         activeTaskTitle = "演示指引"
-        val options = demoVideos.mapIndexed { index, video -> "${index + 1}. ${demoDisplayLabel(video)}" }
+        val options = demoVideos.mapIndexed { index, video ->
+            "${index + 1}. ${demoDisplayLabel(video)}${if (video.streamUrl.isBlank()) "（暂无视频文件）" else ""}"
+        }
         lastStatusText = "请说视频序号或名称"
         lastResultText = options.joinToString("\n")
         screenState = ScreenState.DEMO_SELECT
@@ -1233,7 +1240,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun selectAndPlayDemoVideo(index: Int?, query: String) {
         if (demoVideos.isEmpty()) {
-            startDemoGuideThenSelect(index, query)
+            startDemoGuide(query, index)
             return
         }
         if (index == null && isGenericDemoGuideRequest(query)) {
@@ -1255,41 +1262,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
         playDemoVideo(video)
-    }
-
-    private fun startDemoGuideThenSelect(index: Int?, query: String) {
-        val token = startRunning("正在读取演示视频...", "")
-        activeTaskTitle = "演示指引"
-        Thread {
-            try {
-                val json = getJson("$baseUrl/api/glasses/demo/videos")
-                val videosJson = json.optJSONArray("videos")
-                val videos = mutableListOf<DemoVideo>()
-                if (videosJson != null) {
-                    for (i in 0 until videosJson.length()) {
-                        val item = videosJson.optJSONObject(i) ?: continue
-                        val id = item.optString("id", "")
-                        val label = item.optString("label", "")
-                        val streamUrl = item.optString("stream_url", "")
-                        if (id.isNotBlank() && label.isNotBlank() && streamUrl.isNotBlank()) {
-                            videos += DemoVideo(id, label, resolveUrl(streamUrl))
-                        }
-                    }
-                }
-                runOnUiIfCurrent(token) {
-                    demoVideos = videos
-                    if (index == null && isGenericDemoGuideRequest(query)) {
-                        enterDemoSelect()
-                    } else {
-                        selectAndPlayDemoVideo(index, query)
-                    }
-                }
-            } catch (exc: Exception) {
-                runOnUiIfCurrent(token) {
-                    showResult(exc.message ?: "无法读取演示视频。", "演示指引失败")
-                }
-            }
-        }.start()
     }
 
     private fun isGenericDemoGuideRequest(query: String): Boolean {
@@ -1370,6 +1342,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun playDemoVideo(video: DemoVideo) {
+        if (video.streamUrl.isBlank()) {
+            showResult("找到“${demoDisplayLabel(video)}”的资料，暂时没有可播放的视频文件。", "演示指引")
+            return
+        }
         stopAssistantAudio()
         stopVoiceIntentRecording()
         passiveListenMode = PassiveListenMode.DEMO_STOP
