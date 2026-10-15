@@ -29,7 +29,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 load_dotenv(Path(PROJECT_ROOT) / ".env")
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from pipeline.common.cv_wrapper import (
     CVDetectionParams,
@@ -2576,24 +2576,49 @@ def glasses_teacher_verify():
 @app.get("/api/glasses/demo/videos")
 def glasses_demo_videos():
     try:
-        experiment_type = _normalize_demo_experiment_type(
-            request.args.get("experiment_type", "distillation")
-        )
+        experiment_type = _normalize_demo_experiment_type(request.args["experiment_type"]) if request.args.get("experiment_type") else None
+        query = request.args.get("q", "").strip()
         videos = _list_demo_videos(experiment_type)
+        if query:
+            videos = [item for item in videos if query.casefold() in item["label"].casefold()]
+        from pipeline.common.knowledge_client import video_candidates
+        external = video_candidates(query) if query else []
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({
-        "videos": [
+        "videos": external + [
             {
                 "id": item["id"],
                 "label": item["label"],
                 "filename": item["filename"],
                 "experiment_type": item["experiment_type"],
                 "stream_url": f"/api/glasses/demo/videos/{item['id']}/stream",
+                "playable": True,
             }
             for item in videos
         ],
     })
+
+
+@app.route("/api/glasses/demo/videos/knowledge/<knowledge_base_id>/<document_id>/stream", methods=["GET", "HEAD"])
+def glasses_knowledge_video_stream(knowledge_base_id: str, document_id: str):
+    from pipeline.common.knowledge_client import enabled, open_video
+    if not enabled():
+        return jsonify({"error": "Knowledge service is not configured"}), 503
+    try:
+        upstream = open_video(knowledge_base_id, document_id, method=request.method,
+                              byte_range=request.headers.get("Range", ""))
+    except ValueError:
+        return jsonify({"error": "Video media is not available"}), 404
+    except Exception:
+        return jsonify({"error": "Video service unavailable"}), 502
+    headers = {key: upstream.headers[key] for key in (
+        "Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control",
+    ) if key in upstream.headers}
+    response = Response(upstream.iter_content(64 * 1024) if request.method == "GET" else b"",
+                        status=upstream.status_code, headers=headers)
+    response.call_on_close(upstream.close)
+    return response
 
 
 @app.get("/api/glasses/demo/videos/<video_id>/stream")

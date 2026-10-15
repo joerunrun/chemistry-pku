@@ -30,7 +30,8 @@ stop_recording：明确要求结束/保存当前录音或录像；必须区别�
 capture_photo：只拍照保存，不自动分析。
 qa：向助手提出问题；question 必须保留本次问题，不要求再说一遍。
 experiment_check：请求检查实验装置或操作；safety_check：请求检查安全。
-demo_guide：请求演示视频；select_demo_video：选当前列表的视频（video_index 从0开始）。
+demo_guide：请求演示视频；slots.video_query 提取用户想看的具体内容，例如“滴定管润洗”，没有具体主题时为空字符串。
+select_demo_video：选当前列表的视频（video_index 从0开始），不重新解释为全库搜索。
 stop_demo_video：明确停止播放。学生端不划分实验种类；请求纠错直接返回 experiment_check，拍照交给视觉模型判断。
 student_question 中允许直接提问；student_demo_select 中允许直接选择。
 其他时候仍要判断是不是对助手说话。正在记录时普通谈话是记录内容，不是控制指令。
