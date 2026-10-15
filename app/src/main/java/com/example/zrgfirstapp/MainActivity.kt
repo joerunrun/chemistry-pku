@@ -1,4 +1,4 @@
-﻿package com.example.zrgfirstapp
+package com.example.zrgfirstapp
 
 import android.Manifest
 import android.content.ComponentName
@@ -52,12 +52,8 @@ class MainActivity : AppCompatActivity() {
         WELCOME,
         CONNECTION_CHECK,
         CONNECTION_FAILED,
-        EXPERIMENT_SETUP,
         CONSENT,
         HOME,
-        EXPERIMENT_SELECT,
-        MORE_EXPERIMENT_SELECT,
-        EXTRA_EXPERIMENT_SELECT,
         LIVE_MINIMAL,
         ACTION_MENU,
         CAPTURE_COUNTDOWN,
@@ -70,18 +66,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private enum class Mode {
+        ASSISTANT,
         EXPERIMENT,
         SAFETY,
         QA,
         OVERLAY_TEST,
-    }
-
-    private enum class ExperimentType {
-        DISTILLATION,
-        PHOTOMETER,
-        ELECTROLYSIS,
-        TLC,
-        OTHER,
     }
 
     private enum class CameraPermissionAction {
@@ -151,8 +140,7 @@ class MainActivity : AppCompatActivity() {
     private var screenState = ScreenState.WELCOME
     private var passiveListenMode = PassiveListenMode.NONE
     private var focusIndex = 0
-    private var selectedMode = Mode.EXPERIMENT
-    private var selectedExperimentType = ExperimentType.DISTILLATION
+    private var selectedMode = Mode.ASSISTANT
     private var shownPreviewDataUrl: String? = null
     private var thinkingFrame = 0
     private var operationToken = 0
@@ -270,7 +258,6 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             if (!::leftPanel.isInitialized || screenState !in setOf(
                     ScreenState.CONNECTION_CHECK,
-                    ScreenState.EXPERIMENT_SETUP,
                     ScreenState.CAPTURE_COUNTDOWN,
                     ScreenState.DEMO_SELECT,
                     ScreenState.VOICE_LISTENING,
@@ -360,7 +347,7 @@ class MainActivity : AppCompatActivity() {
         bindViews()
         gestureDetector = GestureDetector(this, TempleGestureListener())
         renderScreen()
-        mainHandler.postDelayed(welcomeRunnable, 5_000L)
+        mainHandler.postDelayed(welcomeRunnable, 300L)
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -415,14 +402,6 @@ class MainActivity : AppCompatActivity() {
                 result = lastResultText.ifBlank { "双击可退出，继续设置后仍可稍后重试。" },
             )
 
-            ScreenState.EXPERIMENT_SETUP -> renderProcessScreen(
-                title = "实验设置",
-                subtitle = "请选择今天的实验",
-                status = lastStatusText,
-                result = lastResultText,
-                running = true,
-            )
-
             ScreenState.CONSENT -> renderChoiceScreen(
                 title = "化学实验识别",
                 subtitle = "记录许可",
@@ -433,38 +412,11 @@ class MainActivity : AppCompatActivity() {
             )
 
             ScreenState.HOME -> renderChoiceScreen(
-                title = "实验设置",
+                title = "小北助手",
                 subtitle = "选择检测类型",
                 primary = "实验纠错",
                 secondary = "安全检查",
                 status = "前后滑动选择，单击确认",
-                result = liveSummary(),
-            )
-
-            ScreenState.EXPERIMENT_SELECT -> renderChoiceScreen(
-                title = "实验纠错",
-                subtitle = "选择实验",
-                primary = "减压蒸馏",
-                secondary = "更多实验",
-                status = "选择后进入实验中界面",
-                result = liveSummary(),
-            )
-
-            ScreenState.MORE_EXPERIMENT_SELECT -> renderChoiceScreen(
-                title = "更多实验",
-                subtitle = "选择实验",
-                primary = "光度计",
-                secondary = "更多实验",
-                status = "双击返回上一层",
-                result = liveSummary(),
-            )
-
-            ScreenState.EXTRA_EXPERIMENT_SELECT -> renderChoiceScreen(
-                title = "更多实验",
-                subtitle = "选择实验",
-                primary = "电解",
-                secondary = "TLC",
-                status = "双击返回上一层",
                 result = liveSummary(),
             )
 
@@ -537,9 +489,9 @@ class MainActivity : AppCompatActivity() {
             setPanelGravity(panel, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
             panel.titleText.visibility = View.VISIBLE
             panel.subtitleText.visibility = View.VISIBLE
-            panel.titleText.text = "化学实验识别"
+            panel.titleText.text = "小北助手"
             panel.titleText.textSize = 30f
-            panel.subtitleText.text = "智能眼镜实验辅助"
+            panel.subtitleText.text = "正在启动"
             panel.optionsRow.visibility = View.GONE
             panel.progress.visibility = View.VISIBLE
             panel.thinkingText.visibility = View.GONE
@@ -548,7 +500,7 @@ class MainActivity : AppCompatActivity() {
             panel.detectionOverlay.clearBoxes()
             panel.demoVideoView.visibility = View.GONE
             panel.statusText.text = ""
-            panel.resultText.text = "实验纠错  |  语音问答"
+            panel.resultText.text = ""
         }
     }
 
@@ -667,25 +619,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun selectedTitle(): String {
         return when (selectedMode) {
+            Mode.ASSISTANT -> "小北助手"
             Mode.SAFETY -> "安全检查"
             Mode.QA -> "语音问答"
             Mode.OVERLAY_TEST -> "投影测试"
-            Mode.EXPERIMENT -> when (selectedExperimentType) {
-                ExperimentType.DISTILLATION -> "减压蒸馏纠错"
-                ExperimentType.PHOTOMETER -> "光度计纠错"
-                ExperimentType.ELECTROLYSIS -> "电解纠错"
-                ExperimentType.TLC -> "TLC纠错"
-                ExperimentType.OTHER -> "其它测试"
-            }
+            Mode.EXPERIMENT -> "实验纠错"
         }
     }
 
     private fun currentSelectionText(): String {
         val selection = when (selectedMode) {
+            Mode.ASSISTANT -> "助手待命"
             Mode.SAFETY -> "当前模式：安全检查"
             Mode.QA -> "当前模式：语音问答"
             Mode.OVERLAY_TEST -> "当前模式：投影测试"
-            Mode.EXPERIMENT -> "当前实验：${experimentLabel()}"
+            Mode.EXPERIMENT -> "当前模式：实验纠错"
         }
         return "$selection\n${recordingSummary()}\n连接方式：$connectionLabel"
     }
@@ -696,16 +644,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun recordingSummary(): String {
         return "记录状态：$recordingStatusText"
-    }
-
-    private fun experimentLabel(): String {
-        return when (selectedExperimentType) {
-            ExperimentType.DISTILLATION -> "减压蒸馏"
-            ExperimentType.PHOTOMETER -> "光度计"
-            ExperimentType.ELECTROLYSIS -> "电解"
-            ExperimentType.TLC -> "TLC"
-            ExperimentType.OTHER -> "其它测试"
-        }
     }
 
     private fun moveFocus(delta: Int) {
@@ -729,7 +667,7 @@ class MainActivity : AppCompatActivity() {
                     focusIndex = 0
                     voiceControlEnabled = voiceIntentSupported
                     if (voiceIntentSupported) {
-                        enterExperimentSetup()
+                        enterStudentReady()
                     } else {
                         screenState = ScreenState.CONSENT
                         renderScreen()
@@ -737,7 +675,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            ScreenState.EXPERIMENT_SETUP -> Unit
 
             ScreenState.CONSENT -> {
                 if (focusIndex == 0) {
@@ -757,7 +694,7 @@ class MainActivity : AppCompatActivity() {
                 focusIndex = 0
                 if (selectedIndex == 0) {
                     selectedMode = Mode.EXPERIMENT
-                    screenState = ScreenState.EXPERIMENT_SELECT
+                    enterLiveMinimal()
                 } else {
                     selectedMode = Mode.SAFETY
                     enterLiveMinimal()
@@ -766,39 +703,8 @@ class MainActivity : AppCompatActivity() {
                 renderScreen()
             }
 
-            ScreenState.EXPERIMENT_SELECT -> {
-                if (focusIndex == 0) {
-                    selectedMode = Mode.EXPERIMENT
-                    selectedExperimentType = ExperimentType.DISTILLATION
-                    enterLiveMinimal()
-                } else {
-                    focusIndex = 0
-                    screenState = ScreenState.MORE_EXPERIMENT_SELECT
-                    renderScreen()
-                }
-            }
 
-            ScreenState.MORE_EXPERIMENT_SELECT -> {
-                if (focusIndex == 0) {
-                    selectedMode = Mode.EXPERIMENT
-                    selectedExperimentType = ExperimentType.PHOTOMETER
-                    enterLiveMinimal()
-                } else {
-                    focusIndex = 0
-                    screenState = ScreenState.EXTRA_EXPERIMENT_SELECT
-                    renderScreen()
-                }
-            }
 
-            ScreenState.EXTRA_EXPERIMENT_SELECT -> {
-                selectedMode = Mode.EXPERIMENT
-                selectedExperimentType = if (focusIndex == 0) {
-                    ExperimentType.ELECTROLYSIS
-                } else {
-                    ExperimentType.TLC
-                }
-                enterLiveMinimal()
-            }
 
             ScreenState.LIVE_MINIMAL -> {
                 showActionMenu()
@@ -835,45 +741,11 @@ class MainActivity : AppCompatActivity() {
         renderScreen()
     }
 
-    private fun enterExperimentSetup() {
-        stopVoiceIntentRecording()
-        mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
-        focusIndex = 0
-        clearTaskOutput()
-        voiceControlEnabled = voiceIntentSupported
-        lastStatusText = "请直接说：减压蒸馏、光度计或电解实验"
-        lastResultText = "无需说小北助手。"
-        screenState = ScreenState.EXPERIMENT_SETUP
-        renderScreen()
-        playPrompt("ask_experiment") {
-            startVoiceIntentLoop()
-        }
-    }
-
-    private fun finishExperimentSetup() {
+    private fun enterStudentReady() {
+        selectedMode = Mode.ASSISTANT
+        studentQuestionPending = false
         enterLiveMinimal()
         playPrompt("assistant_ready")
-    }
-
-    private fun retryExperimentSetup() {
-        if (screenState != ScreenState.EXPERIMENT_SETUP) {
-            screenState = ScreenState.EXPERIMENT_SETUP
-        }
-        lastStatusText = "请选择今天的实验"
-        lastResultText = "可以说：减压蒸馏、光度计、电解实验或TLC。"
-        renderScreen()
-        playPrompt("ask_experiment") {
-            mainHandler.postDelayed({ startVoiceIntentLoop() }, 300L)
-        }
-    }
-
-    private fun experimentTypeFromValue(value: String): ExperimentType {
-        return when (value) {
-            "photometer" -> ExperimentType.PHOTOMETER
-            "electrolysis" -> ExperimentType.ELECTROLYSIS
-            "tlc" -> ExperimentType.TLC
-            else -> ExperimentType.DISTILLATION
-        }
     }
 
     private fun enterLiveMinimal() {
@@ -904,30 +776,11 @@ class MainActivity : AppCompatActivity() {
             ScreenState.WELCOME,
             ScreenState.CONNECTION_CHECK,
             ScreenState.CONNECTION_FAILED,
-            ScreenState.EXPERIMENT_SETUP,
             ScreenState.CONSENT,
             ScreenState.HOME,
             ScreenState.LIVE_MINIMAL -> {
                 stopRecordingService()
                 finishAndRemoveTask()
-            }
-            ScreenState.EXPERIMENT_SELECT -> {
-                focusIndex = 0
-                screenState = ScreenState.HOME
-                clearTaskOutput()
-                renderScreen()
-            }
-            ScreenState.MORE_EXPERIMENT_SELECT -> {
-                focusIndex = 1
-                screenState = ScreenState.EXPERIMENT_SELECT
-                clearTaskOutput()
-                renderScreen()
-            }
-            ScreenState.EXTRA_EXPERIMENT_SELECT -> {
-                focusIndex = 1
-                screenState = ScreenState.MORE_EXPERIMENT_SELECT
-                clearTaskOutput()
-                renderScreen()
             }
             ScreenState.ACTION_MENU -> {
                 enterLiveMinimal()
@@ -963,9 +816,6 @@ class MainActivity : AppCompatActivity() {
         return this == ScreenState.CONNECTION_FAILED ||
             this == ScreenState.CONSENT ||
             this == ScreenState.HOME ||
-            this == ScreenState.EXPERIMENT_SELECT ||
-            this == ScreenState.MORE_EXPERIMENT_SELECT ||
-            this == ScreenState.EXTRA_EXPERIMENT_SELECT ||
             this == ScreenState.ACTION_MENU
     }
 
@@ -1193,7 +1043,6 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun voiceContextValue(): String = when {
-        screenState == ScreenState.EXPERIMENT_SETUP -> "student_setup"
         studentQuestionPending -> "student_question"
         screenState == ScreenState.DEMO_SELECT -> "student_demo_select"
         screenState == ScreenState.DEMO_PLAYING -> "student_demo_playing"
@@ -1256,18 +1105,6 @@ class MainActivity : AppCompatActivity() {
         if (intent in setOf("no_action", "unclear", "unknown")) return
         if (recordingRequested && !screenState.allowsVoiceIntent() && intent != "stop_recording") return
         val slots = json.optJSONObject("slots")
-        val experimentType = slots?.optString("experiment_type", "") ?: ""
-
-        if (context == "student_setup") {
-            if (intent == "select_experiment" && experimentType.isNotBlank()) {
-                selectedMode = Mode.EXPERIMENT
-                selectedExperimentType = experimentTypeFromValue(experimentType)
-                finishExperimentSetup()
-            } else {
-                retryExperimentSetup()
-            }
-            return
-        }
 
         if (passiveMode == PassiveListenMode.DEMO_STOP) {
             if (intent == "stop_demo_video") {
@@ -1308,11 +1145,6 @@ class MainActivity : AppCompatActivity() {
                 selectedMode = Mode.EXPERIMENT
                 startCaptureCountdown()
             }
-            "select_experiment" -> {
-                selectedMode = Mode.EXPERIMENT
-                selectedExperimentType = experimentTypeFromValue(experimentType)
-                startCaptureCountdown()
-            }
             "qa" -> {
                 val question = json.optString("question").ifBlank { json.optString("transcript") }
                 if (question.isNotBlank()) submitTextQuestion(question)
@@ -1341,7 +1173,6 @@ class MainActivity : AppCompatActivity() {
     private fun ScreenState.allowsVoiceIntent(): Boolean {
         return this == ScreenState.QA_RECORDING ||
             this == ScreenState.LIVE_MINIMAL ||
-            this == ScreenState.EXPERIMENT_SETUP ||
             this == ScreenState.DEMO_SELECT ||
             this == ScreenState.DEMO_PLAYING ||
             this == ScreenState.VOICE_LISTENING
@@ -1353,7 +1184,7 @@ class MainActivity : AppCompatActivity() {
         activeTaskTitle = "演示指引"
         Thread {
             try {
-                val json = getJson("$baseUrl/api/glasses/demo/videos?experiment_type=${selectedExperimentTypeValue()}")
+                val json = getJson("$baseUrl/api/glasses/demo/videos")
                 val videosJson = json.optJSONArray("videos")
                 val videos = mutableListOf<DemoVideo>()
                 if (videosJson != null) {
@@ -1431,7 +1262,7 @@ class MainActivity : AppCompatActivity() {
         activeTaskTitle = "演示指引"
         Thread {
             try {
-                val json = getJson("$baseUrl/api/glasses/demo/videos?experiment_type=${selectedExperimentTypeValue()}")
+                val json = getJson("$baseUrl/api/glasses/demo/videos")
                 val videosJson = json.optJSONArray("videos")
                 val videos = mutableListOf<DemoVideo>()
                 if (videosJson != null) {
@@ -1827,7 +1658,7 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(this, Intent(this, RecordingService::class.java)
             .setAction(RecordingService.ACTION_START_STUDENT_SESSION))
         withRecordingService { service ->
-            val started = service.startStudentRecording(video, baseUrl, selectedExperimentTypeValue(), source)
+            val started = service.startStudentRecording(video, baseUrl, "unknown_experiment", source)
             if (!started) {
                 recordingRequested = false
                 recordingVideo = false
@@ -1908,7 +1739,7 @@ class MainActivity : AppCompatActivity() {
                     focusIndex = 0
                     voiceControlEnabled = voiceIntentSupported
                     if (voiceIntentSupported) {
-                        enterExperimentSetup()
+                        enterStudentReady()
                     } else {
                         screenState = ScreenState.CONSENT
                         renderScreen()
@@ -1965,7 +1796,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun startOverlayTestCountdown() {
         selectedMode = Mode.OVERLAY_TEST
-        selectedExperimentType = ExperimentType.OTHER
         startCaptureCountdown()
     }
 
@@ -2074,7 +1904,7 @@ class MainActivity : AppCompatActivity() {
         withRecordingService { service ->
             Thread {
                 try {
-                    service.saveStudentPhoto(file, baseUrl, selectedExperimentTypeValue())
+                    service.saveStudentPhoto(file, baseUrl, "unknown_experiment")
                     runOnUiThread { showResult("照片已保存在眼镜上，等待上传。", "拍照完成") }
                 } catch (error: Exception) {
                     runOnUiThread { showResult(error.message ?: "照片保存失败", "拍照失败") }
@@ -2102,12 +1932,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun submitImage(file: File) {
-        val token = startRunning("正在核对实验要求...", "")
+        val token = startRunning("正在分析实验照片...", "")
         Thread {
             try {
                 val fields = linkedMapOf(
                     "mode" to selectedModeValue(),
-                    "experiment_type" to selectedExperimentTypeValue(),
                     "provider" to "qiniu",
                     "model" to "google/gemini-3.5-flash",
                 )
@@ -2256,22 +2085,12 @@ class MainActivity : AppCompatActivity() {
         return when (selectedMode) {
             Mode.SAFETY -> "safety"
             Mode.OVERLAY_TEST -> "overlay_test"
-            else -> "experiment"
+            else -> "general_check"
         }
     }
 
     private fun shouldUseWorldOverlay(): Boolean {
-        return selectedMode == Mode.OVERLAY_TEST || selectedMode == Mode.EXPERIMENT
-    }
-
-    private fun selectedExperimentTypeValue(): String {
-        return when (selectedExperimentType) {
-            ExperimentType.DISTILLATION -> "distillation"
-            ExperimentType.PHOTOMETER -> "photometer"
-            ExperimentType.ELECTROLYSIS -> "electrolysis"
-            ExperimentType.TLC -> "tlc"
-            ExperimentType.OTHER -> "other"
-        }
+        return selectedMode == Mode.OVERLAY_TEST
     }
 
     private fun resolveUrl(path: String): String {
