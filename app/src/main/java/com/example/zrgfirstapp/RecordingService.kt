@@ -383,7 +383,7 @@ class RecordingService : LifecycleService() {
 
     private fun buildNotification(status: String): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.role_launcher_foreground)
             .setContentTitle("化学实验识别")
             .setContentText(status)
             .setOngoing(true)

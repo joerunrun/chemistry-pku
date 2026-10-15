@@ -28,7 +28,7 @@ android {
         versionCode = 1
         versionName = "1.0"
         manifestPlaceholders["applicationLabel"] = "@string/app_name"
-        buildConfigField("boolean", "STUDENT_TEST", "false")
+        buildConfigField("boolean", "STUDENT_USB", "false")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -40,10 +40,12 @@ android {
             versionCode = 2
             versionName = "2.0-student"
             buildConfigField("String", "APP_MODE", "\"student\"")
+            val usb = providers.gradleProperty("studentTest").isPresent || providers.gradleProperty("studentUsb").isPresent
+            buildConfigField("boolean", "STUDENT_USB", usb.toString())
+            if (usb) versionNameSuffix = "-usb"
             if (providers.gradleProperty("studentTest").isPresent) {
                 applicationIdSuffix = ".naturaltest"
                 versionNameSuffix = "-naturaltest"
-                buildConfigField("boolean", "STUDENT_TEST", "true")
                 manifestPlaceholders["applicationLabel"] = "学生自然语音测试"
             }
         }

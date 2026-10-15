@@ -1,5 +1,19 @@
 # 智能眼镜实验识别 App 调试指南
 
+## 教／学图标及 USB 学生版
+
+学生版使用蓝底“学”，教师版使用橙底“教”；图标按角色分别提供普通与自适应资源。
+
+编译 USB 学生版（包名仍为 `com.example.zrgfirstapp`，覆盖安装原学生版）：
+
+```powershell
+.\gradlew.bat -PstudentUsb :app:assembleStudentDebug
+```
+
+不带参数构建学生版时，继续读取 `glasses_config.xml` 的连接模式。`-PstudentTest` 仍可构建包名带 `.naturaltest` 的独立 USB 测试版。教师版的网络配置不受这些参数影响。
+
+本地 Docker 后端在 5081 时，连接眼镜后执行 `adb reverse tcp:5080 tcp:5081`；本机 Python 后端在 5080 时，改为 `adb reverse tcp:5080 tcp:5080`。
+
 这个项目是眼镜端 Android App。电脑端负责运行化学实验 pipeline 服务，眼镜端只负责拍照、上传图片、轮询结果并显示文字反馈。
 
 ## 1. 重启电脑后如何启动电脑服务

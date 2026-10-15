@@ -129,7 +129,7 @@ class MainActivity : AppCompatActivity() {
         get() = listOf(leftPanel, rightPanel)
 
     private val connectionMode: String by lazy {
-        if (BuildConfig.STUDENT_TEST) "usb" else getString(R.string.glasses_connection_mode).trim().lowercase()
+        if (BuildConfig.STUDENT_USB) "usb" else getString(R.string.glasses_connection_mode).trim().lowercase()
     }
     private val baseUrl: String by lazy {
         val urlRes = if (connectionMode == "network") {
