@@ -3436,8 +3436,8 @@ def create_glasses_job():
             return jsonify({"error": "Missing image file."}), 400
 
         mode = request.form.get("mode", "experiment").strip() or "experiment"
-        if mode not in {"experiment", "safety"}:
-            return jsonify({"error": "mode must be experiment or safety."}), 400
+        if mode not in {"experiment", "safety", "general_check"}:
+            return jsonify({"error": "mode must be experiment, safety or general_check."}), 400
 
         experiment_type = request.form.get("experiment_type", "distillation").strip() or "distillation"
         if mode == "experiment" and resolve_experiment_spec(experiment_type) is None:
@@ -3872,10 +3872,21 @@ def _run_glasses_job(
 ) -> None:
     _update_glasses_job(job_id, status="running", stage="upload", message="Image accepted.")
     try:
-        from pipeline.experiments.runner import run_experiment_check
-        exp_id = experiment_type if mode == "experiment" else "safety"
         _update_glasses_job(job_id, stage="processing", message="Running check.")
-        result = run_experiment_check(exp_id, image_bytes, provider=provider, model=model)
+        if mode == "general_check":
+            from pipeline.common.vlm_client import build_image_part_from_bytes, build_text_part, call_vlm, create_vlm
+
+            client = create_vlm(provider, model)
+            analysis, elapsed = call_vlm(client, [
+                {"role": "system", "content": "你是小北化学实验助手。根据学生现场照片检查可见的装置连接、操作和安全问题，不预设实验种类。只根据照片中看得到的证据判断，不臆测操作过程、试剂或实验目标。优先指出最需要纠正的问题，给出简短具体的改正建议；无法确定时说明限制。用适合眼镜播报的简短中文回答。"},
+                {"role": "user", "content": [build_text_part("请帮我检查并纠正照片中的实验。"), build_image_part_from_bytes(image_bytes, client)]},
+            ])
+            result = {"analysis_text": analysis, "mode": mode, "timings": {"vlm": elapsed}}
+        else:
+            from pipeline.experiments.runner import run_experiment_check
+
+            exp_id = experiment_type if mode == "experiment" else "safety"
+            result = run_experiment_check(exp_id, image_bytes, provider=provider, model=model)
         _attach_analysis_audio(job_id, result)
         _update_glasses_job(
             job_id,

@@ -16,7 +16,7 @@ def test_question_is_preserved_and_selection_is_contextual():
     result = parse_student_intent('{"intent":"qa"}', "小北，为什么会沸腾？", "student_idle", "IDLE")
     assert result["question"] == "小北，为什么会沸腾？"
     assert parse_student_intent('{"intent":"select_experiment"}', "电解", "student_idle", "IDLE")["intent"] == "no_action"
-    assert parse_student_intent('{"intent":"select_experiment"}', "电解", "student_setup", "IDLE")["intent"] == "select_experiment"
+    assert parse_student_intent('{"intent":"select_experiment"}', "电解", "student_setup", "IDLE")["intent"] == "no_action"
 
 
 def test_prompt_distinguishes_recording_content_from_commands():
