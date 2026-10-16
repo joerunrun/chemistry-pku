@@ -333,6 +333,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (AppUpdateActivity.onLaunch(this)) return
         if (BuildConfig.APP_MODE == "teacher") {
             startActivity(Intent(this, TeacherActivity::class.java))
             finish()
@@ -885,6 +886,13 @@ class MainActivity : AppCompatActivity() {
         private val velocityThreshold = 40
 
         override fun onDown(e: MotionEvent): Boolean = true
+
+        override fun onLongPress(e: MotionEvent) {
+            if (!recordingRequested && screenState in setOf(ScreenState.LIVE_MINIMAL, ScreenState.ACTION_MENU, ScreenState.RESULT)) {
+                startActivity(Intent(this@MainActivity, AppUpdateActivity::class.java))
+                finish()
+            }
+        }
 
         override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
             activateFocusedChoice()

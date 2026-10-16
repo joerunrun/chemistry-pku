@@ -156,6 +156,11 @@ class TeacherActivity : AppCompatActivity() {
 
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
+            override fun onLongPress(e: MotionEvent) {
+                if (teacherState == TeacherState.LISTENING && !teacherExitInProgress) {
+                    exitTeacherApp(forUpdate = true)
+                }
+            }
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 lastTempleTouchTapAt = android.os.SystemClock.uptimeMillis()
                 mainHandler.removeCallbacks(templeSingleTapRunnable)
@@ -270,7 +275,7 @@ class TeacherActivity : AppCompatActivity() {
         exitTeacherApp()
     }
 
-    private fun exitTeacherApp() {
+    private fun exitTeacherApp(forUpdate: Boolean = false) {
         if (teacherExitInProgress) return
         teacherExitInProgress = true
         mainHandler.removeCallbacks(awakeTimeoutRunnable)
@@ -303,7 +308,10 @@ class TeacherActivity : AppCompatActivity() {
             stopContinuousRecording()
             stopTeacherService()
         }
-        finishAndRemoveTask()
+        if (forUpdate) {
+            startActivity(Intent(this, AppUpdateActivity::class.java))
+            finish()
+        } else finishAndRemoveTask()
     }
 
     private fun stopTeacherService() {

@@ -25,8 +25,8 @@ android {
         applicationId = "com.example.zrgfirstapp"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "2.1"
         manifestPlaceholders["applicationLabel"] = "@string/app_name"
         buildConfigField("boolean", "STUDENT_USB", "false")
 
@@ -37,8 +37,7 @@ android {
     productFlavors {
         create("student") {
             dimension = "role"
-            versionCode = 2
-            versionName = "2.0-student"
+            versionName = "2.1-student"
             buildConfigField("String", "APP_MODE", "\"student\"")
             val usb = providers.gradleProperty("studentTest").isPresent || providers.gradleProperty("studentUsb").isPresent
             buildConfigField("boolean", "STUDENT_USB", usb.toString())

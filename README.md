@@ -177,3 +177,10 @@ D:\chemistry\chemistry_agent\android\glasses-app\app\src\main\res\values\glasses
 
 
 D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SETTINGS
+
+
+## 眼镜内更新（2.1，versionCode 3）
+
+教师、学生联网版启动时检查新版本；空闲时长按触摸板可手动检查。下载后核对摘要、包名和版本，再打开系统安装界面。首次 USB 安装包会尝试开启安装来源许可，系统仍可能要求确认安装。USB 开发包不自动检查正式版。
+
+首装文件夹及同名 ZIP 位于 `chemistry_agent/release/化小北教师版一键更新包`、`化小北学生版一键更新包`。完整解压后双击 `安装更新.bat`，两版均直接连接服务器。后续必须递增 versionCode 并沿用当前包名和签名密钥。
