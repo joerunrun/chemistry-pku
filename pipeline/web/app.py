@@ -74,8 +74,10 @@ from pipeline.web.teacher_binding_store import (
 )
 from pipeline.resource_paths import runtime_asset_path
 from pipeline.web.security import install_security
+from pipeline.web.app_updates import updates
 
 app = Flask(__name__)
+app.register_blueprint(updates)
 app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
 app.secret_key = os.getenv("CHEM_SESSION_SECRET") or os.urandom(32)
 install_security(app, lambda: _current_user(), lambda: _admin_is_unlocked(),

@@ -173,3 +173,10 @@ docker compose logs --tail=100 chemistry-api
 - `reference_images/`、`cv_detection2_data/`、`safety_check_data/`：分析资源
 
 备份时同时备份 `.env` 和 `runtime_assets/`。服务器只改代码或配置时，统一执行 `docker compose up -d --build`。
+
+
+## 眼镜 APK 更新发布
+
+2026-10-16 已上线教师、学生 2.1（versionCode=3）。`GET /api/glasses/updates/teacher` 或 `/student` 返回版本、包名、摘要和下载地址；APK 保存在 `runtime_assets/app_updates/<角色>/<角色>-<版本号>.apk`，对应 `latest.json`。只提供查询和下载，不开放上传接口。
+
+发布新版先上传保持原签名、递增版本号的 APK，核对摘要后替换 latest.json。字段为 package_name、version_code、version_name、sha256、size_bytes、notes，download_url 由接口生成。教师和学生分开发布，不触及身份库和录制资料。
