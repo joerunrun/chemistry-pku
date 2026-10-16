@@ -37,3 +37,19 @@ def test_generate_daily_course_normalizes_model_result(monkeypatch):
     assert result["course_content"] == "今天完成了实验并讨论了操作要点。"
     assert result["provider"] == "test"
 
+
+def test_full_daily_account_keeps_late_content_in_long_recordings(monkeypatch):
+    from pipeline.derived_analysis.daily_reports import generate_daily_reports
+    import json
+    prompts = []
+    class Client:
+        def chat(self, messages, **kwargs):
+            prompt = messages[0]["content"]
+            prompts.append(prompt)
+            return json.dumps({"summary": "short", "detail": "END retained" if "END" in prompt else "first part"}) if "输出JSON" in prompt else "daily overview"
+    monkeypatch.setattr("pipeline.derived_analysis.daily_reports.create_vlm", lambda *args: Client())
+    result = generate_daily_reports("2026-10-16", [{"transcript": "x" * 6500 + "END"}])
+    assert "END retained" in result["detailed_content"]
+    assert "first part" in result["detailed_content"]
+    assert result["course_content"] == "daily overview"
+

@@ -392,6 +392,9 @@ def _write_workspace_report_markdown(path: Path, report: dict[str, Any]) -> None
                 str(issue.get("guidance", "")).strip() or "暂无建议。",
                 "",
             ])
+    elif kind == "daily":
+        lines.extend(["## 当天概括", "", report.get("course_content", ""), "",
+                      "## 完整整理", "", report.get("detailed_content", ""), ""])
     else:
         highlights = report.get("highlights") if isinstance(report.get("highlights"), list) else []
         if highlights:
@@ -753,6 +756,13 @@ def _run_workspace_report_job(job_path: Path) -> None:
                 "model": result["model"],
                 "warnings": ([] if result["common_issues"] else ["未发现至少出现在两条记录中的重复问题。"]),
             })
+        elif job["kind"] == "daily":
+            from pipeline.derived_analysis.daily_reports import generate_daily_reports
+
+            report.update(generate_daily_reports(
+                job["filters"]["start_date"], job["transcripts"],
+                provider=job.get("provider"), model=job.get("model"),
+            ))
         else:
             result = generate_daily_course(
                 f"{job['filters']['start_date']} 至 {job['filters']['end_date']}",
@@ -905,8 +915,11 @@ def _auto_claim_teacher_upload(metadata: dict[str, Any], item_type: str) -> dict
     created_at = _candidate_datetime(
         metadata.get("created_at"), fallback=datetime.now(timezone.utc)
     )
+    capture_time = metadata.get("started_at") or metadata.get("captured_at")
+    if not capture_time:
+        return None
     captured_at = _candidate_datetime(
-        metadata.get("started_at") or metadata.get("captured_at"),
+        capture_time,
         fallback=created_at,
     )
     binding = teacher_binding_for_glass_at(glass_number, captured_at.isoformat())
@@ -996,56 +1009,6 @@ def _claim_candidate_items(
             })
     candidates.sort(key=lambda item: item.get("started_at", ""))
     return candidates
-
-
-def _backfill_unclaimed_teacher_media(identity_id: str, glass_number: str) -> dict[str, Any]:
-    """Assign existing, unclaimed teacher media for a glass to its teacher."""
-    candidates = _claim_candidate_items(
-        glass_number,
-        datetime(1970, 1, 1, tzinfo=timezone.utc),
-        datetime.max.replace(tzinfo=timezone.utc),
-        source_role="teacher",
-    )
-    claimed = claimed_item_keys()
-    unclaimed = [
-        item for item in candidates
-        if (item["item_type"], "teacher", item["item_id"]) not in claimed
-    ]
-    claim_ids: list[str] = []
-    item_count = 0
-    for offset in range(0, len(unclaimed), 100):
-        batch = unclaimed[offset:offset + 100]
-        try:
-            claim = create_claim(
-                identity_id=identity_id,
-                role="teacher",
-                glass_number=glass_number,
-                started_at=min(item["started_at"] for item in batch),
-                ended_at=max(item["ended_at"] for item in batch),
-                items=batch,
-            )
-        except ClaimConflict:
-            current = claimed_item_keys()
-            batch = [
-                item for item in batch
-                if (item["item_type"], "teacher", item["item_id"]) not in current
-            ]
-            if not batch:
-                continue
-            try:
-                claim = create_claim(
-                    identity_id=identity_id,
-                    role="teacher",
-                    glass_number=glass_number,
-                    started_at=min(item["started_at"] for item in batch),
-                    ended_at=max(item["ended_at"] for item in batch),
-                    items=batch,
-                )
-            except ClaimConflict:
-                continue
-        claim_ids.append(str(claim["claim_id"]))
-        item_count += len(claim["items"])
-    return {"item_count": item_count, "claim_ids": claim_ids}
 
 
 def _claim_period(value: datetime) -> tuple[str, str]:
@@ -1456,11 +1419,12 @@ def workspace_admin_set_teacher_glass(identity_id: str):
     if not glass or not glass.get("device_id"):
         return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
     try:
-        binding = set_teacher_binding(identity_id, glass_number)
+        binding = set_teacher_binding(identity_id, glass_number, payload.get("weekday"))
     except TeacherBindingConflict:
-        return jsonify({"error": "该眼镜已绑定给其他教师，请先解除原绑定"}), 409
-    backfill = _backfill_unclaimed_teacher_media(identity_id, glass_number)
-    return jsonify({"binding": binding, "backfill": backfill})
+        return jsonify({"error": "该眼镜在所选星期已分配给其他助教"}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"binding": binding})
 
 
 @app.get("/admin/test-identities")
@@ -1793,18 +1757,18 @@ def _teacher_user_required() -> tuple[dict[str, Any] | None, Any | None]:
 
 def _teacher_binding_payload(identity_id: str) -> dict[str, Any]:
     binding = active_teacher_binding(identity_id=identity_id)
-    occupied = {
-        str(item["glass_number"]): str(item["identity_id"])
-        for item in list_teacher_bindings(active_only=True)
-    }
+    occupied = list_teacher_bindings(active_only=True)
     glasses = []
     for glass in list_glasses():
         number = str(glass["glass_number"])
-        owner = occupied.get(number)
+        blocked = [item["weekday"] for item in occupied
+                   if item["glass_number"] == number and item["identity_id"] != identity_id
+                   and item.get("weekday") is not None]
         glasses.append({
             "glass_number": number,
             "calibrated": bool(glass.get("device_id")),
-            "available": owner in {None, identity_id},
+            "available": len(blocked) < 7,
+            "occupied_weekdays": blocked,
             "current": bool(binding and binding.get("glass_number") == number),
         })
     history = [
@@ -1820,9 +1784,6 @@ def workspace_teacher_binding():
     if error:
         return error
     identity_id = str(user["identity_id"])
-    binding = active_teacher_binding(identity_id=identity_id)
-    if binding:
-        _backfill_unclaimed_teacher_media(identity_id, str(binding["glass_number"]))
     return jsonify(_teacher_binding_payload(identity_id))
 
 
@@ -1841,13 +1802,12 @@ def workspace_teacher_set_binding():
         return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
     try:
         identity_id = str(user["identity_id"])
-        set_teacher_binding(identity_id, glass_number)
+        set_teacher_binding(identity_id, glass_number, payload.get("weekday"))
     except TeacherBindingConflict:
-        return jsonify({"error": "该眼镜已绑定给其他教师，请选择其他眼镜"}), 409
-    backfill = _backfill_unclaimed_teacher_media(identity_id, glass_number)
-    payload = _teacher_binding_payload(identity_id)
-    payload["backfill"] = backfill
-    return jsonify(payload)
+        return jsonify({"error": "该眼镜在所选星期已分配给其他助教"}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(_teacher_binding_payload(identity_id))
 
 
 @app.delete("/api/workspace/teacher/binding")
@@ -1931,9 +1891,6 @@ def _teacher_report_sources(
         claim = claimed.get(record_id)
         if claim is None:
             continue
-        if not any(Path(str(item.get("filename", ""))).suffix.lower() in _AUDIO_RECORD_SUFFIXES
-                   for item in record.get("files", [])):
-            continue
         record_experiment = str(record.get("experiment_type", "")).strip()
         if experiment_type and record_experiment != experiment_type:
             continue
@@ -1959,13 +1916,39 @@ def _teacher_report_sources(
             "eligible": status == "succeeded",
             "transcript": transcript,
         })
-    sources.sort(key=lambda item: item.get("started_at") or item.get("created_at") or "")
+    sources.sort(key=lambda item: _candidate_datetime(item.get("started_at") or item.get("created_at"), fallback=range_start))
     return {
         "start_date": start_text,
         "end_date": end_text,
         "experiment_type": experiment_type,
         "glass_number": glass_number,
     }, sources
+
+
+@app.get("/api/workspace/teacher/report-calendar")
+def workspace_teacher_report_calendar():
+    user, error = _teacher_user_required()
+    if error:
+        return error
+    month = request.args.get("month", datetime.now(_BEIJING_TZ).strftime("%Y-%m"))
+    try:
+        start = datetime.strptime(month, "%Y-%m")
+        end = datetime(start.year + (start.month == 12), start.month % 12 + 1, 1) - timedelta(days=1)
+        _, sources = _teacher_report_sources(str(user["identity_id"]), start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    days = {}
+    for item in sources:
+        day = _candidate_datetime(item["started_at"] or item["created_at"], fallback=start.replace(tzinfo=_BEIJING_TZ)).astimezone(_BEIJING_TZ).strftime("%Y-%m-%d")
+        entry = days.setdefault(day, {"date": day, "record_count": 0, "pending_count": 0})
+        entry["record_count" if item["eligible"] else "pending_count"] += 1
+    for path in _scoped_course_root().glob("daily_*.json"):
+        report = _read_common_issue_json(path) or {}
+        day = report.get("filters", {}).get("start_date", "")
+        if report.get("owner_identity_id") == user["identity_id"] and day.startswith(month + "-"):
+            entry = days.setdefault(day, {"date": day, "record_count": 0, "pending_count": 0})
+            entry.update({"report_id": report["report_id"], "status": report["status"]})
+    return jsonify({"month": month, "days": [days[key] for key in sorted(days)]})
 
 
 @app.get("/api/workspace/teacher/report-sources")
@@ -1994,8 +1977,11 @@ def workspace_teacher_create_report():
         return error
     payload = request.get_json(silent=True) or {}
     kind = str(payload.get("kind", "course")).strip()
-    if kind not in {"course", "common_issues"}:
-        return jsonify({"error": "kind 必须是 course 或 common_issues"}), 400
+    if kind not in {"course", "common_issues", "daily"}:
+        return jsonify({"error": "不支持的报告类型"}), 400
+    if kind == "daily":
+        payload = {"start_date": payload.get("date"), "end_date": payload.get("date"),
+                   "refresh": payload.get("refresh", False)}
     experiment_type = str(payload.get("experiment_type", "")).strip()
     if kind == "common_issues" and not experiment_type:
         return jsonify({"error": "生成共性问题时必须选择实验"}), 400
@@ -2013,6 +1999,12 @@ def workspace_teacher_create_report():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    daily_id = f"daily_{filters['start_date'].replace('-', '')}_{uuid.uuid5(uuid.NAMESPACE_URL, str(user['identity_id'])).hex[:16]}"
+    if kind == "daily":
+        previous = _read_common_issue_json(_workspace_report_path(daily_id, kind))
+        if previous and (previous.get("status") in {"queued", "running"} or
+                         (previous.get("status") == "succeeded" and not payload.get("refresh"))):
+            return jsonify({"report": previous})
     requested_ids = payload.get("record_ids")
     if requested_ids is not None and not isinstance(requested_ids, list):
         return jsonify({"error": "record_ids 必须是数组"}), 400
@@ -2026,7 +2018,7 @@ def workspace_teacher_create_report():
     else:
         selected = sources
     unavailable = [item["record_id"] for item in selected if not item["eligible"]]
-    if unavailable:
+    if unavailable and kind != "daily":
         return jsonify({"error": "所选记录中有尚未完成转写的内容", "record_ids": unavailable}), 400
     selected = [item for item in selected if item["eligible"]]
 
@@ -2034,6 +2026,8 @@ def workspace_teacher_create_report():
     now = _common_issue_now()
     prefix = "issues" if kind == "common_issues" else "course"
     report_id = f"range_{filters['start_date'].replace('-', '')}_{filters['end_date'].replace('-', '')}_{prefix}_{uuid.uuid4().hex[:8]}"
+    if kind == "daily":
+        report_id = daily_id
     report_path = _workspace_report_path(report_id, kind)
     if report_path is None:
         return jsonify({"error": "无法创建报告 ID"}), 500
@@ -2051,7 +2045,7 @@ def workspace_teacher_create_report():
         "course_content": "",
         "highlights": [],
         "common_issues": [],
-        "warnings": [],
+        "warnings": [f"另有 {len(unavailable)} 条记录尚无可用转写，本次未纳入。"] if unavailable else [],
         "status": "queued",
         "generated_at": now,
         "updated_at": now,
@@ -2074,6 +2068,7 @@ def workspace_teacher_create_report():
         "device_id": item["device_id"],
         "experiment_type": item["experiment_type"],
         "transcript": item["transcript"],
+        "started_at": item["started_at"],
     } for item in selected]
     provider = os.getenv("MEDIA_ANALYSIS_PROVIDER", DEFAULT_VLM_PROVIDER).strip() or DEFAULT_VLM_PROVIDER
     model = os.getenv("MEDIA_ANALYSIS_MODEL", DEFAULT_VLM_MODEL).strip() or DEFAULT_VLM_MODEL
@@ -2153,6 +2148,15 @@ def workspace_teacher_report_download(report_id: str):
     report = _read_common_issue_json(path) if path else None
     if not report or not _workspace_report_visible(report, str(user["identity_id"])):
         return jsonify({"error": "报告不存在"}), 404
+    if report.get("kind") == "daily":
+        part = request.args.get("part", "summary")
+        if part not in {"summary", "detail"} or report.get("status") != "succeeded":
+            return jsonify({"error": "报告尚未完成或下载类型无效"}), 400
+        title, key = ("当天概括", "course_content") if part == "summary" else ("完整整理", "detailed_content")
+        return Response(f"# {report.get('title', '')} · {title}\n\n{report.get(key, '')}\n",
+                        mimetype="text/markdown", headers={
+                            "Content-Disposition": f'attachment; filename="{report_id}_{part}.md"',
+                        })
     if report.get("legacy") or (not report.get("owner_identity_id") and report.get("date")):
         markdown_path = _daily_course_markdown_path(report_id)
     else:

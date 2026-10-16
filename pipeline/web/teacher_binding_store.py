@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 from typing import Any
+from zoneinfo import ZoneInfo
 import uuid
 
 from pipeline.resource_paths import runtime_asset_path
@@ -53,10 +54,16 @@ def init_teacher_binding_store() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS uq_teacher_active_binding
             ON teacher_glass_bindings(identity_id) WHERE ended_at IS NULL;
 
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_glass_active_teacher
-            ON teacher_glass_bindings(glass_number) WHERE ended_at IS NULL;
             """
         )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(teacher_glass_bindings)")}
+        if "weekday" not in columns:
+            connection.execute("ALTER TABLE teacher_glass_bindings ADD COLUMN weekday INTEGER")
+        connection.executescript("""
+            DROP INDEX IF EXISTS uq_glass_active_teacher;
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_glass_weekday_teacher
+            ON teacher_glass_bindings(glass_number, weekday) WHERE ended_at IS NULL;
+        """)
         connection.commit()
 
 
@@ -95,21 +102,23 @@ def list_teacher_bindings(*, active_only: bool = False) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def set_teacher_binding(identity_id: str, glass_number: str) -> dict[str, Any]:
+def set_teacher_binding(identity_id: str, glass_number: str, weekday: int) -> dict[str, Any]:
     identity_id = identity_id.strip()
     glass_number = glass_number.strip()
     if not identity_id:
         raise ValueError("identity_id 不能为空")
     if glass_number not in GLASS_NUMBERS:
         raise ValueError("眼镜编号必须是 01 到 12")
+    if type(weekday) is not int or weekday not in range(7):
+        raise ValueError("请选择固定使用的星期（0为星期一，6为星期日）")
 
     init_teacher_binding_store()
     now = _now()
     with closing(_connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         target = connection.execute(
-            "SELECT * FROM teacher_glass_bindings WHERE glass_number = ? AND ended_at IS NULL",
-            (glass_number,),
+            "SELECT * FROM teacher_glass_bindings WHERE glass_number = ? AND weekday = ? AND ended_at IS NULL",
+            (glass_number, weekday),
         ).fetchone()
         if target is not None and target["identity_id"] != identity_id:
             connection.rollback()
@@ -119,7 +128,7 @@ def set_teacher_binding(identity_id: str, glass_number: str) -> dict[str, Any]:
             "SELECT * FROM teacher_glass_bindings WHERE identity_id = ? AND ended_at IS NULL",
             (identity_id,),
         ).fetchone()
-        if current is not None and current["glass_number"] == glass_number:
+        if current is not None and current["glass_number"] == glass_number and current["weekday"] == weekday:
             connection.commit()
             return dict(current)
         if current is not None:
@@ -131,8 +140,8 @@ def set_teacher_binding(identity_id: str, glass_number: str) -> dict[str, Any]:
         binding_id = f"teacher_glass_{uuid.uuid4().hex}"
         connection.execute(
             "INSERT INTO teacher_glass_bindings(binding_id, identity_id, glass_number, "
-            "started_at, ended_at, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
-            (binding_id, identity_id, glass_number, now, now),
+            "started_at, ended_at, created_at, weekday) VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            (binding_id, identity_id, glass_number, now, now, weekday),
         )
         connection.commit()
     return active_teacher_binding(identity_id=identity_id) or {}
@@ -164,12 +173,17 @@ def end_teacher_binding(identity_id: str) -> dict[str, Any] | None:
 def teacher_binding_for_glass_at(glass_number: str, when: str) -> dict[str, Any] | None:
     """Return the teacher assigned at an upload's actual capture/start time."""
     init_teacher_binding_store()
+    captured = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    weekday = captured.astimezone(ZoneInfo("Asia/Shanghai")).weekday()
+    when = captured.astimezone(timezone.utc).isoformat()
     with closing(_connect()) as connection:
         row = connection.execute(
             "SELECT * FROM teacher_glass_bindings "
-            "WHERE glass_number = ? AND started_at <= ? "
+            "WHERE glass_number = ? AND weekday = ? AND started_at <= ? "
             "AND (ended_at IS NULL OR ended_at > ?) "
             "ORDER BY started_at DESC LIMIT 1",
-            (glass_number.strip(), when, when),
+            (glass_number.strip(), weekday, when, when),
         ).fetchone()
     return _binding(row)

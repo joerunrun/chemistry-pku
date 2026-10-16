@@ -69,49 +69,100 @@
     try { const data = await fetchJson('/api/glasses/health'); const options = (data.experiments || []).map(item => `<option value="${esc(item.value)}">${esc(item.label || item.value)}</option>`).join(''); if (byId('reportExperiment')) byId('reportExperiment').innerHTML = `<option value="">全部实验</option>${options}`; if (byId('videoExperiment')) byId('videoExperiment').innerHTML = options; if (byId('adminMediaExperiment')) byId('adminMediaExperiment').innerHTML = `<option value="">全部实验</option>${options}`; if (byId('teacherMediaExperiment')) byId('teacherMediaExperiment').innerHTML = `<option value="">全部实验</option>${options}`; } catch (error) { setStatus('reportStatus', error.message, true); }
   }
 
-  // Teacher scoped reports.
+  // One date produces both the overview and the full cleaned account.
   if (cfg.role === 'teacher') {
-    let reportSources = [];
-    const reportQuery = () => new URLSearchParams({ start_date: byId('reportStartDate').value, end_date: byId('reportEndDate').value, experiment_type: byId('reportExperiment').value, glass_number: byId('reportGlass').value });
-    function selectedReportIds() { return [...document.querySelectorAll('[data-report-source]:checked')].map(item => item.value); }
-    function renderSources() { byId('reportSources').innerHTML = reportSources.length ? reportSources.map(item => `<label class="source-row ${item.eligible ? '' : 'unavailable'}"><input type="checkbox" data-report-source value="${esc(item.record_id)}" ${item.eligible ? 'checked' : 'disabled'}><span><b>${esc(item.created_at || item.started_at || item.record_id)}</b><br>${esc(item.experiment_type || '未标记实验')} · ${esc(item.glass_number)}号眼镜</span><span class="badge">${item.eligible ? '可用于报告' : item.status === 'pending' ? '转写中' : item.status === 'failed' ? '转写失败' : '没有转写'}</span></label>`).join('') : '<span class="muted">当前范围没有已认领的教师记录。</span>'; byId('generateReport').disabled = !reportSources.some(item => item.eligible); }
-    async function loadReportSources() { setStatus('reportStatus', '正在查找记录……'); try { const data = await fetchJson(`/api/workspace/teacher/report-sources?${reportQuery()}`); reportSources = data.sources || []; renderSources(); setStatus('reportStatus', `找到 ${reportSources.length} 条记录，其中 ${reportSources.filter(item => item.eligible).length} 条可用于报告。`); } catch (error) { reportSources = []; renderSources(); setStatus('reportStatus', error.message, true); } }
-    function reportMarkup(report) { const kind = report.kind === 'common_issues' ? '共性问题' : '课程整理'; const scope = report.filters ? `${report.filters.start_date} 至 ${report.filters.end_date}` : report.date || '旧版单日报告'; const body = report.kind === 'common_issues' ? (report.common_issues || []).map((item, i) => `${i + 1}. ${item.problem}\n建议：${item.guidance}`).join('\n\n') : report.course_content || ''; return `<article class="item"><div class="item-head"><b>${esc(report.title || kind)}</b><span class="badge">${esc(report.status || '')}${report.legacy ? ' · 旧版' : ''}</span></div><div>${esc(scope)} · ${Number(report.transcript_count || 0)} 条转写</div>${body ? `<details><summary>查看内容</summary><div class="report-body">${esc(body)}</div></details>` : ''}<div class="item-links">${report.status === 'succeeded' ? `<a class="button secondary" href="/api/workspace/teacher/reports/${encodeURIComponent(report.report_id)}/download">下载 Markdown</a>` : ''}</div>${(report.warnings || []).length ? `<div class="status error">${(report.warnings || []).map(esc).join('<br>')}</div>` : ''}</article>`; }
-    async function loadReports() { try { const data = await fetchJson('/api/workspace/teacher/reports'); byId('reportList').innerHTML = (data.reports || []).length ? data.reports.map(reportMarkup).join('') : '<span class="muted">还没有生成报告。</span>'; } catch (error) { setStatus('reportStatus', error.message, true); } }
-    async function waitReport(id) { for (let i = 0; i < 90; i += 1) { const data = await fetchJson(`/api/workspace/teacher/reports/${encodeURIComponent(id)}`); if (!['queued', 'running'].includes(data.report.status)) return data.report; await new Promise(resolve => setTimeout(resolve, 1000)); } throw new Error('报告仍在后台处理中，请稍后点击刷新。'); }
-    byId('loadReportSources').onclick = loadReportSources;
-    byId('refreshReports').onclick = loadReports;
-    byId('reportKind').onchange = () => { if (byId('reportKind').value === 'common_issues' && !byId('reportExperiment').value) setStatus('reportStatus', '共性问题报告需要选择一个实验。'); };
-    byId('generateReport').onclick = async () => { const ids = selectedReportIds(); if (!ids.length) return setStatus('reportStatus', '请至少选择一条可用记录。', true); const payload = { kind: byId('reportKind').value, start_date: byId('reportStartDate').value, end_date: byId('reportEndDate').value, experiment_type: byId('reportExperiment').value, glass_number: byId('reportGlass').value, record_ids: ids }; setStatus('reportStatus', '正在提交报告任务……'); byId('generateReport').disabled = true; try { const data = await fetchJson('/api/workspace/teacher/reports', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); const finalReport = ['queued', 'running'].includes(data.report.status) ? await waitReport(data.report.report_id) : data.report; await loadReports(); const failed = ['failed', 'insufficient_data'].includes(finalReport.status); setStatus('reportStatus', finalReport.status === 'succeeded' ? '报告生成完成。' : finalReport.status === 'insufficient_data' ? '可用记录不足，请调整范围。' : (finalReport.warnings || []).join('；') || '报告生成失败。', failed); } catch (error) { setStatus('reportStatus', error.message, true); } finally { byId('generateReport').disabled = false; } };
-    const today = new Date(); byId('reportEndDate').value = localDate(today); byId('reportStartDate').value = localDate(new Date(today.getTime() - 6 * 86400000)); loadReports();
+    const today = () => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+    let month = today().slice(0, 7), days = [], activeDate = '', busy = false;
+    function renderCalendar() {
+      const [year, number] = month.split('-').map(Number);
+      const leading = (new Date(year, number - 1, 1).getDay() + 6) % 7;
+      byId('reportMonth').textContent = `${year}年${number}月`;
+      byId('reportCalendar').innerHTML = Array.from({ length: 42 }, (_, i) => {
+        const date = new Date(year, number - 1, i - leading + 1), key = localDate(date);
+        const item = days.find(day => day.date === key);
+        const available = item && (item.record_count > 0 || item.status === 'succeeded');
+        const status = item?.status === 'succeeded' ? '已生成' : ['queued', 'running'].includes(item?.status) ? '生成中' : item?.record_count ? `${item.record_count}条可用` : item?.pending_count ? '等待转写' : '';
+        return `<button class="calendar-cell ${available ? 'available' : ''} ${date.getMonth() === number - 1 ? '' : 'other-month'} ${key === today() ? 'today' : ''}" data-report-date="${key}" ${!available || busy ? 'disabled' : ''}><b>${date.getDate()}</b><small>${status}</small></button>`;
+      }).join('');
+    }
+    async function loadCalendar() {
+      try { const data = await fetchJson(`/api/workspace/teacher/report-calendar?month=${month}`); days = data.days || []; renderCalendar(); }
+      catch (error) { setStatus('reportStatus', error.message, true); }
+    }
+    function showReport(report) {
+      if (report.status !== 'succeeded') return;
+      const link = `/api/workspace/teacher/reports/${encodeURIComponent(report.report_id)}/download`;
+      byId('reportResult').innerHTML = `<article class="item"><div class="section-head"><h3>${esc(report.title)}</h3><button id="updateDailyReport" class="secondary">更新总结</button></div><h3>当天概括</h3><div class="report-body">${esc(report.course_content)}</div><p><a class="button secondary" href="${link}?part=summary">下载概括</a></p><details><summary>查看完整整理</summary><div class="report-body">${esc(report.detailed_content)}</div><p><a class="button secondary" href="${link}?part=detail">下载完整整理</a></p></details>${(report.warnings || []).map(item => `<p class="muted">${esc(item)}</p>`).join('')}</article>`;
+      byId('updateDailyReport').onclick = () => openDate(activeDate, true);
+    }
+    async function openDate(date, refresh = false) {
+      if (busy) return;
+      busy = true; activeDate = date; renderCalendar(); byId('reportResult').innerHTML = '';
+      setStatus('reportStatus', `${date}：正在整理当天概括和完整记录……`);
+      try {
+        const data = await fetchJson('/api/workspace/teacher/reports', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind: 'daily', date, refresh }) });
+        let report = data.report;
+        for (let i = 0; i < 300 && ['queued', 'running'].includes(report.status); i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          report = (await fetchJson(`/api/workspace/teacher/reports/${encodeURIComponent(report.report_id)}`)).report;
+        }
+        showReport(report);
+        setStatus('reportStatus', report.status === 'succeeded' ? `${date}：两份内容已生成。` : ['queued', 'running'].includes(report.status) ? '仍在后台整理，稍后点击日期查看。' : (report.warnings || ['生成失败，请重试。']).join('；'), report.status === 'failed');
+      } catch (error) { setStatus('reportStatus', error.message, true); }
+      finally { busy = false; await loadCalendar(); }
+    }
+    byId('reportCalendar').onclick = event => { const button = event.target.closest('[data-report-date]'); if (button && !button.disabled) openDate(button.dataset.reportDate); };
+    function moveMonth(delta) { const [year, number] = month.split('-').map(Number); month = localDate(new Date(year, number - 1 + delta, 1)).slice(0, 7); loadCalendar(); }
+    byId('reportPrev').onclick = () => moveMonth(-1);
+    byId('reportNext').onclick = () => moveMonth(1);
+    byId('reportToday').onclick = () => { month = today().slice(0, 7); loadCalendar(); };
+    tabLoaders['teacher-reports'] = loadCalendar;
+    loadCalendar();
+    fetchJson('/api/workspace/teacher/reports').then(data => {
+      byId('reportList').innerHTML = (data.reports || []).filter(report => report.kind !== 'daily').map(report => `<article class="item"><b>${esc(report.title)}</b><div class="report-body">${esc(report.course_content || (report.common_issues || []).map(item => `${item.problem}：${item.guidance}`).join('\n'))}</div>${report.status === 'succeeded' ? `<a href="/api/workspace/teacher/reports/${encodeURIComponent(report.report_id)}/download">下载以前的报告</a>` : ''}</article>`).join('') || '还没有以前的报告。';
+    }).catch(error => setStatus('reportStatus', error.message, true));
   }
 
+  const weekdays = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'];
+  const weekdayName = value => weekdays[value] || '待补选星期';
+  const weekdayOptions = (selected, blocked = []) => '<option value="">请选择星期</option>' + weekdays.map((name, i) => `<option value="${i}" ${selected !== null && selected !== undefined && selected !== '' && Number(selected) === i ? 'selected' : ''} ${blocked.includes(i) ? 'disabled' : ''}>${name}${blocked.includes(i) ? '（已占用）' : ''}</option>`).join('');
+  let teacherGlasses = [];
+  function updateTeacherWeekdays() {
+    const select = byId('teacherBindingWeekday'), glass = teacherGlasses.find(item => item.glass_number === byId('teacherBindingGlass').value);
+    select.innerHTML = weekdayOptions(select.value, glass?.occupied_weekdays || []);
+  }
   let teacherBinding = null;
   async function loadTeacherBinding() {
     const data = await fetchJson('/api/workspace/teacher/binding');
     teacherBinding = data.binding || null;
+    teacherGlasses = data.glasses || [];
     const select = byId('teacherBindingGlass');
     if (select) {
       select.innerHTML = '<option value="">请选择眼镜</option>' + (data.glasses || []).map(glass => {
         const note = !glass.calibrated ? '（待校准）' : !glass.available ? '（已被占用）' : '';
         return `<option value="${esc(glass.glass_number)}" ${glass.current ? 'selected' : ''} ${!glass.calibrated || !glass.available ? 'disabled' : ''}>${esc(glass.glass_number)}号${note}</option>`;
       }).join('');
-      byId('teacherBindingBadge').textContent = teacherBinding ? `${teacherBinding.glass_number}号眼镜` : '尚未选择';
-      byId('teacherBindingHistory').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article class="item"><b>${esc(item.glass_number)}号眼镜</b><div>${esc(item.started_at)} 至 ${esc(item.ended_at || '当前')}</div></article>`).join('') : '<span class="muted">还没有使用历史。</span>';
+      byId('teacherBindingBadge').textContent = teacherBinding ? `${teacherBinding.glass_number}号 · ${weekdayName(teacherBinding.weekday)}` : '尚未选择';
+      byId('teacherBindingWeekday').innerHTML = weekdayOptions(teacherBinding?.weekday);
+      updateTeacherWeekdays();
+      byId('teacherBindingHistory').innerHTML = (data.history || []).length ? (data.history || []).map(item => `<article class="item"><b>${esc(item.glass_number)}号 · ${weekdayName(item.weekday)}</b><div>${esc(item.started_at)} 至 ${esc(item.ended_at || '当前')}</div></article>`).join('') : '<span class="muted">还没有使用历史。</span>';
     }
     return data;
   }
 
   if (cfg.role === 'teacher') {
+    byId('teacherBindingGlass').onchange = updateTeacherWeekdays;
     byId('saveTeacherBinding').onclick = async () => {
       const glassNumber = byId('teacherBindingGlass').value;
       if (!glassNumber) return setStatus('teacherBindingStatus', '请先选择一副已经校准的眼镜。', true);
-      const wasUnbound = !teacherBinding;
+      const weekday = byId('teacherBindingWeekday').value;
+      if (weekday === '') return setStatus('teacherBindingStatus', '请选择固定使用的星期。', true);
+      const wasUnbound = !teacherBinding || teacherBinding.weekday === null;
       try {
-        const data = await fetchJson('/api/workspace/teacher/binding', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glassNumber }) });
+        const data = await fetchJson('/api/workspace/teacher/binding', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glassNumber, weekday: Number(weekday) }) });
         teacherBinding = data.binding;
         await loadTeacherBinding();
-        setStatus('teacherBindingStatus', `${glassNumber}号眼镜已经设为当前教师眼镜。`);
+        setStatus('teacherBindingStatus', `${glassNumber}号眼镜 · ${weekdayName(Number(weekday))} 已保存。`);
         if (wasUnbound) showTab('teacher-media');
       } catch (error) { setStatus('teacherBindingStatus', error.message, true); }
     };
@@ -178,7 +229,7 @@
     };
     byId('teacherMediaPrev').onclick = () => { if (teacherMediaPage > 1) loadTeacherMedia(teacherMediaPage - 1); };
     byId('teacherMediaNext').onclick = () => { if (teacherMediaPage < teacherMediaPages) loadTeacherMedia(teacherMediaPage + 1); };
-    loadTeacherBinding().then(() => { if (!requestedTab) showTab(teacherBinding ? 'teacher-media' : 'claims'); }).catch(error => setStatus('teacherBindingStatus', error.message, true));
+    loadTeacherBinding().then(() => { if (!requestedTab) showTab(teacherBinding && teacherBinding.weekday !== null ? 'teacher-media' : 'claims'); }).catch(error => setStatus('teacherBindingStatus', error.message, true));
     fetchJson('/api/auth/profile').then(data => { byId('profileData').textContent = data.profile ? JSON.stringify(data.profile, null, 2) : '尚未保存门户原始字段。'; }).catch(error => { byId('profileData').textContent = error.message; });
     tabLoaders['student-data'] = async () => { try { const data = await fetchJson('/api/workspace/data'); byId('studentData').innerHTML = (data.student_items || []).length ? data.student_items.map(dataItem).join('') : '<span class="muted">还没有学生数据。</span>'; } catch (error) { byId('studentData').textContent = error.message; } };
   }
@@ -196,16 +247,10 @@
     try {
       const data = await fetchJson('/admin/api/auth/users');
       const bindings = data.teacher_bindings || [];
-      const bindingByTeacher = Object.fromEntries(bindings.map(item => [item.identity_id, item.glass_number]));
-      const teacherByGlass = Object.fromEntries(bindings.map(item => [item.glass_number, item.identity_id]));
-      const glassOptions = user => cfg.glasses.map(glass => {
-        const occupiedBy = teacherByGlass[glass.glass_number];
-        const disabled = !glass.device_id || (occupiedBy && occupiedBy !== user.identity_id);
-        const note = !glass.device_id ? '（待校准）' : occupiedBy && occupiedBy !== user.identity_id ? '（已占用）' : '';
-        return `<option value="${esc(glass.glass_number)}" ${bindingByTeacher[user.identity_id] === glass.glass_number ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${esc(glass.glass_number)}号${note}</option>`;
-      }).join('');
+      const bindingByTeacher = Object.fromEntries(bindings.map(item => [item.identity_id, item]));
+      const glassOptions = user => cfg.glasses.map(glass => `<option value="${esc(glass.glass_number)}" ${bindingByTeacher[user.identity_id]?.glass_number === glass.glass_number ? 'selected' : ''} ${!glass.device_id ? 'disabled' : ''}>${esc(glass.glass_number)}号${!glass.device_id ? '（待校准）' : ''}</option>`).join('');
       byId('adminUserStatus').textContent = `共 ${(data.users || []).length} 个身份。`;
-      byId('adminUsers').innerHTML = `<table><thead><tr><th>身份</th><th>门户判断</th><th>当前角色</th><th>教师眼镜</th><th>来源</th><th>原始字段</th></tr></thead><tbody>${(data.users || []).map(user => `<tr><td>${esc(user.identity_id.startsWith('demo-') ? user.identity_id : `${user.identity_id.slice(0, 2)}***${user.identity_id.slice(-2)}`)}</td><td>${user.portal_role === 'student' ? '学生' : user.portal_role === 'teacher' ? '教师' : '未知'}</td><td><select data-user-role="${esc(user.identity_id)}"><option value="student" ${user.role === 'student' ? 'selected' : ''}>学生</option><option value="teacher" ${user.role === 'teacher' ? 'selected' : ''}>教师</option><option value="portal">恢复门户判断</option></select></td><td>${user.role === 'teacher' ? `<select data-user-glass="${esc(user.identity_id)}"><option value="">未绑定</option>${glassOptions(user)}</select>` : '—'}</td><td>${esc(user.role_source || '')}</td><td><details><summary>查看原始字段</summary><pre class="profile">${esc(user.profile ? JSON.stringify(user.profile, null, 2) : '尚未保存')}</pre></details></td></tr>`).join('')}</tbody></table>`;
+      byId('adminUsers').innerHTML = `<table><thead><tr><th>身份</th><th>门户判断</th><th>当前角色</th><th>教师眼镜</th><th>来源</th><th>原始字段</th></tr></thead><tbody>${(data.users || []).map(user => `<tr><td>${esc(user.identity_id.startsWith('demo-') ? user.identity_id : `${user.identity_id.slice(0, 2)}***${user.identity_id.slice(-2)}`)}</td><td>${user.portal_role === 'student' ? '学生' : user.portal_role === 'teacher' ? '教师' : '未知'}</td><td><select data-user-role="${esc(user.identity_id)}"><option value="student" ${user.role === 'student' ? 'selected' : ''}>学生</option><option value="teacher" ${user.role === 'teacher' ? 'selected' : ''}>教师</option><option value="portal">恢复门户判断</option></select></td><td>${user.role === 'teacher' ? `<select data-user-glass="${esc(user.identity_id)}"><option value="">未绑定</option>${glassOptions(user)}</select><select data-user-weekday="${esc(user.identity_id)}">${weekdayOptions(bindingByTeacher[user.identity_id]?.weekday)}</select><button data-save-binding="${esc(user.identity_id)}">保存</button>` : '—'}</td><td>${esc(user.role_source || '')}</td><td><details><summary>查看原始字段</summary><pre class="profile">${esc(user.profile ? JSON.stringify(user.profile, null, 2) : '尚未保存')}</pre></details></td></tr>`).join('')}</tbody></table>`;
     } catch (error) { byId('adminUserStatus').textContent = error.message; }
   }
   let adminMediaPage = 1;
@@ -289,12 +334,17 @@
       try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(roleIdentity)}/role`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: event.target.value }) }); await loadAdminUsers(); } catch (error) { alert(error.message); }
       return;
     }
-    const glassIdentity = event.target.dataset.userGlass;
-    if (glassIdentity) {
-      try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(glassIdentity)}/glass`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: event.target.value }) }); await loadAdminUsers(); } catch (error) { alert(error.message); await loadAdminUsers(); }
-    }
   });
   document.addEventListener('click', async event => {
+    const bindingIdentity = event.target.dataset.saveBinding;
+    if (bindingIdentity) {
+      const glass = document.querySelector(`[data-user-glass="${CSS.escape(bindingIdentity)}"]`).value;
+      const weekday = document.querySelector(`[data-user-weekday="${CSS.escape(bindingIdentity)}"]`).value;
+      if (glass && weekday === '') return alert('请选择固定使用的星期。');
+      try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(bindingIdentity)}/glass`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glass, weekday: weekday === '' ? null : Number(weekday) }) }); await loadAdminUsers(); }
+      catch (error) { alert(error.message); }
+      return;
+    }
     const number = event.target.dataset.saveGlass;
     if (number) { const input = document.querySelector(`[data-glass-device="${CSS.escape(number)}"]`); try { await fetchJson(`/admin/api/auth/glasses/${encodeURIComponent(number)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_id: input.value }) }); setStatus('adminGlassStatus', `${number} 号眼镜已保存。`); await loadAdminGlasses(); } catch (error) { setStatus('adminGlassStatus', error.message, true); } }
     const recordId = event.target.dataset.deleteRecord;

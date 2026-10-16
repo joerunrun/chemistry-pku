@@ -132,7 +132,7 @@ def test_test_identities_are_fixed_and_role_pages_do_not_mix() -> None:
     _login_test_identity(client, "bing")
     page = client.get("/workspace").get_data(as_text=True)
     assert "教师工作台" in page
-    assert "课程整理" in page
+    assert "每日总结" in page
     assert "眼镜编号校准" not in page
 
 
@@ -236,6 +236,7 @@ def test_admin_media_is_lazy_page_ready_and_includes_transcripts(monkeypatch) ->
 
 
 def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch) -> None:
+    monkeypatch.setattr("pipeline.web.teacher_binding_store._now", lambda: "2026-10-16T00:00:00+00:00")
     admin = app_module.app.test_client()
     _unlock_admin(admin)
     device_id = "teacher_binding_device_12"
@@ -256,20 +257,21 @@ def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch)
     assert historical.status_code == 201
     historical_id = historical.get_json()["record"]["record_id"]
 
-    binding = teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12"})
+    binding = teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12", "weekday": 4})
     assert binding.status_code == 200
     assert binding.get_json()["binding"]["glass_number"] == "12"
-    assert binding.get_json()["backfill"]["item_count"] == 1
+    assert binding.get_json()["binding"]["weekday"] == 4
     visible_ids = {
         item["record_id"]
         for item in teacher.get("/api/workspace/teacher/media?media_type=audio").get_json()["items"]
     }
-    assert historical_id in visible_ids
+    assert historical_id not in visible_ids
 
     other_teacher = app_module.app.test_client()
     _login_test_identity(other_teacher, "bing")
-    conflict = other_teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12"})
+    conflict = other_teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12", "weekday": 4})
     assert conflict.status_code == 409
+    assert other_teacher.put("/api/workspace/teacher/binding", json={"glass_number": "12", "weekday": 2}).status_code == 200
 
     for index in range(2):
         upload = teacher.post(
@@ -278,6 +280,7 @@ def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch)
                 "device_id": device_id,
                 "experiment_type": "distillation",
                 "audio": (BytesIO(b"test-audio"), f"lesson-{index}.wav"),
+                "started_at": "2026-10-16T01:00:00+00:00",
             },
             content_type="multipart/form-data",
         )
@@ -295,8 +298,8 @@ def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch)
     first_page = teacher.get("/api/workspace/teacher/media?media_type=audio&page=1&page_size=1")
     assert first_page.status_code == 200
     first_data = first_page.get_json()
-    assert first_data["total"] == 3
-    assert first_data["pages"] == 3
+    assert first_data["total"] == 2
+    assert first_data["pages"] == 2
     assert len(first_data["items"]) == 1
     assert first_data["items"][0]["transcript"].startswith("绑定教师")
     assert first_data["items"][0]["glass_number"] == "12"
@@ -310,6 +313,7 @@ def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch)
             "device_id": device_id,
             "experiment_type": "distillation",
             "photo": (image_bytes, "photo.jpg"),
+            "captured_at": "2026-10-16T01:00:00+00:00",
         },
         content_type="multipart/form-data",
     )
@@ -319,11 +323,11 @@ def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch)
     assert teacher.get(photo_items[0]["thumbnail_url"]).status_code == 200
 
     assert admin.put("/admin/api/auth/glasses/11", json={"device_id": "teacher_binding_device_11"}).status_code == 200
-    assert teacher.put("/api/workspace/teacher/binding", json={"glass_number": "11"}).status_code == 200
+    assert teacher.put("/api/workspace/teacher/binding", json={"glass_number": "11", "weekday": 4}).status_code == 200
     binding_state = teacher.get("/api/workspace/teacher/binding").get_json()
     assert binding_state["binding"]["glass_number"] == "11"
     assert len(binding_state["history"]) == 2
-    assert teacher.get("/api/workspace/teacher/media?media_type=audio").get_json()["total"] == 3
+    assert teacher.get("/api/workspace/teacher/media?media_type=audio").get_json()["total"] == 2
 
 
 def test_pending_claim_overview_disappears_after_claim() -> None:
@@ -430,6 +434,35 @@ def test_course_report_job_success_download_and_common_issue_minimum() -> None:
     finally:
         app_module._schedule_workspace_report_job = original_schedule
         derived_analysis.generate_daily_course = original_generate
+
+
+def test_daily_calendar_generates_two_downloads_without_changing_old_claims(monkeypatch):
+    from pipeline.derived_analysis import daily_reports
+    client = app_module.app.test_client()
+    records = _prepare_teacher_audio_records(client, month="06", glass="09")
+    before = client.get("/api/claims").get_json()["claims"]
+    monkeypatch.setattr(app_module, "_schedule_workspace_report_job", lambda path: None)
+    monkeypatch.setattr(daily_reports, "generate_daily_reports", lambda *args, **kwargs: {
+        "title": "当天教学记录", "course_content": "简短概括", "detailed_content": "详尽整理",
+        "provider": "test", "model": "test",
+    })
+    days = client.get("/api/workspace/teacher/report-calendar?month=2026-06").get_json()["days"]
+    assert {day["date"] for day in days} == {"2026-06-01", "2026-06-02"}
+    created = client.post("/api/workspace/teacher/reports", json={"kind": "daily", "date": "2026-06-01"})
+    report_id = created.get_json()["report"]["report_id"]
+    assert created.status_code == 202
+    app_module._run_workspace_report_job(app_module._workspace_report_job_root() / f"{report_id}.json")
+    report = client.get(f"/api/workspace/teacher/reports/{report_id}").get_json()["report"]
+    assert report["input_record_ids"] == [records[0]["record_id"]]
+    for part, content in (("summary", "简短概括"), ("detail", "详尽整理")):
+        response = client.get(f"/api/workspace/teacher/reports/{report_id}/download?part={part}")
+        assert response.status_code == 200 and content in response.get_data(as_text=True)
+    again = client.post("/api/workspace/teacher/reports", json={"kind": "daily", "date": "2026-06-01"})
+    assert again.get_json()["report"]["report_id"] == report_id
+    assert client.get("/api/claims").get_json()["claims"] == before
+    _login_test_identity(client, "bing")
+    assert client.get("/api/workspace/teacher/report-calendar?month=2026-06").get_json()["days"] == []
+    assert client.get(f"/api/workspace/teacher/reports/{report_id}/download?part=detail").status_code == 404
 
 
 def test_running_report_job_is_requeued_after_restart() -> None:
