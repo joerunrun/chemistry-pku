@@ -77,6 +77,7 @@ def deploy_archive(
     *,
     backup_root: Path | None = None,
     dry_run: bool = False,
+    no_backup: bool = False,
 ) -> dict[str, int]:
     archive = archive.resolve()
     target = target.resolve()
@@ -106,7 +107,8 @@ def deploy_archive(
         if dry_run:
             return {"updated": 0, "protected": skipped, "planned": len(selected)}
 
-        _backup_critical_files(target, backup_root)
+        if not no_backup:
+            _backup_critical_files(target, backup_root)
         with tempfile.TemporaryDirectory(prefix="chemistry_deploy_") as temporary:
             staging = Path(temporary)
             for member, parts in selected:
@@ -132,6 +134,7 @@ def main() -> int:
     parser.add_argument("--target", type=Path, default=Path.cwd(), help="server project directory")
     parser.add_argument("--backup-root", type=Path, help="critical data backup directory")
     parser.add_argument("--dry-run", action="store_true", help="validate without writing")
+    parser.add_argument("--no-backup", action="store_true", help="skip optional backup copies; protected paths are still skipped")
     args = parser.parse_args()
     try:
         deploy_archive(
@@ -139,6 +142,7 @@ def main() -> int:
             args.target,
             backup_root=args.backup_root,
             dry_run=args.dry_run,
+            no_backup=args.no_backup,
         )
     except (BadZipFile, OSError, ValueError) as exc:
         parser.exit(1, f"Deployment failed: {exc}\n")
