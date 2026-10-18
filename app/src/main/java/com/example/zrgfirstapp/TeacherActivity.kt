@@ -92,7 +92,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     private val connectionMode: String by lazy {
-        getString(R.string.glasses_connection_mode).trim().lowercase()
+        if (BuildConfig.LOCAL_USB) "usb" else getString(R.string.glasses_connection_mode).trim().lowercase()
     }
 
     private val baseUrl: String by lazy {

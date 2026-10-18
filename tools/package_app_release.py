@@ -15,6 +15,8 @@ for role, label in (("teacher", "教师"), ("student", "学生")):
     output = root / f"app/build/outputs/apk/{role}/debug"
     build = json.loads((output / "output-metadata.json").read_text(encoding="utf-8"))
     element = build["elements"][0]
+    if "-usb" in element["versionName"]:
+        raise SystemExit("Build network APKs without teacherUsb/studentUsb/studentTest before publishing.")
     apk = output / element["outputFile"]
     apks[role] = apk
     shutil.copy2(apk, release / f"化小北{label}版一键更新包/化小北{label}版.apk")

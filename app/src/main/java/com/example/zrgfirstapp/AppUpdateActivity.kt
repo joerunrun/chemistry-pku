@@ -183,7 +183,7 @@ class AppUpdateActivity : AppCompatActivity() {
 
     companion object {
         fun onLaunch(activity: Activity): Boolean {
-            if (BuildConfig.STUDENT_USB || activity.intent.getBooleanExtra("skip_update_check", false)) return false
+            if (BuildConfig.LOCAL_USB || activity.intent.getBooleanExtra("skip_update_check", false)) return false
             activity.startActivity(Intent(activity, AppUpdateActivity::class.java).putExtra("startup", true))
             activity.finish()
             return true

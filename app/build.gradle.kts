@@ -28,7 +28,7 @@ android {
         versionCode = 4
         versionName = "2.2"
         manifestPlaceholders["applicationLabel"] = "@string/app_name"
-        buildConfigField("boolean", "STUDENT_USB", "false")
+        buildConfigField("boolean", "LOCAL_USB", "false")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -40,7 +40,7 @@ android {
             versionName = "2.2-student"
             buildConfigField("String", "APP_MODE", "\"student\"")
             val usb = providers.gradleProperty("studentTest").isPresent || providers.gradleProperty("studentUsb").isPresent
-            buildConfigField("boolean", "STUDENT_USB", usb.toString())
+            buildConfigField("boolean", "LOCAL_USB", usb.toString())
             if (usb) versionNameSuffix = "-usb"
             if (providers.gradleProperty("studentTest").isPresent) {
                 applicationIdSuffix = ".naturaltest"
@@ -51,7 +51,9 @@ android {
         create("teacher") {
             dimension = "role"
             applicationIdSuffix = ".teacher"
-            versionNameSuffix = "-teacher"
+            val usb = providers.gradleProperty("teacherUsb").isPresent
+            versionNameSuffix = if (usb) "-teacher-usb" else "-teacher"
+            buildConfigField("boolean", "LOCAL_USB", usb.toString())
             buildConfigField("String", "APP_MODE", "\"teacher\"")
         }
     }
