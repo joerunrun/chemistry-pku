@@ -1,4 +1,4 @@
-"""Time-bounded teacher-to-glass assignments stored beside identity data."""
+"""Time-bounded glass schedules, separated by student/teacher role."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ GLASS_NUMBERS = tuple(f"{number:02d}" for number in range(1, 13))
 
 class TeacherBindingConflict(ValueError):
     def __init__(self, binding: dict[str, Any]):
-        super().__init__("该眼镜已经绑定给其他教师")
+        super().__init__("该眼镜在所选星期已分配给同角色的其他用户")
         self.binding = binding
 
 
@@ -51,18 +51,21 @@ def init_teacher_binding_store() -> None:
                 created_at TEXT NOT NULL
             );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_teacher_active_binding
-            ON teacher_glass_bindings(identity_id) WHERE ended_at IS NULL;
-
             """
         )
         columns = {row[1] for row in connection.execute("PRAGMA table_info(teacher_glass_bindings)")}
         if "weekday" not in columns:
             connection.execute("ALTER TABLE teacher_glass_bindings ADD COLUMN weekday INTEGER")
+        if "role" not in columns:
+            connection.execute("ALTER TABLE teacher_glass_bindings ADD COLUMN role TEXT NOT NULL DEFAULT 'teacher'")
         connection.executescript("""
             DROP INDEX IF EXISTS uq_glass_active_teacher;
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_glass_weekday_teacher
-            ON teacher_glass_bindings(glass_number, weekday) WHERE ended_at IS NULL;
+            DROP INDEX IF EXISTS uq_teacher_active_binding;
+            DROP INDEX IF EXISTS uq_glass_weekday_teacher;
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_active_role_binding
+            ON teacher_glass_bindings(identity_id, role) WHERE ended_at IS NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_glass_weekday_role
+            ON teacher_glass_bindings(glass_number, weekday, role) WHERE ended_at IS NULL;
         """)
         connection.commit()
 
@@ -72,11 +75,11 @@ def _binding(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def active_teacher_binding(
-    *, identity_id: str | None = None, glass_number: str | None = None
+    *, identity_id: str | None = None, glass_number: str | None = None, role: str = "teacher"
 ) -> dict[str, Any] | None:
     init_teacher_binding_store()
-    filters = ["ended_at IS NULL"]
-    values: list[str] = []
+    filters = ["ended_at IS NULL", "role = ?"]
+    values: list[str] = [role]
     if identity_id:
         filters.append("identity_id = ?")
         values.append(identity_id.strip())
@@ -92,21 +95,23 @@ def active_teacher_binding(
     return _binding(row)
 
 
-def list_teacher_bindings(*, active_only: bool = False) -> list[dict[str, Any]]:
+def list_teacher_bindings(*, active_only: bool = False, role: str = "teacher") -> list[dict[str, Any]]:
     init_teacher_binding_store()
-    where = "WHERE ended_at IS NULL" if active_only else ""
+    where = "WHERE role = ?" + (" AND ended_at IS NULL" if active_only else "")
     with closing(_connect()) as connection:
         rows = connection.execute(
-            f"SELECT * FROM teacher_glass_bindings {where} ORDER BY started_at DESC"
+            f"SELECT * FROM teacher_glass_bindings {where} ORDER BY started_at DESC", (role,)
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def set_teacher_binding(identity_id: str, glass_number: str, weekday: int) -> dict[str, Any]:
+def set_teacher_binding(identity_id: str, glass_number: str, weekday: int, *, role: str = "teacher") -> dict[str, Any]:
     identity_id = identity_id.strip()
     glass_number = glass_number.strip()
     if not identity_id:
         raise ValueError("identity_id 不能为空")
+    if role not in {"teacher", "student"}:
+        raise ValueError("角色必须是教师或学生")
     if glass_number not in GLASS_NUMBERS:
         raise ValueError("眼镜编号必须是 01 到 12")
     if type(weekday) is not int or weekday not in range(7):
@@ -117,16 +122,16 @@ def set_teacher_binding(identity_id: str, glass_number: str, weekday: int) -> di
     with closing(_connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         target = connection.execute(
-            "SELECT * FROM teacher_glass_bindings WHERE glass_number = ? AND weekday = ? AND ended_at IS NULL",
-            (glass_number, weekday),
+            "SELECT * FROM teacher_glass_bindings WHERE glass_number = ? AND weekday = ? AND role = ? AND ended_at IS NULL",
+            (glass_number, weekday, role),
         ).fetchone()
         if target is not None and target["identity_id"] != identity_id:
             connection.rollback()
             raise TeacherBindingConflict(dict(target))
 
         current = connection.execute(
-            "SELECT * FROM teacher_glass_bindings WHERE identity_id = ? AND ended_at IS NULL",
-            (identity_id,),
+            "SELECT * FROM teacher_glass_bindings WHERE identity_id = ? AND role = ? AND ended_at IS NULL",
+            (identity_id, role),
         ).fetchone()
         if current is not None and current["glass_number"] == glass_number and current["weekday"] == weekday:
             connection.commit()
@@ -137,24 +142,24 @@ def set_teacher_binding(identity_id: str, glass_number: str, weekday: int) -> di
                 (now, current["binding_id"]),
             )
 
-        binding_id = f"teacher_glass_{uuid.uuid4().hex}"
+        binding_id = f"{role}_glass_{uuid.uuid4().hex}"
         connection.execute(
             "INSERT INTO teacher_glass_bindings(binding_id, identity_id, glass_number, "
-            "started_at, ended_at, created_at, weekday) VALUES (?, ?, ?, ?, NULL, ?, ?)",
-            (binding_id, identity_id, glass_number, now, now, weekday),
+            "started_at, ended_at, created_at, weekday, role) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
+            (binding_id, identity_id, glass_number, now, now, weekday, role),
         )
         connection.commit()
-    return active_teacher_binding(identity_id=identity_id) or {}
+    return active_teacher_binding(identity_id=identity_id, role=role) or {}
 
 
-def end_teacher_binding(identity_id: str) -> dict[str, Any] | None:
+def end_teacher_binding(identity_id: str, *, role: str = "teacher") -> dict[str, Any] | None:
     identity_id = identity_id.strip()
     init_teacher_binding_store()
     with closing(_connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         current = connection.execute(
-            "SELECT * FROM teacher_glass_bindings WHERE identity_id = ? AND ended_at IS NULL",
-            (identity_id,),
+            "SELECT * FROM teacher_glass_bindings WHERE identity_id = ? AND role = ? AND ended_at IS NULL",
+            (identity_id, role),
         ).fetchone()
         if current is None:
             connection.commit()
@@ -170,8 +175,8 @@ def end_teacher_binding(identity_id: str) -> dict[str, Any] | None:
         return result
 
 
-def teacher_binding_for_glass_at(glass_number: str, when: str) -> dict[str, Any] | None:
-    """Return the teacher assigned at an upload's actual capture/start time."""
+def teacher_binding_for_glass_at(glass_number: str, when: str, *, role: str = "teacher") -> dict[str, Any] | None:
+    """Return the assignment at an upload's actual capture/start time."""
     init_teacher_binding_store()
     captured = datetime.fromisoformat(when.replace("Z", "+00:00"))
     if captured.tzinfo is None:
@@ -181,9 +186,9 @@ def teacher_binding_for_glass_at(glass_number: str, when: str) -> dict[str, Any]
     with closing(_connect()) as connection:
         row = connection.execute(
             "SELECT * FROM teacher_glass_bindings "
-            "WHERE glass_number = ? AND weekday = ? AND started_at <= ? "
+            "WHERE glass_number = ? AND weekday = ? AND role = ? AND started_at <= ? "
             "AND (ended_at IS NULL OR ended_at > ?) "
             "ORDER BY started_at DESC LIMIT 1",
-            (glass_number.strip(), weekday, when, when),
+            (glass_number.strip(), weekday, role, when, when),
         ).fetchone()
     return _binding(row)

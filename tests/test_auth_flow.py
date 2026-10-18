@@ -465,6 +465,69 @@ def test_daily_calendar_generates_two_downloads_without_changing_old_claims(monk
     assert client.get(f"/api/workspace/teacher/reports/{report_id}/download?part=detail").status_code == 404
 
 
+def test_student_schedule_daily_reports_and_admin_assign_unowned_saturday(monkeypatch):
+    from pipeline.derived_analysis import daily_reports
+    monkeypatch.setattr("pipeline.web.teacher_binding_store._now", lambda: "2026-10-16T00:00:00+00:00")
+    monkeypatch.setattr(app_module._media_analysis_queue, "enqueue", lambda *args: None)
+    monkeypatch.setattr(app_module, "_schedule_workspace_report_job", lambda path: None)
+    admin, student, other = (app_module.app.test_client() for _ in range(3))
+    _unlock_admin(admin)
+    assert admin.put("/admin/api/auth/glasses/10", json={"device_id": "student-schedule-10"}).status_code == 200
+    _login_test_identity(student, "jia")
+    _login_test_identity(other, "yi")
+    before = student.get("/api/claims").get_json()["claims"]
+    assert student.put("/api/workspace/student/binding", json={"glass_number": "10", "weekday": 4}).status_code == 200
+    assert student.get("/api/claims").get_json()["claims"] == before
+    assert other.put("/api/workspace/student/binding", json={"glass_number": "10", "weekday": 4}).status_code == 409
+    assert student.get("/api/workspace/teacher/binding").status_code == 403
+    page = student.get("/workspace").get_data(as_text=True)
+    assert "每天的学习记录" in page and 'id="claimStartDate"' not in page
+
+    records = []
+    for day in (16, 17):
+        uploaded = student.post("/api/glasses/records/upload", data={
+            "device_id": "student-schedule-10", "audio": (BytesIO(b"student-audio"), "record.wav"),
+            "started_at": f"2026-10-{day}T09:00:23+08:00", "ended_at": f"2026-10-{day}T09:10:37+08:00",
+        })
+        assert uploaded.status_code == 201
+        record = uploaded.get_json()["record"]
+        Path(record["path"], "analysis.json").write_text(json.dumps({"items": {
+            "audio": {"status": "succeeded", "transcript": f"学生{day}日的操作记录"}
+        }}, ensure_ascii=False), encoding="utf-8")
+        records.append(record)
+    media = student.get("/api/workspace/student/media?glass_number=10").get_json()
+    assert {item["record_id"] for item in media["items"]} == {records[0]["record_id"]}
+    file_url = media["items"][0]["file_url"]
+    assert student.get(file_url).status_code == 200
+    assert other.get(file_url).status_code == 403
+    days = student.get("/api/workspace/student/report-calendar?month=2026-10").get_json()["days"]
+    assert "2026-10-16" in {day["date"] for day in days}
+    assert "2026-10-17" not in {day["date"] for day in days}
+
+    def generate(*args, **kwargs):
+        assert kwargs["role"] == "student"
+        return {"title": "当天学习记录", "course_content": "学习概括", "detailed_content": "完整学习记录"}
+    monkeypatch.setattr(daily_reports, "generate_daily_reports", generate)
+    created = student.post("/api/workspace/student/reports", json={"kind": "daily", "date": "2026-10-16"})
+    assert created.status_code == 202
+    report_id = created.get_json()["report"]["report_id"]
+    app_module._run_workspace_report_job(app_module._workspace_report_job_root() / f"{report_id}.json")
+    for part, text in (("summary", "学习概括"), ("detail", "完整学习记录")):
+        response = student.get(f"/api/workspace/student/reports/{report_id}/download?part={part}")
+        assert response.status_code == 200 and text in response.get_data(as_text=True)
+        assert other.get(f"/api/workspace/student/reports/{report_id}/download?part={part}").status_code == 404
+
+    groups = admin.get("/api/workspace/admin/unassigned?source_role=student&date=2026-10-17&glass_number=10").get_json()["groups"]
+    assert len(groups) == 1
+    payload = {**groups[0], "identity_id": "demo-jia"}
+    assert student.post("/api/workspace/admin/assign", json=payload).status_code == 403
+    assert admin.post("/api/workspace/admin/assign", json=payload).status_code == 201
+    assert admin.post("/api/workspace/admin/assign", json=payload).status_code == 400
+    days = student.get("/api/workspace/student/report-calendar?month=2026-10").get_json()["days"]
+    assert "2026-10-17" in {day["date"] for day in days}
+    assert len(student.get("/api/claims").get_json()["claims"]) == len(before) + 2
+
+
 def test_running_report_job_is_requeued_after_restart() -> None:
     job_path = app_module._workspace_report_job_root() / "restart-test.json"
     app_module._write_common_issue_json(job_path, {"job_id": "restart-test", "status": "running"})

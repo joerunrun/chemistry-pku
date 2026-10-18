@@ -25,3 +25,8 @@ def test_old_bindings_survive_and_weekday_ownership_uses_capture_time(tmp_path, 
     assert store.teacher_binding_for_glass_at("11", "2026-10-21T09:00:00+08:00")["identity_id"] == "bob"
     assert store.teacher_binding_for_glass_at("11", "2026-10-12T09:00:00+08:00") is None
     assert any(item["binding_id"] == "old" and item["ended_at"] for item in store.list_teacher_bindings())
+    store.set_teacher_binding("student-a", "11", 0, role="student")
+    with pytest.raises(store.TeacherBindingConflict):
+        store.set_teacher_binding("student-b", "11", 0, role="student")
+    assert store.teacher_binding_for_glass_at("11", "2026-10-19T09:00:00+08:00", role="student")["identity_id"] == "student-a"
+    assert store.teacher_binding_for_glass_at("11", "2026-10-19T09:00:00+08:00")["identity_id"] == "alice"

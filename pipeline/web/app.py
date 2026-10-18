@@ -764,6 +764,7 @@ def _run_workspace_report_job(job_path: Path) -> None:
             report.update(generate_daily_reports(
                 job["filters"]["start_date"], job["transcripts"],
                 provider=job.get("provider"), model=job.get("model"),
+                role=job.get("source_role", "teacher"),
             ))
         else:
             result = generate_daily_course(
@@ -903,9 +904,10 @@ def _candidate_datetime(value: Any, *, fallback: datetime) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _auto_claim_teacher_upload(metadata: dict[str, Any], item_type: str) -> dict[str, Any] | None:
-    """Attach newly uploaded teacher media to the teacher using that glass."""
-    if metadata.get("record_role") != "teacher" or item_type not in {"record", "photo"}:
+def _auto_claim_upload(metadata: dict[str, Any], item_type: str) -> dict[str, Any] | None:
+    """Assign newly uploaded media using capture time and the matching role's schedule."""
+    role = metadata.get("record_role")
+    if role not in {"student", "teacher"} or item_type not in {"record", "photo"}:
         return None
     device_id = str(metadata.get("device_id", "")).strip()
     glass_number = glass_for_device(device_id) if device_id else None
@@ -924,7 +926,7 @@ def _auto_claim_teacher_upload(metadata: dict[str, Any], item_type: str) -> dict
         capture_time,
         fallback=created_at,
     )
-    binding = teacher_binding_for_glass_at(glass_number, captured_at.isoformat())
+    binding = teacher_binding_for_glass_at(glass_number, captured_at.isoformat(), role=role)
     if binding is None:
         return None
 
@@ -937,14 +939,14 @@ def _auto_claim_teacher_upload(metadata: dict[str, Any], item_type: str) -> dict
     try:
         return create_claim(
             identity_id=str(binding["identity_id"]),
-            role="teacher",
+            role=role,
             glass_number=glass_number,
             started_at=captured_at.isoformat(),
             ended_at=ended_at.isoformat(),
             items=[{
                 "item_type": item_type,
                 "item_id": item_id,
-                "source_role": "teacher",
+                "source_role": role,
                 "device_id": device_id,
                 "experiment_type": str(metadata.get("experiment_type", "")),
                 "item_created_at": created_at.isoformat(),
@@ -953,7 +955,7 @@ def _auto_claim_teacher_upload(metadata: dict[str, Any], item_type: str) -> dict
     except ClaimConflict:
         return None
     except (KeyError, ValueError, sqlite3.Error) as exc:
-        app.logger.warning("teacher upload auto-claim failed: %s", exc)
+        app.logger.warning("upload auto-claim failed: %s", exc)
         return None
 
 
@@ -1362,6 +1364,7 @@ def admin_auth_users():
     return jsonify({
         "users": list_users(),
         "teacher_bindings": list_teacher_bindings(active_only=True),
+        "student_bindings": list_teacher_bindings(active_only=True, role="student"),
     })
 
 
@@ -1394,8 +1397,8 @@ def workspace_admin_set_user_role(identity_id: str):
         return jsonify({"error": str(exc)}), 400
     if user is None:
         return jsonify({"error": "身份不存在"}), 404
-    if user.get("role") != "teacher":
-        end_teacher_binding(identity_id)
+    old_role = "student" if user.get("role") == "teacher" else "teacher"
+    end_teacher_binding(identity_id, role=old_role)
     return jsonify({"user": user})
 
 
@@ -1410,20 +1413,18 @@ def workspace_admin_set_teacher_glass(identity_id: str):
     payload = request.get_json(silent=True) or {}
     raw_glass_number = str(payload.get("glass_number") or "").strip()
     if not raw_glass_number:
-        ended = end_teacher_binding(identity_id)
+        ended = end_teacher_binding(identity_id, role=user["role"])
         return jsonify({"binding": None, "ended_binding": ended})
     glass_number = _normalize_glass_number(raw_glass_number)
     if not glass_number:
         return jsonify({"error": "眼镜编号必须是 01 到 12"}), 400
-    if user.get("role") != "teacher":
-        return jsonify({"error": "只有教师身份可以绑定眼镜"}), 400
     glass = next((item for item in list_glasses() if item["glass_number"] == glass_number), None)
     if not glass or not glass.get("device_id"):
         return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
     try:
-        binding = set_teacher_binding(identity_id, glass_number, payload.get("weekday"))
+        binding = set_teacher_binding(identity_id, glass_number, payload.get("weekday"), role=user["role"])
     except TeacherBindingConflict:
-        return jsonify({"error": "该眼镜在所选星期已分配给其他助教"}), 409
+        return jsonify({"error": "该眼镜在所选星期已分配给同角色的其他用户"}), 409
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"binding": binding})
@@ -1446,6 +1447,59 @@ def workspace_admin_test_identities():
         user = _test_identity_user(key)
         identities.append({"key": key, **spec, "current_role": user.get("role") if user else None})
     return jsonify({"identities": identities})
+
+
+@app.get("/api/workspace/admin/unassigned")
+def workspace_admin_unassigned():
+    required = _admin_required()
+    if required:
+        return required
+    role = request.args.get("source_role", "student")
+    if role not in {"student", "teacher"}:
+        return jsonify({"error": "请选择学生或助教"}), 400
+    groups, unmapped = _pending_claim_groups(role)
+    date_text = request.args.get("date", "")
+    glass_number = request.args.get("glass_number", "")
+    groups = [group for group in groups if (not date_text or group["date"] == date_text)
+              and (not glass_number or group["glass_number"] == glass_number)]
+    for group in groups:
+        group["started_at"] = min(item["started_at"] for item in group["items"])
+        group["ended_at"] = max(item["ended_at"] for item in group["items"])
+    users = [{"identity_id": user["identity_id"], "label": _masked_identity_for_page(user["identity_id"])}
+             for user in list_users() if user.get("role") == role]
+    return jsonify({"groups": groups, "users": users, "unmapped_count": unmapped})
+
+
+@app.post("/api/workspace/admin/assign")
+def workspace_admin_assign():
+    required = _admin_required()
+    if required:
+        return required
+    payload = request.get_json(silent=True) or {}
+    user = find_user(str(payload.get("identity_id", "")))
+    if user is None:
+        return jsonify({"error": "请选择资料接收人"}), 400
+    role = user["role"]
+    if payload.get("source_role") != role:
+        return jsonify({"error": "接收人的角色与资料来源不一致"}), 400
+    glass_number = str(payload.get("glass_number", ""))
+    try:
+        start = _parse_claim_time(payload.get("started_at"), "开始时间")
+        end = _parse_claim_time(payload.get("ended_at"), "结束时间")
+        if end < start:
+            raise ValueError("结束时间不能早于开始时间")
+        requested = {(item.get("item_type"), item.get("item_id")) for item in payload.get("items", [])}
+        claimed = claimed_item_keys()
+        items = [item for item in _claim_candidate_items(glass_number, start, end, source_role=role)
+                 if (item["item_type"], item["item_id"]) in requested
+                 and (item["item_type"], role, item["item_id"]) not in claimed]
+        claim = create_claim(identity_id=user["identity_id"], role=role, glass_number=glass_number,
+                             started_at=start.isoformat(), ended_at=end.isoformat(), items=items)
+    except ClaimConflict:
+        return jsonify({"error": "资料已经被归属，请刷新后重试"}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"claim": claim}), 201
 
 
 @app.post("/admin/test-identities/<key>/login")
@@ -1757,9 +1811,22 @@ def _teacher_user_required() -> tuple[dict[str, Any] | None, Any | None]:
     return user, None
 
 
+def _workspace_role() -> str:
+    return "student" if request.path.startswith("/api/workspace/student/") else "teacher"
+
+
+def _workspace_user_required():
+    user = _current_user()
+    if user is None:
+        return None, (jsonify({"error": "请先完成身份登录"}), 401)
+    if user.get("role") != _workspace_role():
+        return None, (jsonify({"error": "无权使用其他角色的工作台"}), 403)
+    return user, None
+
+
 def _teacher_binding_payload(identity_id: str) -> dict[str, Any]:
-    binding = active_teacher_binding(identity_id=identity_id)
-    occupied = list_teacher_bindings(active_only=True)
+    binding = active_teacher_binding(identity_id=identity_id, role=_workspace_role())
+    occupied = list_teacher_bindings(active_only=True, role=_workspace_role())
     glasses = []
     for glass in list_glasses():
         number = str(glass["glass_number"])
@@ -1774,24 +1841,26 @@ def _teacher_binding_payload(identity_id: str) -> dict[str, Any]:
             "current": bool(binding and binding.get("glass_number") == number),
         })
     history = [
-        item for item in list_teacher_bindings()
+        item for item in list_teacher_bindings(role=_workspace_role())
         if item.get("identity_id") == identity_id
     ]
     return {"binding": binding, "glasses": glasses, "history": history}
 
 
+@app.get("/api/workspace/student/binding")
 @app.get("/api/workspace/teacher/binding")
 def workspace_teacher_binding():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     identity_id = str(user["identity_id"])
     return jsonify(_teacher_binding_payload(identity_id))
 
 
+@app.put("/api/workspace/student/binding")
 @app.put("/api/workspace/teacher/binding")
 def workspace_teacher_set_binding():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     payload = request.get_json(silent=True) or {}
@@ -1804,20 +1873,21 @@ def workspace_teacher_set_binding():
         return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
     try:
         identity_id = str(user["identity_id"])
-        set_teacher_binding(identity_id, glass_number, payload.get("weekday"))
+        set_teacher_binding(identity_id, glass_number, payload.get("weekday"), role=user["role"])
     except TeacherBindingConflict:
-        return jsonify({"error": "该眼镜在所选星期已分配给其他助教"}), 409
+        return jsonify({"error": "该眼镜在所选星期已分配给同角色的其他用户"}), 409
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify(_teacher_binding_payload(identity_id))
 
 
+@app.delete("/api/workspace/student/binding")
 @app.delete("/api/workspace/teacher/binding")
 def workspace_teacher_end_binding():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
-    end_teacher_binding(str(user["identity_id"]))
+    end_teacher_binding(str(user["identity_id"]), role=user["role"])
     return jsonify(_teacher_binding_payload(str(user["identity_id"])))
 
 
@@ -1877,10 +1947,10 @@ def _teacher_report_sources(
 
     claimed: dict[str, dict[str, Any]] = {}
     for claim in list_claims(identity_id):
-        if claim.get("role") != "teacher":
+        if claim.get("role") != _workspace_role():
             continue
         for item in claim.get("items", []):
-            if item.get("item_type") != "record" or item.get("source_role") != "teacher":
+            if item.get("item_type") != "record" or item.get("source_role") != _workspace_role():
                 continue
             claimed[str(item.get("item_id", ""))] = {
                 "claim_id": str(claim.get("claim_id", "")),
@@ -1888,7 +1958,9 @@ def _teacher_report_sources(
             }
 
     sources: list[dict[str, Any]] = []
-    for record in _list_records(_teacher_record_root(), "teacher_admin_download_record_file"):
+    record_root = _record_root() if _workspace_role() == "student" else _teacher_record_root()
+    record_endpoint = "admin_download_record_file" if _workspace_role() == "student" else "teacher_admin_download_record_file"
+    for record in _list_records(record_root, record_endpoint):
         record_id = str(record.get("record_id", ""))
         claim = claimed.get(record_id)
         if claim is None:
@@ -1927,9 +1999,10 @@ def _teacher_report_sources(
     }, sources
 
 
+@app.get("/api/workspace/student/report-calendar")
 @app.get("/api/workspace/teacher/report-calendar")
 def workspace_teacher_report_calendar():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     month = request.args.get("month", datetime.now(_BEIJING_TZ).strftime("%Y-%m"))
@@ -1947,15 +2020,16 @@ def workspace_teacher_report_calendar():
     for path in _scoped_course_root().glob("daily_*.json"):
         report = _read_common_issue_json(path) or {}
         day = report.get("filters", {}).get("start_date", "")
-        if report.get("owner_identity_id") == user["identity_id"] and day.startswith(month + "-"):
+        if _workspace_report_visible(report, str(user["identity_id"])) and day.startswith(month + "-"):
             entry = days.setdefault(day, {"date": day, "record_count": 0, "pending_count": 0})
             entry.update({"report_id": report["report_id"], "status": report["status"]})
     return jsonify({"month": month, "days": [days[key] for key in sorted(days)]})
 
 
+@app.get("/api/workspace/student/report-sources")
 @app.get("/api/workspace/teacher/report-sources")
 def workspace_teacher_report_sources():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     try:
@@ -1972,14 +2046,15 @@ def workspace_teacher_report_sources():
     return jsonify({"filters": filters, "sources": public_sources})
 
 
+@app.post("/api/workspace/student/reports")
 @app.post("/api/workspace/teacher/reports")
 def workspace_teacher_create_report():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     payload = request.get_json(silent=True) or {}
     kind = str(payload.get("kind", "course")).strip()
-    if kind not in {"course", "common_issues", "daily"}:
+    if kind not in ({"daily"} if user["role"] == "student" else {"course", "common_issues", "daily"}):
         return jsonify({"error": "不支持的报告类型"}), 400
     if kind == "daily":
         payload = {"start_date": payload.get("date"), "end_date": payload.get("date"),
@@ -2002,6 +2077,8 @@ def workspace_teacher_create_report():
         return jsonify({"error": str(exc)}), 400
 
     daily_id = f"daily_{filters['start_date'].replace('-', '')}_{uuid.uuid5(uuid.NAMESPACE_URL, str(user['identity_id'])).hex[:16]}"
+    if user["role"] == "student":
+        daily_id += "_student"
     if kind == "daily":
         previous = _read_common_issue_json(_workspace_report_path(daily_id, kind))
         if previous and (previous.get("status") in {"queued", "running"} or
@@ -2015,7 +2092,7 @@ def workspace_teacher_create_report():
         normalized_ids = list(dict.fromkeys(str(item).strip() for item in requested_ids if str(item).strip()))
         unknown = [record_id for record_id in normalized_ids if record_id not in source_map]
         if unknown:
-            return jsonify({"error": "包含不属于当前教师或筛选范围的记录", "record_ids": unknown}), 403
+            return jsonify({"error": "包含不属于当前用户或筛选范围的记录", "record_ids": unknown}), 403
         selected = [source_map[record_id] for record_id in normalized_ids]
     else:
         selected = sources
@@ -2038,6 +2115,7 @@ def workspace_teacher_create_report():
         "report_id": report_id,
         "kind": kind,
         "owner_identity_id": str(user["identity_id"]),
+        "source_role": user["role"],
         "filters": {**filters, "record_ids": [item["record_id"] for item in selected]},
         "input_record_ids": [item["record_id"] for item in selected],
         "record_count": len(selected),
@@ -2088,6 +2166,7 @@ def workspace_teacher_create_report():
         "report_id": report_id,
         "report_path": str(report_path.resolve()),
         "kind": kind,
+        "source_role": user["role"],
         "filters": filters,
         "transcripts": transcripts,
         "experiment": _common_issue_experiment_context(cfg or {}),
@@ -2107,12 +2186,14 @@ def workspace_teacher_create_report():
 
 def _workspace_report_visible(report: dict[str, Any], identity_id: str) -> bool:
     owner = str(report.get("owner_identity_id", "")).strip()
-    return owner == identity_id or (not owner and bool(report.get("date")))
+    return report.get("source_role", "teacher") == _workspace_role() and (
+        owner == identity_id or (not owner and bool(report.get("date"))))
 
 
+@app.get("/api/workspace/student/reports")
 @app.get("/api/workspace/teacher/reports")
 def workspace_teacher_reports():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     identity_id = str(user["identity_id"])
@@ -2121,17 +2202,18 @@ def workspace_teacher_reports():
         root.mkdir(parents=True, exist_ok=True)
         for path in root.glob("*.json"):
             report = _read_common_issue_json(path)
-            if report and str(report.get("owner_identity_id", "")) == identity_id:
+            if report and report.get("owner_identity_id") == identity_id and _workspace_report_visible(report, identity_id):
                 reports.append(report)
-    for legacy in _list_daily_course_reports():
+    for legacy in (_list_daily_course_reports() if user["role"] == "teacher" else []):
         reports.append({**legacy, "kind": "course", "legacy": True})
     reports.sort(key=lambda item: item.get("generated_at", ""), reverse=True)
     return jsonify({"reports": reports})
 
 
+@app.get("/api/workspace/student/reports/<report_id>")
 @app.get("/api/workspace/teacher/reports/<report_id>")
 def workspace_teacher_report(report_id: str):
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     path = _find_workspace_report_path(report_id)
@@ -2141,9 +2223,10 @@ def workspace_teacher_report(report_id: str):
     return jsonify({"report": report})
 
 
+@app.get("/api/workspace/student/reports/<report_id>/download")
 @app.get("/api/workspace/teacher/reports/<report_id>/download")
 def workspace_teacher_report_download(report_id: str):
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     path = _find_workspace_report_path(report_id)
@@ -2752,7 +2835,7 @@ def _store_uploaded_record(record_root: Path, *, record_role: str):
     }
     metadata_path = record_dir / "record.json"
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    automatic_claim = _auto_claim_teacher_upload(metadata, "record")
+    automatic_claim = _auto_claim_upload(metadata, "record")
     if automatic_claim:
         metadata["owner_identity_id"] = automatic_claim["identity_id"]
         metadata["automatic_claim_id"] = automatic_claim["claim_id"]
@@ -2823,9 +2906,10 @@ def workspace_admin_media():
     })
 
 
+@app.get("/api/workspace/student/media")
 @app.get("/api/workspace/teacher/media")
 def workspace_teacher_media():
-    user, error = _teacher_user_required()
+    user, error = _workspace_user_required()
     if error:
         return error
     try:
@@ -2852,7 +2936,7 @@ def workspace_teacher_media():
     identity_id = str(user["identity_id"])
     owners = claim_item_owners()
     items = _list_workspace_admin_media(
-        source_role="teacher",
+        source_role=user["role"],
         media_type=media_type,
         start_date=start_date,
         end_date=end_date,
@@ -2863,13 +2947,21 @@ def workspace_teacher_media():
     for item in items:
         item_id = str(item.get("photo_id") if item.get("item_type") == "photo" else item.get("record_id"))
         item_kind = "photo" if item.get("item_type") == "photo" else "record"
-        owner = owners.get((item_kind, "teacher", item_id)) or {}
+        owner = owners.get((item_kind, user["role"], item_id)) or {}
         if owner.get("identity_id") != identity_id:
             continue
         if item_kind == "photo":
             item["thumbnail_url"] = url_for(
                 "workspace_teacher_photo_thumbnail", photo_id=item_id
             )
+        if user["role"] == "student":
+            base = "/api/workspace/student/media"
+            file_url = (f"{base}/photos/{item_id}/file" if item_kind == "photo" else
+                        f"{base}/records/{item_id}/files/{item['filename']}")
+            item["file_url"] = file_url + "?download=0"
+            item["download_url"] = file_url + "?download=1"
+            if item_kind == "photo":
+                item["thumbnail_url"] = f"{base}/photos/{item_id}/thumbnail"
         visible.append(item)
 
     total = len(visible)
@@ -2880,7 +2972,7 @@ def workspace_teacher_media():
         "page_size": page_size,
         "pages": max(1, (total + page_size - 1) // page_size),
         "total": total,
-        "binding": active_teacher_binding(identity_id=identity_id),
+        "binding": active_teacher_binding(identity_id=identity_id, role=user["role"]),
     })
 
 
@@ -2941,17 +3033,18 @@ def _teacher_media_access_allowed(item_type: str, item_id: str) -> bool:
     if _admin_is_unlocked():
         return True
     user = _current_user()
-    if user is None or user.get("role") != "teacher":
+    if user is None or user.get("role") != _workspace_role():
         return False
-    owner = claim_item_owners().get((item_type, "teacher", item_id)) or {}
+    owner = claim_item_owners().get((item_type, _workspace_role(), item_id)) or {}
     return owner.get("identity_id") == user.get("identity_id")
 
 
+@app.get("/api/workspace/student/media/records/<record_id>/files/<filename>")
 @app.get("/teacher-admin/api/records/<record_id>/files/<filename>")
 def teacher_admin_download_record_file(record_id: str, filename: str):
     if not _teacher_media_access_allowed("record", record_id):
         return jsonify({"error": "无权访问该记录"}), 403
-    record_dir = _resolve_record_dir(_teacher_record_root(), record_id)
+    record_dir = _resolve_record_dir((_record_root() if _workspace_role() == "student" else _teacher_record_root()), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
     safe_name = Path(filename).name
@@ -2967,11 +3060,12 @@ def teacher_admin_download_record_file(record_id: str, filename: str):
     )
 
 
+@app.delete("/api/workspace/student/media/records/<record_id>")
 @app.delete("/teacher-admin/api/records/<record_id>")
 def teacher_admin_delete_record(record_id: str):
     if not _teacher_media_access_allowed("record", record_id):
         return jsonify({"error": "无权删除该记录"}), 403
-    record_dir = _resolve_record_dir(_teacher_record_root(), record_id)
+    record_dir = _resolve_record_dir((_record_root() if _workspace_role() == "student" else _teacher_record_root()), record_id)
     if record_dir is None:
         return jsonify({"error": "record not found"}), 404
     try:
@@ -3041,7 +3135,7 @@ def _store_uploaded_photo(photo_root: Path, *, record_role: str):
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    automatic_claim = _auto_claim_teacher_upload(metadata, "photo")
+    automatic_claim = _auto_claim_upload(metadata, "photo")
     if automatic_claim:
         metadata["owner_identity_id"] = automatic_claim["identity_id"]
         metadata["automatic_claim_id"] = automatic_claim["claim_id"]
@@ -3119,11 +3213,12 @@ def teacher_admin_photos():
     return jsonify({"photos": photos})
 
 
+@app.get("/api/workspace/student/media/photos/<photo_id>/file")
 @app.get("/teacher-admin/api/photos/<photo_id>/file")
 def teacher_admin_photo_file(photo_id: str):
     if not _teacher_media_access_allowed("photo", photo_id):
         return jsonify({"error": "无权访问该照片"}), 403
-    return _send_photo_file(_teacher_photo_root(), photo_id)
+    return _send_photo_file((_photo_root() if _workspace_role() == "student" else _teacher_photo_root()), photo_id)
 
 
 @app.get("/api/workspace/admin/media/photos/<source_role>/<photo_id>/thumbnail")
@@ -3138,11 +3233,12 @@ def workspace_admin_photo_thumbnail(source_role: str, photo_id: str):
     return _send_photo_thumbnail(root, photo_id)
 
 
+@app.get("/api/workspace/student/media/photos/<photo_id>/thumbnail")
 @app.get("/api/workspace/teacher/media/photos/<photo_id>/thumbnail")
 def workspace_teacher_photo_thumbnail(photo_id: str):
     if not _teacher_media_access_allowed("photo", photo_id):
         return jsonify({"error": "无权访问该照片"}), 403
-    return _send_photo_thumbnail(_teacher_photo_root(), photo_id)
+    return _send_photo_thumbnail((_photo_root() if _workspace_role() == "student" else _teacher_photo_root()), photo_id)
 
 
 def _send_photo_thumbnail(root: Path, photo_id: str):
@@ -3169,11 +3265,12 @@ def _send_photo_thumbnail(root: Path, photo_id: str):
     return send_file(output, mimetype="image/jpeg", max_age=86400)
 
 
+@app.delete("/api/workspace/student/media/photos/<photo_id>")
 @app.delete("/teacher-admin/api/photos/<photo_id>")
 def teacher_admin_delete_photo(photo_id: str):
     if not _teacher_media_access_allowed("photo", photo_id):
         return jsonify({"error": "无权删除该照片"}), 403
-    photo_dir = _resolve_photo_dir(_teacher_photo_root(), photo_id)
+    photo_dir = _resolve_photo_dir((_photo_root() if _workspace_role() == "student" else _teacher_photo_root()), photo_id)
     if photo_dir is None:
         return jsonify({"error": "photo not found"}), 404
     try:
