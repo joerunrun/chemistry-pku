@@ -227,7 +227,8 @@ class MainActivity : AppCompatActivity() {
                 if (studentForeground) {
                     renderScreen()
                     if (wasPreparing && state in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING)) {
-                        playPrompt("recording_start") { startVoiceIntentLoop() }
+                        val prompt = if (state == StudentRecordState.VIDEO_RECORDING) "student_video_start" else "student_audio_start"
+                        playPrompt(prompt) { startVoiceIntentLoop() }
                     }
                 }
             }
@@ -1431,70 +1432,6 @@ class MainActivity : AppCompatActivity() {
         player.start()
     }
 
-    private fun playDynamicPrompt(text: String, onDone: (() -> Unit)? = null) {
-        if (text.isBlank()) {
-            onDone?.invoke()
-            return
-        }
-        val token = operationToken
-        Thread {
-            try {
-                val json = postJson(
-                    "$baseUrl/api/glasses/tts",
-                    JSONObject().put("text", text).put("model", "qwen3.5-omni-plus-realtime"),
-                )
-                val audioDataUrl = json.optString("audio_data_url", "")
-                runOnUiIfCurrent(token) {
-                    playAudioDataUrl(audioDataUrl, onDone)
-                }
-            } catch (_: Exception) {
-                runOnUiIfCurrent(token) {
-                    onDone?.invoke()
-                }
-            }
-        }.start()
-    }
-
-    private fun playAudioDataUrl(audioDataUrl: String?, onDone: (() -> Unit)? = null) {
-        if (audioDataUrl.isNullOrBlank() || audioDataUrl == "null") {
-            onDone?.invoke()
-            return
-        }
-        try {
-            stopAssistantAudio()
-            val bytes = Base64.decode(audioDataUrl.substringAfter(",", ""), Base64.DEFAULT)
-            val audioFile = File(cacheDir, "assistant_prompt_${System.currentTimeMillis()}.wav")
-            audioFile.writeBytes(bytes)
-            assistantAudioFile = audioFile
-            val player = MediaPlayer().apply {
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build(),
-                )
-                setDataSource(audioFile.absolutePath)
-                setVolume(1.0f, 1.0f)
-                setOnCompletionListener {
-                    stopAssistantAudio()
-                    onDone?.invoke()
-                }
-                setOnErrorListener { _, _, _ ->
-                    stopAssistantAudio()
-                    onDone?.invoke()
-                    true
-                }
-                prepare()
-            }
-            recordingService?.acceptStudentCommands = false
-            assistantPlayer = player
-            voiceControlPausedUntilMs = System.currentTimeMillis() + 2_500L
-            player.start()
-        } catch (_: Exception) {
-            onDone?.invoke()
-        }
-    }
-
     private fun playResultAudio(audioDataUrl: String?, fallbackText: String) {
         stopAssistantAudio()
         mainHandler.removeCallbacks(resultReturnRunnable)
@@ -1641,13 +1578,15 @@ class MainActivity : AppCompatActivity() {
     private fun stopRecordingService(announce: Boolean = false, returnToLive: Boolean = false) {
         val service = recordingService ?: return
         if (service.studentState in setOf(StudentRecordState.IDLE, StudentRecordState.STOPPING)) return
+        val prompt = if (service.studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING))
+            "student_video_stop" else "student_audio_stop"
         operationToken += 1
         studentPendingUtterances.clear()
         passiveListenMode = PassiveListenMode.NONE
         service.stopStudentRecording {
             if (studentForeground) {
                 if (returnToLive) enterLiveMinimal()
-                if (announce) playDynamicPrompt(recordingStatusText) { startVoiceIntentLoop() }
+                if (announce) playPrompt(prompt) { startVoiceIntentLoop() }
             }
         }
     }
