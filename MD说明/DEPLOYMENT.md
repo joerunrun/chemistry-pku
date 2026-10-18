@@ -88,7 +88,7 @@ docker compose down
 ```bash
 cd /projects/chemistry-glasses
 python3 deploy/safe_extract.py code_deploy.zip --target . --dry-run
-python3 deploy/safe_extract.py code_deploy.zip --target .
+python3 deploy/safe_extract.py code_deploy.zip --target . --no-backup
 docker compose up -d --build
 ```
 
@@ -104,6 +104,8 @@ docker compose up -d --build
 - 同时兼容压缩包直接包含项目文件，或外层多一层 `code/` 的结构
 
 明确不需要额外备份时，可在实际解压命令加 `--no-backup`；它只跳过备份复制，仍禁止覆盖 `.env` 和 `runtime_assets/`。
+
+当前按不额外备份的约定使用上述 `--no-backup` 命令。2026-10-18 的学生固定星期排班、自动归属、日历双份学习记录及管理员未归属资料分配，也统一通过本地 `code_deploy.zip` 发布；先同步 `code/`，再重新打包，不使用旧包。本地打包不代表服务器已经更新。
 
 2026-10-16 已部署学生自然语音控制、知识库问答／视频搜索／照片纠错，以及助教固定星期绑定和日历双份总结。此次使用 `--no-backup` 更新差异代码，保留原有 Compose、Nginx 和数据挂载配置，仅补充知识库环境变量。归属明细 1391 条、归属批次 705 批均核对一致，8 条原绑定保留，需由助教补选星期。
 
