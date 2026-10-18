@@ -708,31 +708,23 @@ class MainActivity : AppCompatActivity() {
 
 
 
-            ScreenState.LIVE_MINIMAL -> {
-                showActionMenu()
-            }
-
-            ScreenState.ACTION_MENU -> {
-                mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
-                if (focusIndex == 0) {
-                    startCaptureCountdown()
-                } else {
-                    startVoiceQuestionFlow()
-                }
-            }
-
-            ScreenState.CAPTURE_COUNTDOWN,
+            ScreenState.LIVE_MINIMAL,
+            ScreenState.ACTION_MENU,
             ScreenState.DEMO_SELECT,
             ScreenState.VOICE_LISTENING,
-            ScreenState.QA_RECORDING -> Unit
+            ScreenState.QA_RECORDING,
+            ScreenState.RESULT -> {
+                startCaptureCountdown(photoOnly = true, immediate = true)
+            }
+
+            ScreenState.CAPTURE_COUNTDOWN -> Unit
 
             ScreenState.DEMO_PLAYING -> {
                 stopDemoPlayback()
-                enterLiveMinimal()
+                startCaptureCountdown(photoOnly = true, immediate = true)
             }
 
-            ScreenState.RUNNING,
-            ScreenState.RESULT -> Unit
+            ScreenState.RUNNING -> Unit
         }
     }
 
@@ -760,16 +752,6 @@ class MainActivity : AppCompatActivity() {
         mainHandler.post { startVoiceIntentLoop() }
         mainHandler.postDelayed({ startVoiceIntentLoop() }, 600L)
         mainHandler.postDelayed({ startVoiceIntentLoop() }, 1_500L)
-    }
-
-    private fun showActionMenu() {
-        stopVoiceIntentRecording()
-        focusIndex = 0
-        clearTaskOutput()
-        screenState = ScreenState.ACTION_MENU
-        renderScreen()
-        mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
-        mainHandler.postDelayed(actionMenuTimeoutRunnable, actionMenuTimeoutMs)
     }
 
     private fun handleBackGesture() {
@@ -1744,7 +1726,9 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun startCaptureCountdown(photoOnly: Boolean = false, checkRequest: String = "") {
+    private fun startCaptureCountdown(photoOnly: Boolean = false, checkRequest: String = "", immediate: Boolean = false) {
+        mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
+        if (immediate) stopAssistantAudio()
         stopVoiceIntentRecording()
         pendingCheckRequest = checkRequest
         standalonePhotoRequested = photoOnly
@@ -1766,6 +1750,10 @@ class MainActivity : AppCompatActivity() {
         lastResultText = "即将自动拍照"
         screenState = ScreenState.CAPTURE_COUNTDOWN
         renderScreen()
+        if (immediate) {
+            startCaptureFlow()
+            return
+        }
         val promptName = when {
             standalonePhotoRequested -> "start_capture"
             selectedMode == Mode.SAFETY -> "start_safety"
@@ -1824,20 +1812,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 renderScreen()
             }
-            val runCapture = {
-                runOnUiThread {
-                    if (captureToken == operationToken) {
-                        lastStatusText = "正在拍照，请保持稳定"
-                        renderScreen()
-                    }
-                }
-                captureWithService(service, captureOnly, captureToken)
-            }
-            if (captureOnly) {
-                mainHandler.postDelayed(runCapture, 1_500L)
-            } else {
-                runCapture()
-            }
+            captureWithService(service, captureOnly, captureToken)
         }
     }
 

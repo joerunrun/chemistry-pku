@@ -7,9 +7,10 @@ internal data class TeacherVoiceWindow(
     val sequence: Long,
     val context: String,
     val pcm: ByteArray,
+    val recordingState: String = "IDLE",
 )
 
-/** Fixed-capacity PCM ring used by the uninterrupted teacher microphone. */
+/** Fixed-capacity PCM ring shared by audio capture. */
 internal class PcmRingBuffer(private val capacity: Int) {
     private val data = ByteArray(capacity)
     private var start = 0

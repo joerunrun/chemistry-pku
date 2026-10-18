@@ -181,6 +181,14 @@ D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SE
 
 ## 眼镜内更新（2.1，versionCode 3）
 
+2.2（versionCode 4）：两版单击镜腿直接拍照保存，录像时单击也拍照，不停止录像。教师取消唤醒菜单及转头唤醒入口，持续收音按语句送 `teacher_direct` 一次判断拍照／录像／停止／no_action，持续录音原件照常保存。停止录像改用语音。连接、权限与更新页面的确认操作保留；正在拍照或处理任务时不重复启动拍照。
+
+2.2 教师端需要后端健康接口包含 `teacher_direct_control`。先部署 `chemistry/code_deploy.zip`，再发布 `release/服务器部署/glasses-update-2.2.zip` 的 APK。打包可运行 `tools/package_app_release.py`，随后运行 `tools/package_network_bootstrap.py` 重建含配网工具的首装 ZIP。已安装 2.1 的联网用户可在服务器发布后直接下载更新，仍需按系统提示确认安装。
+
+2.2（versionCode 4）：两版单击镜腿直接拍照保存，录像时单击也拍照，不停止录像。教师取消唤醒菜单及转头唤醒入口，持续收音按语句送 `teacher_direct` 一次判断拍照／录像／停止／no_action，持续录音原件照常保存。停止录像改用语音。连接、权限与更新页面的确认操作保留；正在拍照或处理任务时不重复启动拍照。
+
+2.2 教师端需要后端健康接口包含 `teacher_direct_control`。先部署 `chemistry/code_deploy.zip`，再发布 `release/服务器部署/glasses-update-2.2.zip` 的 APK。打包可运行 `tools/package_app_release.py`，随后运行 `tools/package_network_bootstrap.py` 重建含配网工具的首装 ZIP。已安装 2.1 的联网用户可在服务器发布后直接下载更新，仍需按系统提示确认安装。
+
 教师、学生联网版启动时检查新版本；空闲时长按触摸板可手动检查。下载后核对摘要、包名和版本，再打开系统安装界面。首次 USB 安装包会尝试开启安装来源许可，系统仍可能要求确认安装。USB 开发包不自动检查正式版。
 
 首装文件夹及同名 ZIP 位于 `chemistry_agent/release/化小北教师版一键更新包`、`化小北学生版一键更新包`。完整解压后双击 `安装更新.bat`，两版均直接连接服务器。后续必须递增 versionCode 并沿用当前包名和签名密钥。

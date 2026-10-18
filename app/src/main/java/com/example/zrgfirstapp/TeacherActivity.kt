@@ -42,22 +42,22 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
 class TeacherActivity : AppCompatActivity() {
-    private lateinit var headWake: TeacherHeadWake
     private lateinit var gestureDetector: GestureDetector
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var activePlayer: MediaPlayer? = null
+    @Volatile private var activePlayer: MediaPlayer? = null
     private val teacherDeviceId by lazy { DeviceIdentity.teacherId(this) }
 
-    // 持续录音（单路，同时承担保存 + 唤醒检测的环形缓冲来源）
+    // 持续录音（单路，同时保存原件并按语句判断指令）
     @Volatile private var continuousRunning = false
     private var continuousRecorder: AudioRecord? = null
     @Volatile private var continuousStopLatch: CountDownLatch? = null
     private var continuousFile: File? = null
     private var continuousTotalSamples = 0
-    private val ringBuffer = PcmRingBuffer(SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * RING_SECONDS)
+    private val utterances = StudentUtteranceBuffer()
+    private var utteranceEpoch = -1
 
-    // 唤醒/指令状态
-    private enum class TeacherState { LISTENING, AWAKE, INSTRUCTION, RECORDING }
+    // 指令状态
+    private enum class TeacherState { LISTENING, INSTRUCTION, RECORDING }
     private var teacherState = TeacherState.LISTENING
     private val operationToken = java.util.concurrent.atomic.AtomicInteger(0)
     private val voiceEpoch = VoiceEpoch()
@@ -67,13 +67,10 @@ class TeacherActivity : AppCompatActivity() {
     private val voiceConnections = mutableMapOf<Long, HttpURLConnection>()
     private val voiceConnectionsLock = Any()
     @Volatile private var voiceRecognitionPaused = false
-    private var wakeCheckScheduled = false
     private var continuousRestartScheduled = false
     private var continuousRestartAttempts = 0
     private var videoRecordingActive = false
     private var videoStartedAt: String? = null
-    private var awakeChoiceIndex = 0
-    private val awakeTimeoutRunnable = Runnable { handleAwakeTimeout() }
     private val templeSingleTapRunnable = Runnable {
         lastTempleKeyTapAt = 0L
         handleTempleSingleTap()
@@ -122,7 +119,7 @@ class TeacherActivity : AppCompatActivity() {
     private val requestCameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (!granted) playPrompt("unclear")
+        if (granted && !teacherExitInProgress) handleInstructionIntent(org.json.JSONObject().put("intent", "capture_photo"))
     }
 
     private var lastTempleKeyTapAt = 0L
@@ -146,14 +143,6 @@ class TeacherActivity : AppCompatActivity() {
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
         findViewById<View>(R.id.main).setBackgroundColor(Color.TRANSPARENT)
-        headWake = TeacherHeadWake(this,
-            canWake = {
-                teacherConnectionReady && teacherSessionStarted && !teacherExitInProgress &&
-                    teacherState == TeacherState.LISTENING && !voiceRecognitionPaused
-            },
-            wake = { enterTeacherAwake() },
-        )
-
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onLongPress(e: MotionEvent) {
@@ -175,34 +164,10 @@ class TeacherActivity : AppCompatActivity() {
                 exitTeacherApp()
                 return true
             }
-            override fun onFling(
-                e1: MotionEvent?,
-                e2: MotionEvent,
-                velocityX: Float,
-                velocityY: Float,
-            ): Boolean {
-                if (e1 == null || teacherState != TeacherState.AWAKE) return false
-                val deltaX = e2.x - e1.x
-                if (kotlin.math.abs(deltaX) < SWIPE_THRESHOLD ||
-                    kotlin.math.abs(velocityX) < SWIPE_VELOCITY_THRESHOLD
-                ) return false
-                moveAwakeChoice(if (deltaX > 0) 1 else -1)
-                return true
-            }
         })
         hideAllViews()
 
         checkTeacherConnection()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        headWake.start()
-    }
-
-    override fun onPause() {
-        headWake.stop()
-        super.onPause()
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -216,26 +181,6 @@ class TeacherActivity : AppCompatActivity() {
         }
         if (event.keyCode == KeyEvent.KEYCODE_BACK || event.keyCode == KeyEvent.KEYCODE_ESCAPE) {
             exitTeacherApp()
-            return true
-        }
-
-        if (teacherState == TeacherState.AWAKE && event.keyCode in setOf(
-                KeyEvent.KEYCODE_DPAD_LEFT,
-                KeyEvent.KEYCODE_DPAD_UP,
-                KeyEvent.KEYCODE_PAGE_UP,
-            )
-        ) {
-            moveAwakeChoice(-1)
-            return true
-        }
-        if (teacherState == TeacherState.AWAKE && event.keyCode in setOf(
-                KeyEvent.KEYCODE_DPAD_RIGHT,
-                KeyEvent.KEYCODE_DPAD_DOWN,
-                KeyEvent.KEYCODE_PAGE_DOWN,
-                KeyEvent.KEYCODE_FORWARD,
-            )
-        ) {
-            moveAwakeChoice(1)
             return true
         }
 
@@ -278,7 +223,6 @@ class TeacherActivity : AppCompatActivity() {
     private fun exitTeacherApp(forUpdate: Boolean = false) {
         if (teacherExitInProgress) return
         teacherExitInProgress = true
-        mainHandler.removeCallbacks(awakeTimeoutRunnable)
         mainHandler.removeCallbacks(templeSingleTapRunnable)
         advanceVoiceEpoch()
         operationToken.incrementAndGet()
@@ -354,98 +298,8 @@ class TeacherActivity : AppCompatActivity() {
             checkTeacherConnection()
             return
         }
-        when (teacherState) {
-            TeacherState.LISTENING -> enterTeacherAwake()
-            TeacherState.AWAKE -> handleInstructionIntent(
-                org.json.JSONObject().put(
-                    "intent",
-                    if (awakeChoiceIndex == 0) "capture_photo" else "start_recording",
-                ),
-            )
-            TeacherState.RECORDING -> stopTeacherRecording()
-            TeacherState.INSTRUCTION -> Unit
-        }
-    }
-
-    private fun enterTeacherAwake(pendingIntent: String? = null) {
-        if (teacherExitInProgress || !teacherSessionStarted || teacherState != TeacherState.LISTENING) return
-        advanceVoiceEpoch()
-        val awakeToken = operationToken.incrementAndGet()
-        teacherState = TeacherState.AWAKE
-        awakeChoiceIndex = if (pendingIntent == "start_recording") 1 else 0
-        voiceRecognitionPaused = true
-        showAwakeChoices()
-        playPrompt("wake_response") {
-            if (teacherExitInProgress || teacherState != TeacherState.AWAKE ||
-                operationToken.get() != awakeToken
-            ) return@playPrompt
-            voiceRecognitionPaused = false
-            if (pendingIntent in setOf("capture_photo", "start_recording")) {
-                handleInstructionIntent(org.json.JSONObject().put("intent", pendingIntent))
-            } else {
-                refreshAwakeTimeout()
-                scheduleWakeCheck()
-            }
-        }
-    }
-
-    private fun showAwakeChoices() {
-        hideAllViews()
-        listOf(R.id.left_eye_panel, R.id.right_eye_panel).forEach { id ->
-            val panel = findViewById<View>(id) ?: return@forEach
-            panel.findViewById<android.widget.TextView>(R.id.title_text).apply {
-                text = "化小北"
-                visibility = View.VISIBLE
-            }
-            panel.findViewById<android.widget.TextView>(R.id.subtitle_text).apply {
-                text = "请选择功能"
-                visibility = View.VISIBLE
-            }
-            panel.findViewById<View>(R.id.options_row).visibility = View.VISIBLE
-            panel.findViewById<android.widget.Button>(R.id.primary_button).apply {
-                text = "拍照"
-                alpha = if (awakeChoiceIndex == 0) 1.0f else 0.62f
-                isSelected = awakeChoiceIndex == 0
-            }
-            panel.findViewById<android.widget.Button>(R.id.secondary_button).apply {
-                text = "录像"
-                alpha = if (awakeChoiceIndex == 1) 1.0f else 0.62f
-                isSelected = awakeChoiceIndex == 1
-            }
-            panel.findViewById<android.widget.TextView>(R.id.status_text).apply {
-                text = "左右滑动选择，单击确认；也可以直接说指令"
-                visibility = View.VISIBLE
-            }
-        }
-    }
-
-    private fun moveAwakeChoice(delta: Int) {
-        if (teacherState != TeacherState.AWAKE) return
-        awakeChoiceIndex = if (delta == 0) awakeChoiceIndex else 1 - awakeChoiceIndex
-        showAwakeChoices()
-        refreshAwakeTimeout()
-    }
-
-    private fun refreshAwakeTimeout() {
-        mainHandler.removeCallbacks(awakeTimeoutRunnable)
-        if (teacherState == TeacherState.AWAKE) {
-            mainHandler.postDelayed(awakeTimeoutRunnable, AWAKE_TIMEOUT_MS)
-        }
-    }
-
-    private fun handleAwakeTimeout() {
-        if (teacherState != TeacherState.AWAKE || teacherExitInProgress) return
-        val timeoutToken = operationToken.incrementAndGet()
-        advanceVoiceEpoch()
-        voiceRecognitionPaused = true
-        hideAllViews()
-        teacherState = TeacherState.INSTRUCTION
-        playPrompt("unclear") { resumeListening(timeoutToken) }
-    }
-
-    private fun clearAwakeControls() {
-        mainHandler.removeCallbacks(awakeTimeoutRunnable)
-        hideAllViews()
+        if (teacherExitInProgress || !teacherSessionStarted || teacherState == TeacherState.INSTRUCTION) return
+        handleInstructionIntent(org.json.JSONObject().put("intent", "capture_photo"))
     }
 
     private fun checkTeacherConnection() {
@@ -461,9 +315,13 @@ class TeacherActivity : AppCompatActivity() {
                     readTimeout = 8_000
                 }
                 val code = connection.responseCode
-                connection.inputStream?.close()
-                connection.disconnect()
-                if (code !in 200..299) throw IOException("HTTP $code")
+                val health = try {
+                    if (code !in 200..299) throw IOException("HTTP $code")
+                    org.json.JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+                } finally { connection.disconnect() }
+                if (health.optJSONArray("features")?.toString()?.contains("teacher_direct_control") != true) {
+                    throw IOException("请先更新服务器，以支持教师直接指令")
+                }
                 runOnUiThread {
                     teacherConnectionCheckInProgress = false
                     teacherConnectionReady = true
@@ -484,7 +342,7 @@ class TeacherActivity : AppCompatActivity() {
                     showTeacherConnectionState(
                         "教师助手",
                         "连接失败",
-                        "电脑服务未连接。单击重试，双击退出。",
+                        "${exc.message ?: "连接失败"}。单击重试，双击退出。",
                     )
                 }
             }
@@ -548,9 +406,9 @@ class TeacherActivity : AppCompatActivity() {
                         ) {
                             val read = recorder.read(buffer, 0, buffer.size)
                             if (read > 0) {
-                                writePcm16(output, buffer, read)
+                                val pcm = writePcm16(output, buffer, read)
                                 continuousTotalSamples += read
-                                appendRing(buffer, read)
+                                detectTeacherSpeech(pcm)
                             }
                         }
                     }
@@ -570,7 +428,6 @@ class TeacherActivity : AppCompatActivity() {
                 stopped.countDown()
             }
         }.start()
-        scheduleWakeCheck()
     }
 
     private fun stopContinuousRecording(onStopped: (() -> Unit)? = null) {
@@ -596,60 +453,32 @@ class TeacherActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun appendRing(buffer: ShortArray, count: Int) {
-        val bytes = ByteArray(count * 2)
-        for (i in 0 until count) {
-            val v = buffer[i].toInt()
-            bytes[i * 2] = (v and 0xff).toByte()
-            bytes[i * 2 + 1] = ((v shr 8) and 0xff).toByte()
+    private fun detectTeacherSpeech(pcm: ByteArray) {
+        val epoch = voiceEpoch.current()
+        if (utteranceEpoch != epoch || voiceRecognitionPaused || activePlayer != null) {
+            utterances.clear()
+            utteranceEpoch = epoch
         }
-        ringBuffer.append(bytes)
-    }
-
-    private fun takeRingSnapshotSeconds(seconds: Int): ByteArray? {
-        return ringBuffer.snapshot(SAMPLE_RATE * PCM_BYTES_PER_SAMPLE * seconds)
-    }
-
-    // ===== 无空档语音检测：每 2 秒取最近 5 秒 PCM，最多并发两个云端请求 =====
-    private fun scheduleWakeCheck() {
-        if (!continuousRunning) return
-        if (voiceContextForCurrentState() == null) return
-        if (continuousRecorder == null) {
-            continuousRunning = false
-            startContinuousRecording()
-            return
-        }
-        if (wakeCheckScheduled) return
-        wakeCheckScheduled = true
-        mainHandler.postDelayed({
-            wakeCheckScheduled = false
-            val context = voiceContextForCurrentState()
-            if (context == null || !continuousRunning) return@postDelayed
-            if (!voiceRecognitionPaused) {
-                val pcm = takeRingSnapshotSeconds(VOICE_WINDOW_SECONDS)
-                if (pcm != null && PcmAudioGate.hasMeaningfulAudio(pcm)) {
-                    enqueueVoiceWindow(pcm, context)
-                }
+        if (voiceRecognitionPaused || activePlayer != null || teacherExitInProgress) return
+        val sentence = utterances.append(pcm, PcmAudioGate.hasMeaningfulAudio(pcm, 120.0, 900)) ?: return
+        mainHandler.post {
+            if (voiceEpoch.accepts(epoch) && !voiceRecognitionPaused && !teacherExitInProgress) {
+                enqueueVoiceWindow(sentence)
             }
-            scheduleWakeCheck()
-        }, VOICE_WINDOW_STEP_MS)
+        }
     }
 
-    private fun voiceContextForCurrentState(): String? = when (teacherState) {
-        TeacherState.LISTENING -> "teacher_sleep"
-        TeacherState.AWAKE -> "teacher_awake"
-        TeacherState.RECORDING -> "teacher_recording"
-        TeacherState.INSTRUCTION -> null
-    }
+    private fun voiceContextForCurrentState(): String? =
+        if (teacherState == TeacherState.INSTRUCTION) null else "teacher_direct"
 
-    private fun enqueueVoiceWindow(pcm: ByteArray, context: String) {
+    private fun enqueueVoiceWindow(pcm: ByteArray) {
         val window = TeacherVoiceWindow(
             epoch = voiceEpoch.current(),
             sequence = voiceRequestSequence.incrementAndGet(),
-            context = context,
+            context = "teacher_direct",
             pcm = pcm,
+            recordingState = if (videoRecordingActive) "VIDEO_RECORDING" else "IDLE",
         )
-        if (context == "teacher_awake") refreshAwakeTimeout()
         voiceWindowLimiter.offer(window)?.let(::submitVoiceWindow)
     }
 
@@ -663,6 +492,7 @@ class TeacherActivity : AppCompatActivity() {
                     mapOf(
                         "model" to "qwen3.5-omni-flash-realtime",
                         "context" to window.context,
+                        "recording_state" to window.recordingState,
                         "demo_options" to "",
                     ),
                     "audio",
@@ -676,11 +506,7 @@ class TeacherActivity : AppCompatActivity() {
                 )
                 mainHandler.post {
                     if (isCurrentVoiceWindow(window)) {
-                        when (window.context) {
-                            "teacher_sleep" -> handleWakeResponse(json)
-                            "teacher_awake" -> handleInstructionIntent(json)
-                            "teacher_recording" -> handleStopRecordingIntent(json)
-                        }
+                        handleInstructionIntent(json)
                     }
                 }
             } catch (exc: Exception) {
@@ -715,22 +541,6 @@ class TeacherActivity : AppCompatActivity() {
         return epoch
     }
 
-    private fun handleWakeResponse(json: org.json.JSONObject) {
-        if (!json.optBoolean("wake", false)) return
-        val intent = json.optString("intent", "").takeIf {
-            it == "capture_photo" || it == "start_recording"
-        }
-        enterTeacherAwake(intent)
-    }
-
-    // 录像中检测到停止意图
-    private fun handleStopRecordingIntent(json: org.json.JSONObject) {
-        val intent = json.optString("intent", "unclear")
-        if (intent == "stop_recording") {
-            stopTeacherRecording()
-        }
-    }
-
     private fun stopTeacherRecording() {
         videoRecordingActive = false
         val videoStartedAtForUpload = videoStartedAt
@@ -761,7 +571,10 @@ class TeacherActivity : AppCompatActivity() {
         if (intent !in setOf("capture_photo", "start_recording", "stop_recording")) {
             return
         }
-        clearAwakeControls()
+        if (teacherExitInProgress || teacherState == TeacherState.INSTRUCTION) return
+        if (intent == "start_recording" && videoRecordingActive) return
+        if (intent == "stop_recording" && !videoRecordingActive) return
+        hideAllViews()
         voiceRecognitionPaused = true
         advanceVoiceEpoch()
         val actionToken = operationToken.incrementAndGet()
@@ -802,13 +615,12 @@ class TeacherActivity : AppCompatActivity() {
                             .setAction(RecordingService.ACTION_START_RECORDING)
                             .putExtra(RecordingService.EXTRA_VIDEO_AUDIO_ENABLED, false)
                     )
-                    // 进入录像状态：恢复持续录音，唤醒检测切到检测"停止录像"
+                    // 进入录像状态：恢复持续录音，语音直接判定当前记录动作
                     videoRecordingActive = true
                     videoStartedAt = UploadMetadata.nowIso()
                     teacherState = TeacherState.RECORDING
                     voiceRecognitionPaused = false
                     advanceVoiceEpoch()
-                    scheduleWakeCheck()
                 }
             }
             "stop_recording" -> {
@@ -824,13 +636,11 @@ class TeacherActivity : AppCompatActivity() {
     private fun resumeListening(expectedToken: Int?) {
         if (teacherExitInProgress) return
         if (expectedToken != null && operationToken.get() != expectedToken) return
-        mainHandler.removeCallbacks(awakeTimeoutRunnable)
         hideAllViews()
-        teacherState = TeacherState.LISTENING
+        teacherState = if (videoRecordingActive) TeacherState.RECORDING else TeacherState.LISTENING
         voiceRecognitionPaused = false
         advanceVoiceEpoch()
         if (!continuousRunning) startContinuousRecording()
-        else scheduleWakeCheck()
     }
 
     private fun resumeAfterCameraSettle(token: Int, prompt: String? = null) {
@@ -959,7 +769,6 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(awakeTimeoutRunnable)
         mainHandler.removeCallbacks(templeSingleTapRunnable)
         advanceVoiceEpoch()
         voiceExecutor.shutdownNow()
@@ -1030,21 +839,14 @@ class TeacherActivity : AppCompatActivity() {
         private const val SAMPLE_RATE = 16_000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val PCM_BYTES_PER_SAMPLE = 2
-        private const val RING_SECONDS = 10
-        private const val VOICE_WINDOW_SECONDS = 5
-        private const val VOICE_WINDOW_STEP_MS = 2_000L
-        private const val MAX_VOICE_REQUESTS = 2
+        private const val MAX_VOICE_REQUESTS = 1
         private const val CONTINUOUS_SEGMENT_MS = 120_000L
         private const val CAMERA_SETTLE_DELAY_MS = 700L
         private const val PHOTO_CAPTURE_TIMEOUT_MS = 5_000L
         private const val SERVICE_WAIT_TIMEOUT_MS = 5_000L
-        private const val AWAKE_TIMEOUT_MS = 8_000L
         private const val DOUBLE_TAP_WINDOW_MS = 500L
-        private const val SWIPE_THRESHOLD = 40
-        private const val SWIPE_VELOCITY_THRESHOLD = 40
 
-        private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int) {
+        private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int): ByteArray {
             val bytes = ByteArray(count * 2)
             for (i in 0 until count) {
                 val value = buffer[i].toInt()
@@ -1052,6 +854,7 @@ class TeacherActivity : AppCompatActivity() {
                 bytes[i * 2 + 1] = ((value shr 8) and 0xff).toByte()
             }
             output.write(bytes)
+            return bytes
         }
         private fun writeWavHeader(output: FileOutputStream, samples: Int) = output.write(buildWavHeader(samples))
         private fun rewriteWavHeader(file: File, samples: Int) {
