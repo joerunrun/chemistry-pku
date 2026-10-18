@@ -17,6 +17,7 @@ from dashscope.audio.qwen_omni import (
 from ali_client import AliyunError
 from omni_client import load_omni_config
 from pipeline.voice_control.student_intent import student_prompt, parse_student_intent
+from pipeline.voice_control.teacher_intent import teacher_prompt, parse_teacher_intent
 
 
 SUPPORTED_INTENTS = {
@@ -237,6 +238,7 @@ def classify_audio_intent(
 ) -> dict[str, Any]:
     ctx = (context or "").strip()
     is_student = ctx.startswith("student_")
+    is_teacher_direct = ctx == "teacher_direct"
     is_teacher_sleep = ctx == "teacher_sleep"
     is_sleep_mode = ctx in {"sleep", "teacher_sleep"}
     is_experiment_setup = ctx == "experiment_setup"
@@ -250,6 +252,8 @@ def classify_audio_intent(
     print(f"\n[voice_intent] === 开始处理 === mode={mode_name}, audio_size={len(audio_bytes)} bytes")
 
     if not audio_bytes:
+        if is_teacher_direct:
+            return parse_teacher_intent("", "", recording_state)
         if is_student:
             return parse_student_intent("", "", ctx, recording_state)
         print(f"[voice_intent] 音频为空，返回默认结果")
@@ -278,7 +282,9 @@ def classify_audio_intent(
     # Keep passive states narrow at both session and response levels. Otherwise
     # the model still sees the full awake intent list and may emit unrelated
     # intents such as qa while a video is playing.
-    if is_student:
+    if is_teacher_direct:
+        system_prompt = teacher_prompt(recording_state)
+    elif is_student:
         system_prompt = student_prompt(ctx, recording_state, recent_dialogue, demo_options or "")
     elif is_teacher_sleep:
         system_prompt = TEACHER_SLEEP_MODE_PROMPT
@@ -322,7 +328,7 @@ def classify_audio_intent(
 
         model_started_at = time.perf_counter()
         conv.create_response(
-            instructions=system_prompt if is_student else _build_response_instruction(
+            instructions=system_prompt if is_student or is_teacher_direct else _build_response_instruction(
                 ctx,
                 is_sleep_mode=is_sleep_mode,
                 demo_options=demo_options,
@@ -372,7 +378,9 @@ def classify_audio_intent(
         print(f"[voice_intent] Omni 转写: {callback.transcript!r}")
         print(f"[voice_intent] Omni 回复: {callback.answer_text!r}")
 
-        if is_student:
+        if is_teacher_direct:
+            result = parse_teacher_intent(callback.answer_text, callback.transcript, recording_state)
+        elif is_student:
             result = parse_student_intent(callback.answer_text, callback.transcript, ctx, recording_state)
         elif is_teacher_sleep:
             result = quick_teacher_result or _parse_teacher_wake_json(

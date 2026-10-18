@@ -182,3 +182,13 @@ docker compose logs --tail=100 chemistry-api
 2026-10-16 已上线教师、学生 2.1（versionCode=3）。`GET /api/glasses/updates/teacher` 或 `/student` 返回版本、包名、摘要和下载地址；APK 保存在 `runtime_assets/app_updates/<角色>/<角色>-<版本号>.apk`，对应 `latest.json`。只提供查询和下载，不开放上传接口。
 
 发布新版先上传保持原签名、递增版本号的 APK，核对摘要后替换 latest.json。字段为 package_name、version_code、version_name、sha256、size_bytes、notes，download_url 由接口生成。教师和学生分开发布，不触及身份库和录制资料。
+
+2026-10-18 本地准备 2.2（versionCode=4）：两版单击镜腿直接拍照，教师不再单独唤醒；教师语音按语句一次判断固定动作。旧 2.1 的语音接口继续兼容。先按上文部署新的 `code_deploy.zip`，确认健康接口已有 `teacher_direct_control`，再上传 `release/服务器部署/glasses-update-2.2.zip` 并发布：
+
+```bash
+cd /projects/chemistry-glasses
+unzip glasses-update-2.2.zip -d /tmp
+sudo python3 /tmp/glasses-update-2.2/publish_app_updates.py
+```
+
+发布脚本仅写入 `runtime_assets/app_updates/teacher/` 与 `student/` 的新版 APK、latest.json，不删除旧版，不触碰其他数据。APK 单独发布，不混进受保护的 `code_deploy.zip`。已装带更新功能的 2.1 联网版可重新打开助手，选择“立即更新”，下载后按系统提示安装；也可在空闲时长按镜腿检查。USB 测试包不走在线更新。本地打包不代表已经发布到服务器。

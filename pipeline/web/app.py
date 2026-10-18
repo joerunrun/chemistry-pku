@@ -2565,6 +2565,7 @@ def glasses_health():
             "qa_audio",
             "voice_intent",
             "student_direct_control",
+            "teacher_direct_control",
             "tts_audio",
             "demo_video",
             "teacher_speaker_verify",
