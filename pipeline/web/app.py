@@ -2569,7 +2569,6 @@ def glasses_health():
             "student_direct_control",
             "teacher_direct_control",
             "voice_feedback",
-            "voice_feedback",
             "tts_audio",
             "demo_video",
             "teacher_speaker_verify",
