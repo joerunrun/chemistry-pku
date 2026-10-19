@@ -15,7 +15,7 @@ import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import java.io.File
 
-internal enum class StudentRecordState { IDLE, STARTING_AUDIO, STARTING_VIDEO, AUDIO_RECORDING, VIDEO_RECORDING, STOPPING }
+internal enum class StudentRecordState { IDLE, STARTING_AUDIO, STARTING_VIDEO, AUDIO_RECORDING, VIDEO_RECORDING, FEEDBACK_RECORDING, STOPPING }
 
 class RecordingService : LifecycleService() {
     companion object {
@@ -41,10 +41,15 @@ class RecordingService : LifecycleService() {
     private var lastStatus = "未记录"
     private val handler = Handler(Looper.getMainLooper())
     private val studentStore by lazy {
-        StudentRecordStore(this) { id, uploaded -> handler.post { onStudentPhotoUpload?.invoke(id, uploaded) } }
+        StudentRecordStore(this,
+            onPhotoUpload = { id, uploaded -> handler.post { onStudentPhotoUpload?.invoke(id, uploaded) } },
+            onFeedbackUpload = { id, uploaded -> handler.post { onFeedbackUpload?.invoke(id, uploaded) } },
+        )
     }
     private var studentAudio: StudentAudioCapture? = null
     private var studentDir: File? = null
+    internal var feedbackRecordId: String? = null
+        private set
     private var studentShutdownRequested = false
     private var studentRecovered = false
     internal var studentState = StudentRecordState.IDLE
@@ -53,6 +58,7 @@ class RecordingService : LifecycleService() {
     internal var onStudentState: ((StudentRecordState, String) -> Unit)? = null
     internal var onStudentError: ((String) -> Unit)? = null
     internal var onStudentPhotoUpload: ((String, Boolean) -> Unit)? = null
+    internal var onFeedbackUpload: ((String, Boolean) -> Unit)? = null
     internal var acceptStudentCommands: Boolean
         get() = studentAudio?.acceptCommands == true
         set(value) { studentAudio?.acceptCommands = value }
@@ -63,7 +69,7 @@ class RecordingService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         cameraSessionManager = CameraSessionManager(this, this) { status ->
-            if (studentAudio == null || studentState !in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.STOPPING)) lastStatus = status
+            if (studentAudio == null || studentState !in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.FEEDBACK_RECORDING, StudentRecordState.STOPPING)) lastStatus = status
             if (studentAudio != null && studentState == StudentRecordState.STARTING_VIDEO) {
                 if (status == "记录中") {
                     val dir = studentDir!!
@@ -142,10 +148,11 @@ class RecordingService : LifecycleService() {
         return true
     }
 
-    internal fun startStudentRecording(video: Boolean, baseUrl: String, experiment: String, source: StudentUtterance?): Boolean {
+    internal fun startStudentRecording(video: Boolean, baseUrl: String, experiment: String, source: StudentUtterance?, feedback: Boolean = false): Boolean {
         if (studentState != StudentRecordState.IDLE || !startStudentSession()) return false
-        val dir = studentStore.create(if (video) "video" else "audio", baseUrl, DeviceIdentity.hardwareId(this), experiment)
+        val dir = studentStore.create(if (feedback) "feedback" else if (video) "video" else "audio", baseUrl, DeviceIdentity.hardwareId(this), experiment)
         studentDir = dir
+        if (feedback) feedbackRecordId = dir.name
         setStudentState(if (video) StudentRecordState.STARTING_VIDEO else StudentRecordState.STARTING_AUDIO, "记录准备中")
         try {
             if (video) {
@@ -156,7 +163,8 @@ class RecordingService : LifecycleService() {
             } else {
                 check(studentAudio!!.beginArchive(File(dir, "record_audio.wav"), source)) { "无法开始录音" }
                 studentStore.markStarted(dir, System.currentTimeMillis() - studentAudio!!.archiveLeadInMs)
-                setStudentState(StudentRecordState.AUDIO_RECORDING, "录音中")
+                setStudentState(if (feedback) StudentRecordState.FEEDBACK_RECORDING else StudentRecordState.AUDIO_RECORDING,
+                    if (feedback) "反馈收集中" else "录音中")
             }
             return true
         } catch (error: Exception) {
@@ -173,6 +181,7 @@ class RecordingService : LifecycleService() {
         val dir = studentDir ?: return
         if (studentState == StudentRecordState.STOPPING) return
         val video = studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING)
+        val feedback = studentState == StudentRecordState.FEEDBACK_RECORDING
         setStudentState(StudentRecordState.STOPPING, "正在保存记录")
         val endedAt = UploadMetadata.nowIso()
         val audio = studentAudio?.endArchive() ?: File(dir, "record_audio.wav").takeIf { it.length() > 44 }
@@ -195,6 +204,7 @@ class RecordingService : LifecycleService() {
                     setStudentState(StudentRecordState.IDLE, when {
                         persisted.isFailure -> "文件已保留，保存清单失败"
                         !saved -> "没有可保存的记录"
+                        feedback -> "反馈已保存，等待上传"
                         separateAudio -> "已保存在眼镜上，视频音轨分开保存"
                         else -> "已保存在眼镜上，等待上传"
                     })
@@ -221,6 +231,7 @@ class RecordingService : LifecycleService() {
         studentAudio = null
         onStudentUtterance = null
         onStudentPhotoUpload = null
+        onFeedbackUpload = null
         handler.removeCallbacks(retryStudentUploads)
         cameraSessionManager.shutdown()
         stopSelf()

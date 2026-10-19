@@ -57,7 +57,7 @@ class TeacherActivity : AppCompatActivity() {
     private var utteranceEpoch = -1
 
     // 指令状态
-    private enum class TeacherState { LISTENING, INSTRUCTION, RECORDING }
+    private enum class TeacherState { LISTENING, INSTRUCTION, RECORDING, FEEDBACK }
     private var teacherState = TeacherState.LISTENING
     private val operationToken = java.util.concurrent.atomic.AtomicInteger(0)
     private val voiceEpoch = VoiceEpoch()
@@ -71,6 +71,21 @@ class TeacherActivity : AppCompatActivity() {
     private var continuousRestartAttempts = 0
     private var videoRecordingActive = false
     private var videoStartedAt: String? = null
+    private var feedbackResultId: String? = null
+    private var feedbackSubmissionText = "反馈已保存，等待上传"
+    private val feedbackCapture by lazy {
+        FeedbackAudioCapture(this) { id, uploaded ->
+            mainHandler.post {
+                if (!teacherExitInProgress && id == feedbackResultId) {
+                    feedbackSubmissionText = if (uploaded) "反馈已提交" else "反馈已保存在眼镜，等待联网提交"
+                    if (teacherState == TeacherState.LISTENING) {
+                        showFeedbackStatus(feedbackSubmissionText)
+                        mainHandler.postDelayed({ if (teacherState == TeacherState.LISTENING) hideAllViews() }, 4_000L)
+                    }
+                }
+            }
+        }
+    }
     private val templeSingleTapRunnable = Runnable {
         lastTempleKeyTapAt = 0L
         handleTempleSingleTap()
@@ -223,6 +238,7 @@ class TeacherActivity : AppCompatActivity() {
     private fun exitTeacherApp(forUpdate: Boolean = false) {
         if (teacherExitInProgress) return
         teacherExitInProgress = true
+        feedbackCapture.close()
         mainHandler.removeCallbacks(templeSingleTapRunnable)
         advanceVoiceEpoch()
         operationToken.incrementAndGet()
@@ -272,6 +288,16 @@ class TeacherActivity : AppCompatActivity() {
                 R.id.demo_video_view, R.id.progress, R.id.thinking_text,
                 R.id.status_text, R.id.result_text,
             ).forEach { v -> panel.findViewById<View>(v)?.visibility = View.GONE }
+        }
+    }
+
+    private fun showFeedbackStatus(text: String) {
+        hideAllViews()
+        listOf(R.id.left_eye_panel, R.id.right_eye_panel).forEach { id ->
+            findViewById<View>(id).findViewById<android.widget.TextView>(R.id.status_text).apply {
+                this.text = text
+                visibility = View.VISIBLE
+            }
         }
     }
 
@@ -352,6 +378,7 @@ class TeacherActivity : AppCompatActivity() {
     private fun startTeacherSession() {
         if (!teacherConnectionReady || teacherSessionStarted) return
         teacherSessionStarted = true
+        feedbackCapture
         startForegroundService(
             this,
             Intent(this, RecordingService::class.java)
@@ -406,8 +433,9 @@ class TeacherActivity : AppCompatActivity() {
                         ) {
                             val read = recorder.read(buffer, 0, buffer.size)
                             if (read > 0) {
-                                val pcm = writePcm16(output, buffer, read)
+                                val pcm = writePcm16(output, buffer, read, archive = !feedbackCapture.active)
                                 continuousTotalSamples += read
+                                if (!voiceRecognitionPaused && activePlayer == null) feedbackCapture.append(pcm)
                                 detectTeacherSpeech(pcm)
                             }
                         }
@@ -471,13 +499,19 @@ class TeacherActivity : AppCompatActivity() {
     private fun voiceContextForCurrentState(): String? =
         if (teacherState == TeacherState.INSTRUCTION) null else "teacher_direct"
 
+    private fun recordingStateValue(): String = when {
+        feedbackCapture.active -> "FEEDBACK_RECORDING"
+        videoRecordingActive -> "VIDEO_RECORDING"
+        else -> "IDLE"
+    }
+
     private fun enqueueVoiceWindow(pcm: ByteArray) {
         val window = TeacherVoiceWindow(
             epoch = voiceEpoch.current(),
             sequence = voiceRequestSequence.incrementAndGet(),
             context = "teacher_direct",
             pcm = pcm,
-            recordingState = if (videoRecordingActive) "VIDEO_RECORDING" else "IDLE",
+            recordingState = recordingStateValue(),
         )
         voiceWindowLimiter.offer(window)?.let(::submitVoiceWindow)
     }
@@ -526,7 +560,7 @@ class TeacherActivity : AppCompatActivity() {
 
     private fun isCurrentVoiceWindow(window: TeacherVoiceWindow): Boolean {
         return !teacherExitInProgress && voiceEpoch.accepts(window.epoch) &&
-            voiceContextForCurrentState() == window.context
+            voiceContextForCurrentState() == window.context && recordingStateValue() == window.recordingState
     }
 
     private fun advanceVoiceEpoch(): Int {
@@ -568,10 +602,13 @@ class TeacherActivity : AppCompatActivity() {
 
     private fun handleInstructionIntent(json: org.json.JSONObject) {
         val intent = json.optString("intent", "unclear")
-        if (intent !in setOf("capture_photo", "start_recording", "stop_recording")) {
+        if (intent !in setOf("capture_photo", "start_recording", "stop_recording", "start_feedback", "stop_feedback")) {
             return
         }
         if (teacherExitInProgress || teacherState == TeacherState.INSTRUCTION) return
+        if (feedbackCapture.active && intent != "stop_feedback") return
+        if (videoRecordingActive && intent != "stop_recording") return
+        if (intent == "stop_feedback" && !feedbackCapture.active) return
         if (intent == "start_recording" && videoRecordingActive) return
         if (intent == "stop_recording" && !videoRecordingActive) return
         hideAllViews()
@@ -579,6 +616,22 @@ class TeacherActivity : AppCompatActivity() {
         advanceVoiceEpoch()
         val actionToken = operationToken.incrementAndGet()
         when (intent) {
+            "start_feedback" -> {
+                teacherState = TeacherState.INSTRUCTION
+                feedbackResultId = null
+                feedbackCapture.start(baseUrl, teacherDeviceId)
+                playPrompt("feedback_start") { resumeListening(actionToken) }
+            }
+            "stop_feedback" -> {
+                teacherState = TeacherState.INSTRUCTION
+                feedbackSubmissionText = "反馈已保存，等待上传"
+                feedbackResultId = feedbackCapture.finish()
+                playPrompt("feedback_stop") {
+                    resumeListening(actionToken)
+                    showFeedbackStatus(feedbackSubmissionText)
+                    mainHandler.postDelayed({ if (teacherState == TeacherState.LISTENING) hideAllViews() }, 4_000L)
+                }
+            }
             "capture_photo" -> {
                 teacherState = TeacherState.INSTRUCTION
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -638,7 +691,12 @@ class TeacherActivity : AppCompatActivity() {
         if (teacherExitInProgress) return
         if (expectedToken != null && operationToken.get() != expectedToken) return
         hideAllViews()
-        teacherState = if (videoRecordingActive) TeacherState.RECORDING else TeacherState.LISTENING
+        teacherState = when {
+            feedbackCapture.active -> TeacherState.FEEDBACK
+            videoRecordingActive -> TeacherState.RECORDING
+            else -> TeacherState.LISTENING
+        }
+        if (teacherState == TeacherState.FEEDBACK) showFeedbackStatus("反馈收集中")
         voiceRecognitionPaused = false
         advanceVoiceEpoch()
         if (!continuousRunning) startContinuousRecording()
@@ -770,6 +828,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        feedbackCapture.close()
         mainHandler.removeCallbacks(templeSingleTapRunnable)
         advanceVoiceEpoch()
         voiceExecutor.shutdownNow()
@@ -847,14 +906,15 @@ class TeacherActivity : AppCompatActivity() {
         private const val SERVICE_WAIT_TIMEOUT_MS = 5_000L
         private const val DOUBLE_TAP_WINDOW_MS = 500L
 
-        private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int): ByteArray {
+        private fun writePcm16(output: FileOutputStream, buffer: ShortArray, count: Int, archive: Boolean): ByteArray {
             val bytes = ByteArray(count * 2)
             for (i in 0 until count) {
                 val value = buffer[i].toInt()
                 bytes[i * 2] = (value and 0xff).toByte()
                 bytes[i * 2 + 1] = ((value shr 8) and 0xff).toByte()
             }
-            output.write(bytes)
+            // Keep the lesson timeline, but put feedback speech only in its own recording.
+            output.write(if (archive) bytes else ByteArray(bytes.size))
             return bytes
         }
         private fun writeWavHeader(output: FileOutputStream, samples: Int) = output.write(buildWavHeader(samples))

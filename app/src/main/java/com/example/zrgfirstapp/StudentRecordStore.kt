@@ -13,7 +13,11 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Durable files and one small retry queue. A receipt is saved before local media is removed. */
-internal class StudentRecordStore(context: Context, private val onPhotoUpload: (String, Boolean) -> Unit = { _, _ -> }) {
+internal class StudentRecordStore(
+    context: Context,
+    private val onPhotoUpload: (String, Boolean) -> Unit = { _, _ -> },
+    private val onFeedbackUpload: (String, Boolean) -> Unit = { _, _ -> },
+) {
     private val root = File(context.filesDir, "student_records").apply { mkdirs() }
     private val uploading = AtomicBoolean(false)
 
@@ -21,7 +25,8 @@ internal class StudentRecordStore(context: Context, private val onPhotoUpload: (
         val id = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date()) + "_" + UUID.randomUUID().toString().replace("-", "")
         val dir = File(root, id).apply { mkdirs() }
         write(dir, JSONObject().put("client_record_id", id).put("kind", kind).put("base_url", baseUrl)
-            .put("device_id", device).put("experiment_type", experiment).put("started_at", UploadMetadata.nowIso()).put("state", "recording"))
+            .put("device_id", device).put("role", BuildConfig.APP_MODE).put("experiment_type", experiment)
+            .put("started_at", UploadMetadata.nowIso()).put("state", "recording"))
         return dir
     }
 
@@ -67,6 +72,7 @@ internal class StudentRecordStore(context: Context, private val onPhotoUpload: (
                     catch (error: Exception) {
                         runCatching { write(dir, job.put("last_error", (error.message ?: "upload failed").take(200))) }
                         if (job.has("photo")) onPhotoUpload(dir.name, false)
+                        if (job.optString("kind") == "feedback") onFeedbackUpload(dir.name, false)
                     }
                 }
             } finally { uploading.set(false) }
@@ -75,7 +81,12 @@ internal class StudentRecordStore(context: Context, private val onPhotoUpload: (
 
     private fun upload(dir: File, job: JSONObject) {
         val photo = job.has("photo")
-        val path = if (photo) "/api/glasses/photos/upload" else "/api/glasses/records/upload"
+        val feedback = job.optString("kind") == "feedback"
+        val path = when {
+            feedback -> "/api/glasses/feedback/upload"
+            photo -> "/api/glasses/photos/upload"
+            else -> "/api/glasses/records/upload"
+        }
         val connection = URL(job.getString("base_url") + path).openConnection() as HttpURLConnection
         try {
             val boundary = "ChemStudent${UUID.randomUUID()}"
@@ -86,7 +97,7 @@ internal class StudentRecordStore(context: Context, private val onPhotoUpload: (
             connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
             connection.setChunkedStreamingMode(64 * 1024)
             DataOutputStream(connection.outputStream).use { out ->
-                val fields = listOf("client_record_id", "device_id", "experiment_type", "started_at", "ended_at")
+                val fields = listOf("client_record_id", "device_id", "role", "experiment_type", "started_at", "ended_at")
                 for (name in fields) {
                     out.writeBytes("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n")
                     out.write(job.optString(name).toByteArray(Charsets.UTF_8)); out.writeBytes("\r\n")
@@ -108,10 +119,11 @@ internal class StudentRecordStore(context: Context, private val onPhotoUpload: (
             check(connection.responseCode in 200..299) { "HTTP ${connection.responseCode}" }
             val receipt = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
             check(receipt.optString("status") == "ok") { "Missing upload receipt" }
-            val objectName = if (photo) "photo" else "record"
-            check(receipt.optJSONObject(objectName)?.optString(if (photo) "photo_id" else "record_id").orEmpty().isNotBlank())
+            val objectName = when { feedback -> "feedback"; photo -> "photo"; else -> "record" }
+            check(receipt.optJSONObject(objectName)?.optString("${objectName}_id").orEmpty().isNotBlank())
             write(dir, job.put("state", "uploaded").put("receipt", receipt))
             if (photo) onPhotoUpload(dir.name, true)
+            if (feedback) onFeedbackUpload(dir.name, true)
             dir.listFiles().orEmpty().filter { it.extension in setOf("wav", "mp4", "m4a", "jpg") }.forEach { it.delete() }
         } finally { connection.disconnect() }
     }

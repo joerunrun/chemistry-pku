@@ -24,7 +24,7 @@ for role, label in (("teacher", "教师"), ("student", "学生")):
         "package_name": build["applicationId"], "version_code": element["versionCode"],
         "version_name": element["versionName"], "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
         "size_bytes": apk.stat().st_size,
-        "notes": "单击拍照后语音提示拍照完成；教师语音直接执行，无须单独唤醒。" if role == "teacher" else "拍照后播放提示音，上传成功显示照片已上传；录音、录像提示音分别播报。",
+        "notes": "新增开始、结束语音反馈；录音、录像、反馈期间只响应各自的结束指令，单击镜腿不切换功能。",
     }
 version = str(metadata["teacher"]["version_name"]).removesuffix("-teacher")
 name = f"glasses-update-{version}"

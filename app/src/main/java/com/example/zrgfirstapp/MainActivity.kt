@@ -164,6 +164,7 @@ class MainActivity : AppCompatActivity() {
     private var serviceBound = false
     private var serviceBindRequested = false
     private var studentQuestionPending = false
+    private var feedbackResultId: String? = null
     private var studentCommandsEnabled = false
     private var studentRequestInFlight = false
     private val studentPendingUtterances = java.util.ArrayDeque<StudentUtterance>()
@@ -216,6 +217,12 @@ class MainActivity : AppCompatActivity() {
             recordingRequested = service.studentState != StudentRecordState.IDLE
             recordingVideo = service.studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING)
             service.onStudentUtterance = { acceptStudentUtterance(it) }
+            service.onFeedbackUpload = { id, uploaded ->
+                if (studentForeground && id == feedbackResultId && screenState == ScreenState.RESULT && activeTaskTitle == "意见反馈") {
+                    lastResultText = if (uploaded) "反馈已提交" else "反馈已保存在眼镜，等待联网提交"
+                    renderScreen()
+                }
+            }
             service.onStudentPhotoUpload = { id, uploaded ->
                 if (studentForeground && photoResult == (id to operationToken) && screenState == ScreenState.RESULT) {
                     lastResultText = if (uploaded) "照片已上传" else "上传未完成，将自动重试"
@@ -233,8 +240,12 @@ class MainActivity : AppCompatActivity() {
                 recordingStatusText = status
                 if (studentForeground) {
                     renderScreen()
-                    if (wasPreparing && state in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING)) {
-                        val prompt = if (state == StudentRecordState.VIDEO_RECORDING) "student_video_start" else "student_audio_start"
+                    if (wasPreparing && state in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING, StudentRecordState.FEEDBACK_RECORDING)) {
+                        val prompt = when (state) {
+                            StudentRecordState.FEEDBACK_RECORDING -> "feedback_start"
+                            StudentRecordState.VIDEO_RECORDING -> "student_video_start"
+                            else -> "student_audio_start"
+                        }
                         playPrompt(prompt) { startVoiceIntentLoop() }
                     }
                 }
@@ -530,8 +541,9 @@ class MainActivity : AppCompatActivity() {
             panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
             panel.detectionOverlay.clearBoxes()
-            panel.statusText.visibility = View.GONE
-            panel.statusText.text = ""
+            val feedback = recordingService?.studentState == StudentRecordState.FEEDBACK_RECORDING
+            panel.statusText.visibility = if (feedback) View.VISIBLE else View.GONE
+            panel.statusText.text = if (feedback) "反馈收集中" else ""
             panel.resultText.text = ""
             panel.resultText.visibility = View.GONE
         }
@@ -1014,7 +1026,7 @@ class MainActivity : AppCompatActivity() {
                     "model" to "qwen3.5-omni-flash-realtime",
                 ), "audio", file, "application/octet-stream")
                 runOnUiIfCurrent(token) {
-                    if (studentForeground && state == (recordingService?.studentState?.name ?: "IDLE") &&
+                    if (studentForeground && context == voiceContextValue() && state == (recordingService?.studentState?.name ?: "IDLE") &&
                         json.optString("intent", "no_action") !in setOf("no_action", "unclear", "unknown")) {
                         studentRecentDialogue = json.optString("transcript").take(700)
                         studentDialogueUntil = System.currentTimeMillis() + 10_000L
@@ -1099,7 +1111,15 @@ class MainActivity : AppCompatActivity() {
     private fun handleStudentIntent(json: JSONObject, context: String, passiveMode: PassiveListenMode) {
         val intent = json.optString("intent", "no_action")
         if (intent in setOf("no_action", "unclear", "unknown")) return
-        if (recordingRequested && !screenState.allowsVoiceIntent() && intent != "stop_recording") return
+        val state = recordingService?.studentState ?: StudentRecordState.IDLE
+        if (state != StudentRecordState.IDLE) {
+            val allowed = when (state) {
+                StudentRecordState.FEEDBACK_RECORDING -> "stop_feedback"
+                StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING -> "stop_recording"
+                else -> "no_action"
+            }
+            if (intent != allowed) return
+        }
         val slots = json.optJSONObject("slots")
 
         if (passiveMode == PassiveListenMode.DEMO_STOP) {
@@ -1119,6 +1139,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         when (intent) {
+            "start_feedback" -> startStudentRecord(video = false, feedback = true)
+            "stop_feedback" -> stopRecordingService(announce = true, returnToLive = true)
             "start_audio_recording", "start_recording" -> {
                 startVoiceIntentLoop()
                 ensureAudioRecordingPermissions()
@@ -1552,20 +1574,20 @@ class MainActivity : AppCompatActivity() {
     private fun startAudioRecordingService() { startStudentRecord(false) }
     private fun startVideoRecordingService() { startStudentRecord(true) }
 
-    private fun startStudentRecord(video: Boolean) {
+    private fun startStudentRecord(video: Boolean, feedback: Boolean = false) {
         if (recordingRequested || recordingService?.studentState?.let { it != StudentRecordState.IDLE } == true) return
         operationToken += 1
         passiveListenMode = PassiveListenMode.NONE
         recordingRequested = true
         recordingVideo = video
-        recordingStatusText = if (video) "录像准备中" else "录音准备中"
+        recordingStatusText = if (feedback) "反馈准备中" else if (video) "录像准备中" else "录音准备中"
         screenState = ScreenState.LIVE_MINIMAL
         renderScreen()
-        val source = studentCommandSource
+        val source = if (feedback) null else studentCommandSource
         ContextCompat.startForegroundService(this, Intent(this, RecordingService::class.java)
             .setAction(RecordingService.ACTION_START_STUDENT_SESSION))
         withRecordingService { service ->
-            val started = service.startStudentRecording(video, baseUrl, "unknown_experiment", source)
+            val started = service.startStudentRecording(video, baseUrl, "unknown_experiment", source, feedback = feedback)
             if (!started) {
                 recordingRequested = false
                 recordingVideo = false
@@ -1580,14 +1602,22 @@ class MainActivity : AppCompatActivity() {
     private fun stopRecordingService(announce: Boolean = false, returnToLive: Boolean = false) {
         val service = recordingService ?: return
         if (service.studentState in setOf(StudentRecordState.IDLE, StudentRecordState.STOPPING)) return
-        val prompt = if (service.studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING))
-            "student_video_stop" else "student_audio_stop"
+        val feedback = service.studentState == StudentRecordState.FEEDBACK_RECORDING
+        val prompt = when {
+            feedback -> "feedback_stop"
+            service.studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING) -> "student_video_stop"
+            else -> "student_audio_stop"
+        }
+        if (feedback) feedbackResultId = service.feedbackRecordId
         operationToken += 1
         studentPendingUtterances.clear()
         passiveListenMode = PassiveListenMode.NONE
         service.stopStudentRecording {
             if (studentForeground) {
-                if (returnToLive) enterLiveMinimal()
+                if (returnToLive && feedback) {
+                    activeTaskTitle = "意见反馈"
+                    showResult("反馈已保存，等待上传", "反馈收集结束")
+                } else if (returnToLive) enterLiveMinimal()
                 if (announce) playPrompt(prompt) { startVoiceIntentLoop() }
             }
         }
@@ -1668,6 +1698,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestPhoto() {
+        if (recordingRequested || screenState in setOf(ScreenState.DEMO_SELECT, ScreenState.DEMO_PLAYING)) return
         if (screenState in setOf(ScreenState.CAPTURE_COUNTDOWN, ScreenState.RUNNING)) return
         if (screenState == ScreenState.DEMO_PLAYING) stopDemoPlayback()
         startCaptureCountdown(photoOnly = true)
@@ -2105,6 +2136,7 @@ class MainActivity : AppCompatActivity() {
         recordingService?.onStudentState = null
         recordingService?.onStudentError = null
         recordingService?.onStudentPhotoUpload = null
+        recordingService?.onFeedbackUpload = null
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
