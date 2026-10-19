@@ -26,6 +26,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_code_zip.ps1
 - 代码目录、`.env`、`runtime_assets/`
 - 对外开放 TCP 80
 
+## 老师补充的实验纠错材料
+
+学生纠错继续检索外部知识库，同时按现场观察匹配老师材料。规则、关键词和 PDF 页码在 `pipeline/qa/teacher_materials.json`，图片在 `runtime_assets/knowledge_supplements/organic_apparatus/`。每次最多附两张参考图，仍是两次模型调用；过滤、萃取没有对应示例图时只附文字。保留“强制／建议”和院系适用范围，不把老师错误示例当作现场问题。
+
+原 PDF 保存在 `runtime_assets/knowledge_supplements/有机实验-实验装置识别要点.pdf`。本地准备图片及单独的资源包（仅准备材料的电脑需要安装 PyMuPDF，服务器无需安装）：
+
+```powershell
+python -m pipeline.tools.prepare_teacher_materials --bundle knowledge_supplements_deploy.zip
+```
+
+`code_deploy.zip` 继续排除所有 `runtime_assets/`。这次部署额外上传 `knowledge_supplements_deploy.zip`，它只含六张参考图片（约 0.5 MB），在服务器项目根目录解压：
+
+```bash
+cd /projects/chemistry-glasses
+python3 -m zipfile -e knowledge_supplements_deploy.zip .
+```
+
+然后按原流程安全更新代码、重建 `chemistry-api`。没有数据库迁移，不修改用户记录、绑定或 `.env`；眼镜无需更新 APK。以后收到不同 PDF，先整理规则与图片索引，再运行准备工具，不会自动导入目录内任意文件。
+
 ## 首次部署
 
 ```bash
