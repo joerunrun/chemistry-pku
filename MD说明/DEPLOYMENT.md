@@ -45,6 +45,8 @@ python3 -m zipfile -e knowledge_supplements_deploy.zip .
 
 然后按原流程安全更新代码、重建 `chemistry-api`。没有数据库迁移，不修改用户记录、绑定或 `.env`；眼镜无需更新 APK。以后收到不同 PDF，先整理规则与图片索引，再运行准备工具，不会自动导入目录内任意文件。
 
+2026-10-19 已部署至 `.134`（代码提交 `73c49cf`）：老师材料的六类规则和六张参考图片已启用。沿用安全解压的 `--no-backup`，仅重建 `chemistry-api`；图片单独写入 `knowledge_supplements/organic_apparatus/`。健康、登录、材料匹配、图片编码及两版 APK 更新接口检查通过。原有 10 条眼镜绑定、705 批归属、1391 条归属明细逐条核对保留，媒体资料未减少，`.env` 未改，其他服务保持运行。APK 仍为 2.3（versionCode=5），无需重装。
+
 ## 首次部署
 
 ```bash
