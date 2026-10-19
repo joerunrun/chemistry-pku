@@ -199,3 +199,5 @@ D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SE
 运行 `./gradlew.bat -PteacherUsb -PstudentUsb :app:assembleTeacherDebug :app:assembleStudentDebug`。两版复用正式包名覆盖安装，保留数据，版本名带 `-usb`，跳过在线更新，只访问眼镜 `127.0.0.1:5080`。本机启动 Python 后端 5080 后运行 `adb reverse tcp:5080 tcp:5080`；也可将眼镜 5080 转发到已启动的 Docker 5081。测试包放在 `release/本地USB测试_2.2/`，正式安装包和在线发布包保持分开。恢复正式版时，重新安装 release 的联网 APK 即可。
 
 学生版录制提示音分别为“开始录音／结束录音”和“开始录制视频／结束录制视频”，使用四个内置音频，开始成功及结束保存后播放。上传进度继续显示文字；问答仍仅显示文字，不自动朗读。
+
+2.3（versionCode 5）：学生单击和语音“拍照”统一进入 `requestPhoto()`，共用开始提示、倒计时、拍照、保存及上传流程。拍照成功播放内置“拍照完成”，先显示“照片上传中”，收到真实上传回执后显示“照片已上传”；未上传成功则提示自动重试。教师单击和语音拍照也共用原动作入口，成功后补充完成提示音。旧上传失败资料继续保留并重试，问答仍只显示文字。

@@ -40,7 +40,9 @@ class RecordingService : LifecycleService() {
     private var teacherSessionActive = false
     private var lastStatus = "未记录"
     private val handler = Handler(Looper.getMainLooper())
-    private val studentStore by lazy { StudentRecordStore(this) }
+    private val studentStore by lazy {
+        StudentRecordStore(this) { id, uploaded -> handler.post { onStudentPhotoUpload?.invoke(id, uploaded) } }
+    }
     private var studentAudio: StudentAudioCapture? = null
     private var studentDir: File? = null
     private var studentShutdownRequested = false
@@ -50,6 +52,7 @@ class RecordingService : LifecycleService() {
     internal var onStudentUtterance: ((StudentUtterance) -> Unit)? = null
     internal var onStudentState: ((StudentRecordState, String) -> Unit)? = null
     internal var onStudentError: ((String) -> Unit)? = null
+    internal var onStudentPhotoUpload: ((String, Boolean) -> Unit)? = null
     internal var acceptStudentCommands: Boolean
         get() = studentAudio?.acceptCommands == true
         set(value) { studentAudio?.acceptCommands = value }
@@ -203,11 +206,11 @@ class RecordingService : LifecycleService() {
         if (video) cameraSessionManager.stopRecording { finish(it) } else finish(emptyList())
     }
 
-    internal fun saveStudentPhoto(file: File, baseUrl: String, experiment: String) {
+    internal fun saveStudentPhoto(file: File, baseUrl: String, experiment: String, onQueued: (String) -> Unit) {
         val dir = studentStore.create("photo", baseUrl, DeviceIdentity.hardwareId(this), experiment)
         val saved = File(dir, "photo.jpg")
         file.copyTo(saved, overwrite = true)
-        studentStore.ready(dir, null, null, photo = saved)
+        studentStore.ready(dir, null, null, photo = saved, onQueued = onQueued)
         file.delete()
     }
 
@@ -217,6 +220,7 @@ class RecordingService : LifecycleService() {
         studentAudio?.stop()
         studentAudio = null
         onStudentUtterance = null
+        onStudentPhotoUpload = null
         handler.removeCallbacks(retryStudentUploads)
         cameraSessionManager.shutdown()
         stopSelf()

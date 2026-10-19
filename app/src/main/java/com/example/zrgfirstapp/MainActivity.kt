@@ -144,6 +144,7 @@ class MainActivity : AppCompatActivity() {
     private var shownPreviewDataUrl: String? = null
     private var thinkingFrame = 0
     private var operationToken = 0
+    private var photoResult: Pair<String, Int>? = null
     private var activeTaskTitle = ""
     private var lastStatusText = "前后滑动选择，单击确认"
     private var lastResultText = ""
@@ -215,6 +216,12 @@ class MainActivity : AppCompatActivity() {
             recordingRequested = service.studentState != StudentRecordState.IDLE
             recordingVideo = service.studentState in setOf(StudentRecordState.STARTING_VIDEO, StudentRecordState.VIDEO_RECORDING)
             service.onStudentUtterance = { acceptStudentUtterance(it) }
+            service.onStudentPhotoUpload = { id, uploaded ->
+                if (studentForeground && photoResult == (id to operationToken) && screenState == ScreenState.RESULT) {
+                    lastResultText = if (uploaded) "照片已上传" else "上传未完成，将自动重试"
+                    renderScreen()
+                }
+            }
             service.onStudentError = { error ->
                 recordingStatusText = error
                 if (studentForeground) showResult(error, "记录异常")
@@ -715,15 +722,12 @@ class MainActivity : AppCompatActivity() {
             ScreenState.VOICE_LISTENING,
             ScreenState.QA_RECORDING,
             ScreenState.RESULT -> {
-                startCaptureCountdown(photoOnly = true, immediate = true)
+                requestPhoto()
             }
 
             ScreenState.CAPTURE_COUNTDOWN -> Unit
 
-            ScreenState.DEMO_PLAYING -> {
-                stopDemoPlayback()
-                startCaptureCountdown(photoOnly = true, immediate = true)
-            }
+            ScreenState.DEMO_PLAYING -> requestPhoto()
 
             ScreenState.RUNNING -> Unit
         }
@@ -1126,9 +1130,7 @@ class MainActivity : AppCompatActivity() {
             "stop_recording" -> {
                 stopRecordingService(announce = true, returnToLive = true)
             }
-            "capture_photo" -> {
-                startCaptureCountdown(photoOnly = true)
-            }
+            "capture_photo" -> requestPhoto()
             "safety_check" -> {
                 selectedMode = Mode.SAFETY
                 startCaptureCountdown()
@@ -1665,9 +1667,15 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun startCaptureCountdown(photoOnly: Boolean = false, checkRequest: String = "", immediate: Boolean = false) {
+    private fun requestPhoto() {
+        if (screenState in setOf(ScreenState.CAPTURE_COUNTDOWN, ScreenState.RUNNING)) return
+        if (screenState == ScreenState.DEMO_PLAYING) stopDemoPlayback()
+        startCaptureCountdown(photoOnly = true)
+    }
+
+    private fun startCaptureCountdown(photoOnly: Boolean = false, checkRequest: String = "") {
         mainHandler.removeCallbacks(actionMenuTimeoutRunnable)
-        if (immediate) stopAssistantAudio()
+        stopAssistantAudio()
         stopVoiceIntentRecording()
         pendingCheckRequest = checkRequest
         standalonePhotoRequested = photoOnly
@@ -1689,10 +1697,6 @@ class MainActivity : AppCompatActivity() {
         lastResultText = "即将自动拍照"
         screenState = ScreenState.CAPTURE_COUNTDOWN
         renderScreen()
-        if (immediate) {
-            startCaptureFlow()
-            return
-        }
         val promptName = when {
             standalonePhotoRequested -> "start_capture"
             selectedMode == Mode.SAFETY -> "start_safety"
@@ -1802,13 +1806,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveStandalonePhoto(file: File) {
+        val token = operationToken
         withRecordingService { service ->
             Thread {
                 try {
-                    service.saveStudentPhoto(file, baseUrl, "unknown_experiment")
-                    runOnUiThread { showResult("照片已保存在眼镜上，等待上传。", "拍照完成") }
+                    service.saveStudentPhoto(file, baseUrl, "unknown_experiment") { id ->
+                        runOnUiIfCurrent(token) {
+                            photoResult = id to token
+                            showResult("照片上传中", "拍照完成")
+                            playPrompt("photo_complete") { startVoiceIntentLoop() }
+                        }
+                    }
                 } catch (error: Exception) {
-                    runOnUiThread { showResult(error.message ?: "照片保存失败", "拍照失败") }
+                    runOnUiIfCurrent(token) { showResult(error.message ?: "照片保存失败", "拍照失败") }
                 }
             }.start()
         }
@@ -2094,6 +2104,7 @@ class MainActivity : AppCompatActivity() {
         recordingService?.onStudentUtterance = null
         recordingService?.onStudentState = null
         recordingService?.onStudentError = null
+        recordingService?.onStudentPhotoUpload = null
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false

@@ -13,7 +13,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Durable files and one small retry queue. A receipt is saved before local media is removed. */
-internal class StudentRecordStore(context: Context) {
+internal class StudentRecordStore(context: Context, private val onPhotoUpload: (String, Boolean) -> Unit = { _, _ -> }) {
     private val root = File(context.filesDir, "student_records").apply { mkdirs() }
     private val uploading = AtomicBoolean(false)
 
@@ -29,13 +29,14 @@ internal class StudentRecordStore(context: Context) {
         write(dir, read(dir).put("started_at", UploadMetadata.isoAt(startedAtMs)))
     }
 
-    fun ready(dir: File, audio: File?, video: File?, photo: File? = null, reason: String = "user", endedAt: String = UploadMetadata.nowIso()) {
+    fun ready(dir: File, audio: File?, video: File?, photo: File? = null, reason: String = "user", endedAt: String = UploadMetadata.nowIso(), onQueued: ((String) -> Unit)? = null) {
         val job = read(dir).put("ended_at", endedAt).put("reason", reason)
         audio?.let { job.put("audio", it.name) }
         video?.let { job.put("video", it.name) }
         photo?.let { job.put("photo", it.name) }
         if (audio == null && video == null && photo == null) job.put("state", "failed")
         else job.put("state", "ready")
+        onQueued?.invoke(dir.name)
         write(dir, job)
         retry()
     }
@@ -65,6 +66,7 @@ internal class StudentRecordStore(context: Context) {
                     try { upload(dir, job) }
                     catch (error: Exception) {
                         runCatching { write(dir, job.put("last_error", (error.message ?: "upload failed").take(200))) }
+                        if (job.has("photo")) onPhotoUpload(dir.name, false)
                     }
                 }
             } finally { uploading.set(false) }
@@ -109,6 +111,7 @@ internal class StudentRecordStore(context: Context) {
             val objectName = if (photo) "photo" else "record"
             check(receipt.optJSONObject(objectName)?.optString(if (photo) "photo_id" else "record_id").orEmpty().isNotBlank())
             write(dir, job.put("state", "uploaded").put("receipt", receipt))
+            if (photo) onPhotoUpload(dir.name, true)
             dir.listFiles().orEmpty().filter { it.extension in setOf("wav", "mp4", "m4a", "jpg") }.forEach { it.delete() }
         } finally { connection.disconnect() }
     }

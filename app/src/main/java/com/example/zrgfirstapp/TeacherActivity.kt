@@ -593,6 +593,7 @@ class TeacherActivity : AppCompatActivity() {
                     fun completeCapture(file: File?, error: Throwable?) {
                         if (!captureCompleted.compareAndSet(false, true)) return
                         if (file != null) {
+                            playPrompt("photo_complete")
                             uploadTeacherPhoto(file)
                         } else {
                             Log.w("TeacherPhoto", "capture failed: ${error?.message}")
