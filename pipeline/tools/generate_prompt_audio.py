@@ -12,6 +12,8 @@ from pipeline.qa.omni_tts import synthesize_text_to_audio
 
 
 PROMPTS = {
+    "feedback_start": "开始收集反馈。",
+    "feedback_stop": "结束收集反馈。",
     "start_experiment_check": "开始实验纠错，请保持画面稳定。",
     "demo_select": "请选择要播放的演示视频。",
     "demo_start": "开始播放演示视频。",

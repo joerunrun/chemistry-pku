@@ -206,7 +206,19 @@
 
   // Shared demo videos and feedback.
   async function loadVideos() { if (!byId('videoExperiment')?.value) return; try { const data = await fetchJson(`/admin/api/demo/videos?experiment_type=${encodeURIComponent(byId('videoExperiment').value)}`); byId('videoList').innerHTML = (data.videos || []).length ? data.videos.map(video => `<article class="item"><b>${esc(video.label || video.filename)}</b><div>${esc(video.experiment_label || video.experiment_type)} · ${size(video.size)}</div><div class="item-links"><a class="button secondary" href="/admin/api/demo/videos/${encodeURIComponent(video.id)}/download">下载</a><button class="danger" data-delete-demo="${esc(video.id)}">删除</button></div></article>`).join('') : '<span class="muted">这个实验还没有演示视频。</span>'; setStatus('videoStatus', `共 ${(data.videos || []).length} 个视频。`); } catch (error) { setStatus('videoStatus', error.message, true); } }
-  async function loadFeedback() { if (!byId('feedbackList')) return; try { const data = await fetchJson('/admin/api/feedback'); byId('feedbackList').innerHTML = (data.feedback || []).length ? data.feedback.map(item => `<article class="item"><b>${esc(item.title)}</b><div>${esc(item.created_at || '')}</div><div>${esc(item.content || '')}</div><div class="item-links"><button class="danger" data-delete-feedback="${esc(item.feedback_id)}">删除</button></div></article>`).join('') : '<span class="muted">还没有意见。</span>'; } catch (error) { setStatus('feedbackStatus', error.message, true); } }
+  async function loadFeedback() {
+    if (!byId('feedbackList')) return;
+    try {
+      const data = await fetchJson('/admin/api/feedback');
+      byId('feedbackList').innerHTML = (data.feedback || []).length ? data.feedback.map(item => {
+        const origin = item.source === 'voice' ? `${item.role === 'teacher' ? '教师' : '学生'} · 眼镜 ${item.glass_number || '未校准'} · ${item.owner_identity_id ? '已关联使用者' : '未归属'}` : '网页文字反馈';
+        const content = item.content || (item.transcription_status === 'failed' ? '转写未完成，可收听原始语音。' : '语音已收到，正在转写……');
+        const audio = item.audio_url ? `<audio controls preload="none" src="${esc(item.audio_url)}"></audio>` : '';
+        return `<article class="item"><b>${esc(item.title)}</b><div>${esc(item.started_at || item.created_at || '')} · ${esc(origin)}</div><div style="white-space:pre-wrap">${esc(content)}</div>${audio}<div class="item-links"><button class="danger" data-delete-feedback="${esc(item.feedback_id)}">删除</button></div></article>`;
+      }).join('') : '<span class="muted">还没有意见。</span>';
+    } catch (error) { setStatus('feedbackStatus', error.message, true); }
+  }
+  tabLoaders.feedback = loadFeedback;
   if (byId('videoForm')) { byId('videoForm').onsubmit = async event => { event.preventDefault(); const file = byId('videoFile').files[0]; if (!file) return; const body = new FormData(); body.append('experiment_type', byId('videoExperiment').value); body.append('video', file); try { await fetchJson('/admin/api/demo/videos', { method: 'POST', body }); byId('videoFile').value = ''; await loadVideos(); } catch (error) { setStatus('videoStatus', error.message, true); } }; byId('refreshVideos').onclick = loadVideos; byId('videoExperiment').onchange = loadVideos; }
   if (byId('feedbackForm')) { byId('feedbackForm').onsubmit = async event => { event.preventDefault(); try { await fetchJson('/admin/api/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: byId('feedbackTitle').value.trim(), content: byId('feedbackContent').value.trim() }) }); byId('feedbackTitle').value = ''; byId('feedbackContent').value = ''; await loadFeedback(); } catch (error) { setStatus('feedbackStatus', error.message, true); } }; byId('refreshFeedback').onclick = loadFeedback; loadFeedback(); }
 

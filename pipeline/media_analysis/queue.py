@@ -129,10 +129,13 @@ class MediaAnalysisQueue:
         audio_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
         audio_format = path.suffix.lower().lstrip(".")
         client = create_vlm(job["provider"], job["model"])
+        instruction = "请准确转写这段音频中的中文内容。只输出转写文本；没有清晰人声则输出：无清晰语音。"
+        if path.name == "feedback_audio.wav":
+            instruction = "准确转写用户的反馈建议，只输出反馈正文。去掉开头和结尾对助手说的开始、结束反馈口令，保留建议原意，不回答问题、不添加建议；没有清晰人声则输出：无清晰语音。"
         text = client.chat([{
             "role": "user",
             "content": [
-                {"type": "text", "text": "请准确转写这段音频中的中文内容。只输出转写文本；没有清晰人声则输出：无清晰语音。"},
+                {"type": "text", "text": instruction},
                 {"type": "input_audio", "input_audio": {"data": audio_b64, "format": audio_format}},
             ],
         }], temperature=0.0)

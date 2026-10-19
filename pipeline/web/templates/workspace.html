@@ -20,8 +20,9 @@
 
   <nav class="tabs" aria-label="工作台功能">
     {% if user %}<button data-tab="overview">概览</button><button data-tab="claims">我的眼镜</button><button data-tab="teacher-media">我的资料</button><button data-tab="teacher-reports">{{ '每日总结' if user.role == 'teacher' else '每日记录' }}</button>{% endif %}
-    {% if user and user.role == 'teacher' %}<button data-tab="student-data">学生数据</button><button data-tab="resources">演示与反馈</button>{% endif %}
-    {% if admin_unlocked %}<button data-tab="admin-devices">眼镜校准</button><button data-tab="admin-identities">身份与角色</button><button data-tab="admin-media">全部资料</button><button data-tab="unassigned">未归属资料</button><button data-tab="resources">演示与反馈</button><button data-tab="admin-tests">测试身份</button>{% endif %}
+    {% if user and user.role == 'teacher' %}<button data-tab="student-data">学生数据</button>{% endif %}
+    {% if (user and user.role == 'teacher') or admin_unlocked %}<button data-tab="resources">演示视频</button><button data-tab="feedback">意见反馈</button>{% endif %}
+    {% if admin_unlocked %}<button data-tab="admin-devices">眼镜校准</button><button data-tab="admin-identities">身份与角色</button><button data-tab="admin-media">全部资料</button><button data-tab="unassigned">未归属资料</button><button data-tab="admin-tests">测试身份</button>{% endif %}
   </nav>
 
   {% if user %}
@@ -82,7 +83,9 @@
   {% if (user and user.role == 'teacher') or admin_unlocked %}
   <section class="panel" data-panel="resources">
     <h2>演示视频</h2><form id="videoForm" class="form-row"><label>实验<select id="videoExperiment"></select></label><input id="videoFile" type="file" accept="video/mp4" required><button>上传视频</button><button id="refreshVideos" class="secondary" type="button">刷新</button></form><div id="videoStatus" class="status"></div><div id="videoList" class="item-list"></div>
-    <h2>意见反馈</h2><form id="feedbackForm"><div class="form-row"><input id="feedbackTitle" maxlength="120" placeholder="标题" required><button>提交意见</button><button id="refreshFeedback" class="secondary" type="button">刷新</button></div><textarea id="feedbackContent" maxlength="5000" placeholder="请写下意见或问题" required></textarea></form><div id="feedbackStatus" class="status"></div><div id="feedbackList" class="item-list"></div>
+  </section>
+  <section class="panel" data-panel="feedback">
+    <h2>意见反馈</h2><p class="muted">师生在眼镜上说“小北助手，开始反馈”，讲完说“小北助手，结束反馈”。这里单独汇总反馈文字和原始语音。</p><form id="feedbackForm"><div class="form-row"><input id="feedbackTitle" maxlength="120" placeholder="标题" required><button>提交文字反馈</button><button id="refreshFeedback" class="secondary" type="button">刷新</button></div><textarea id="feedbackContent" maxlength="5000" placeholder="请写下意见或问题" required></textarea></form><div id="feedbackStatus" class="status"></div><div id="feedbackList" class="item-list"></div>
   </section>
   {% endif %}
 

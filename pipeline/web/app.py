@@ -75,6 +75,7 @@ from pipeline.web.teacher_binding_store import (
 from pipeline.resource_paths import runtime_asset_path
 from pipeline.web.security import install_security
 from pipeline.web.app_updates import updates
+from pipeline.web.feedback import list_voice_feedback, register_feedback
 
 app = Flask(__name__)
 app.register_blueprint(updates)
@@ -121,6 +122,7 @@ _glasses_lock = Lock()
 _vlm_semaphore = Semaphore(int(os.environ.get("CHEM_VLM_CONCURRENCY", "4")))
 _omni_semaphore = Semaphore(int(os.environ.get("CHEM_OMNI_CONCURRENCY", "4")))
 _media_analysis_queue = MediaAnalysisQueue()
+register_feedback(app, _media_analysis_queue)
 _device_mapping_lock = Lock()
 _student_upload_lock = Lock()
 _common_issue_lock = Lock()
@@ -2566,6 +2568,8 @@ def glasses_health():
             "voice_intent",
             "student_direct_control",
             "teacher_direct_control",
+            "voice_feedback",
+            "voice_feedback",
             "tts_audio",
             "demo_video",
             "teacher_speaker_verify",
@@ -3323,7 +3327,10 @@ def admin_delete_feedback(feedback_id: str):
     if feedback_path is None:
         return jsonify({"error": "feedback not found"}), 404
     try:
-        feedback_path.unlink()
+        if feedback_path.name == "feedback.json":
+            shutil.rmtree(feedback_path.parent)
+        else:
+            feedback_path.unlink()
     except PermissionError:
         return jsonify({"error": "feedback is currently in use"}), 409
     return jsonify({"status": "ok"})
@@ -4660,7 +4667,7 @@ def _load_analysis(media_dir: Path) -> dict[str, Any]:
 def _list_feedback() -> list[dict[str, Any]]:
     root = _feedback_root()
     root.mkdir(parents=True, exist_ok=True)
-    items = []
+    items = list_voice_feedback()
     for path in root.glob("*.json"):
         try:
             item = json.loads(path.read_text(encoding="utf-8"))
@@ -4683,6 +4690,8 @@ def _resolve_feedback_path(feedback_id: str) -> Path | None:
         return None
     root = _feedback_root().resolve()
     path = (root / f"{feedback_id}.json").resolve()
+    if not path.is_file():
+        path = (root / feedback_id / "feedback.json").resolve()
     if not _is_relative_to(path, root):
         return None
     if not path.exists() or not path.is_file():
