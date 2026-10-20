@@ -2708,7 +2708,7 @@ def glasses_knowledge_video_stream(knowledge_base_id: str, document_id: str):
     headers = {key: upstream.headers[key] for key in (
         "Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control",
     ) if key in upstream.headers}
-    response = Response(upstream.iter_content(64 * 1024) if request.method == "GET" else b"",
+    response = Response(upstream.iter_content(64 * 1024) if request.method == "GET" else (),
                         status=upstream.status_code, headers=headers)
     response.call_on_close(upstream.close)
     return response
