@@ -1,6 +1,8 @@
 package com.example.zrgfirstapp
 
 import android.app.Activity
+import android.app.PendingIntent
+import android.content.pm.PackageInstaller
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -56,7 +58,14 @@ class AppUpdateActivity : AppCompatActivity() {
                 return false
             }
         })
-        check()
+        val error = intent.getStringExtra("install_error")
+        if (error != null) show(error) else check()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra("install_error")?.let(::show)
     }
 
     private fun render() {
@@ -95,7 +104,7 @@ class AppUpdateActivity : AppCompatActivity() {
                 onUi {
                     if (newer) {
                         info = release
-                        show("发现新版 ${release.getString("version_name")}\n${release.optString("notes")}\n更新可能需要系统确认安装。")
+                        show("发现新版 ${release.getString("version_name")}\n${release.optString("notes")}\n点击立即更新；支持的系统会直接完成安装。")
                     } else if (intent.getBooleanExtra("startup", false)) leave()
                     else show("已经是最新版本。")
                 }
@@ -152,12 +161,47 @@ class AppUpdateActivity : AppCompatActivity() {
                 permission.launch(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
                 return
             }
+            if (Build.VERSION.SDK_INT >= 31) {
+                installSession(file)
+                return
+            }
             val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
             installer.launch(Intent(Intent.ACTION_INSTALL_PACKAGE, uri)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).putExtra(Intent.EXTRA_RETURN_RESULT, true))
         } catch (error: Exception) {
             show("无法打开系统安装界面，请先使用 USB 更新。\n${error.message.orEmpty().take(100)}")
         }
+    }
+
+    private fun installSession(file: File) {
+        busy = true
+        status = "正在安装更新，请稍候；完成后重新打开助手。"
+        render()
+        Thread {
+            val manager = packageManager.packageInstaller
+            var sessionId: Int? = null
+            try {
+                val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
+                    setAppPackageName(packageName)
+                    setSize(file.length())
+                    setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+                }
+                val id = manager.createSession(params)
+                sessionId = id
+                manager.openSession(id).use { session ->
+                    session.openWrite("base.apk", 0, file.length()).use { output ->
+                        file.inputStream().use { it.copyTo(output) }
+                        session.fsync(output)
+                    }
+                    val result = PendingIntent.getBroadcast(this, id, Intent(this, AppInstallReceiver::class.java),
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
+                    session.commit(result.intentSender)
+                }
+            } catch (error: Exception) {
+                sessionId?.let { runCatching { manager.abandonSession(it) } }
+                onUi { show("更新安装失败，可重试或使用 USB 更新。\n${error.message.orEmpty().take(100)}") }
+            }
+        }.start()
     }
 
     private fun leave() {
