@@ -75,7 +75,8 @@ def create_claim(
     started_at: str,
     ended_at: str,
     items: Iterable[dict[str, Any]],
-) -> dict[str, Any]:
+    skip_claimed: bool = False,
+) -> dict[str, Any] | None:
     init_claim_store()
     claim_id = f"claim_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     normalized_items = [
@@ -99,7 +100,7 @@ def create_claim(
         raise ValueError("没有可认领的数据")
 
     with closing(_connect()) as connection:
-        connection.execute("BEGIN")
+        connection.execute("BEGIN IMMEDIATE")
         placeholders = ",".join("(?, ?, ?)" for _ in normalized_items)
         params: list[str] = []
         for item in normalized_items:
@@ -109,9 +110,16 @@ def create_claim(
             f"WHERE (item_type, source_role, item_id) IN ({placeholders})",
             params,
         ).fetchall()
-        if rows:
+        if rows and not skip_claimed:
             connection.rollback()
             raise ClaimConflict([dict(row) for row in rows])
+        if rows:
+            claimed = {(row["item_type"], row["source_role"], row["item_id"]) for row in rows}
+            normalized_items = [item for item in normalized_items
+                                if (item["item_type"], item["source_role"], item["item_id"]) not in claimed]
+            if not normalized_items:
+                connection.rollback()
+                return None
 
         created_at = _now()
         connection.execute(

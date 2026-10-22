@@ -132,7 +132,8 @@
         const data = await fetchJson(`${userApi}/binding`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glassNumber, weekday: Number(weekday) }) });
         teacherBinding = data.binding;
         await loadTeacherBinding();
-        setStatus('teacherBindingStatus', `${glassNumber}号眼镜 · ${weekdayName(Number(weekday))} 已保存。`);
+        teacherMediaLoaded = false;
+        setStatus('teacherBindingStatus', `${glassNumber}号眼镜 · ${weekdayName(Number(weekday))} 已保存，补归 ${Number(data.backfilled_count || 0)} 条历史未归属资料。`);
         if (wasUnbound) showTab('teacher-media');
       } catch (error) { setStatus('teacherBindingStatus', error.message, true); }
     };
@@ -349,7 +350,11 @@
       const glass = document.querySelector(`[data-user-glass="${CSS.escape(bindingIdentity)}"]`).value;
       const weekday = document.querySelector(`[data-user-weekday="${CSS.escape(bindingIdentity)}"]`).value;
       if (glass && weekday === '') return alert('请选择固定使用的星期。');
-      try { await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(bindingIdentity)}/glass`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glass, weekday: weekday === '' ? null : Number(weekday) }) }); await loadAdminUsers(); }
+      try {
+        const data = await fetchJson(`/api/workspace/admin/users/${encodeURIComponent(bindingIdentity)}/glass`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ glass_number: glass, weekday: weekday === '' ? null : Number(weekday) }) });
+        await loadAdminUsers();
+        setStatus('adminUserStatus', `已保存，补归 ${Number(data.backfilled_count || 0)} 条历史未归属资料。`);
+      }
       catch (error) { alert(error.message); }
       return;
     }

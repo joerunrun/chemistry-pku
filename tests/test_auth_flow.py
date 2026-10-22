@@ -251,6 +251,7 @@ def test_teacher_binding_auto_claims_uploads_and_media_is_paginated(monkeypatch)
             "device_id": device_id,
             "experiment_type": "distillation",
             "audio": (BytesIO(b"historical-audio"), "historical.wav"),
+            "started_at": "2026-10-15T09:00:00+08:00",
         },
         content_type="multipart/form-data",
     )
@@ -526,6 +527,95 @@ def test_student_schedule_daily_reports_and_admin_assign_unowned_saturday(monkey
     days = student.get("/api/workspace/student/report-calendar?month=2026-10").get_json()["days"]
     assert "2026-10-17" in {day["date"] for day in days}
     assert len(student.get("/api/claims").get_json()["claims"]) == len(before) + 2
+
+
+@pytest.mark.parametrize("role", ["student", "teacher"])
+@pytest.mark.parametrize("save_as", ["self", "admin"])
+def test_binding_backfills_only_matching_unowned_media(tmp_path, monkeypatch, role, save_as):
+    monkeypatch.setenv("CHEM_RUNTIME_ASSETS_DIR", str(tmp_path))
+    monkeypatch.setattr(app_module._media_analysis_queue, "enqueue", lambda *args: None)
+    monkeypatch.setattr("pipeline.web.teacher_binding_store._now", lambda: "2026-10-12T00:00:00+00:00")
+    app_module.init_store()
+    app_module.init_claim_store()
+    app_module.init_teacher_binding_store()
+    admin, user, other = (app_module.app.test_client() for _ in range(3))
+    _unlock_admin(admin)
+    _portal_login(user, "backfill-user", "学生" if role == "student" else "教师")
+    _portal_login(other, "backfill-other", "学生" if role == "student" else "教师")
+    for number in ("01", "02"):
+        assert admin.put(f"/admin/api/auth/glasses/{number}", json={"device_id": f"backfill-{number}"}).status_code == 200
+    own_api = f"/api/workspace/{role}/binding"
+    assert user.put(own_api, json={"glass_number": "01", "weekday": 0}).status_code == 200
+    prefix = "/api/glasses/teacher" if role == "teacher" else "/api/glasses"
+
+    def record(when, *, device="backfill-01", video=False, api=prefix):
+        part, filename = ("video", "record.mp4") if video else ("audio", "record.wav")
+        response = user.post(api + "/records/upload", data={
+            "device_id": device, "started_at": when, "ended_at": when,
+            part: (BytesIO(b"test-media"), filename),
+        })
+        assert response.status_code == 201
+        return response.get_json()["record"]
+
+    monday = record("2026-10-19T09:00:00+08:00")
+    # Wednesday in UTC is Thursday in Beijing: use capture time, not upload time.
+    audio = record("2026-10-14T17:10:00+00:00")
+    video = record("2026-10-15T09:00:00+08:00", video=True)
+    image = BytesIO()
+    Image.new("RGB", (10, 10), "white").save(image, format="JPEG")
+    image.seek(0)
+    response = user.post(prefix + "/photos/upload", data={
+        "device_id": "backfill-01", "captured_at": "2026-10-15T10:00:00+08:00", "photo": (image, "photo.jpg"),
+    })
+    assert response.status_code == 201
+    photo = response.get_json()["photo"]
+    protected = record("2026-10-15T11:00:00+08:00")
+    app_module.create_claim(identity_id="backfill-other", role=role, glass_number="01",
+        started_at="2026-10-15T11:00:00+08:00", ended_at="2026-10-15T11:00:00+08:00",
+        items=[{"item_type": "record", "source_role": role, "item_id": protected["record_id"]}])
+    wrong_day = record("2026-10-14T09:00:00+08:00")
+    wrong_glass = record("2026-10-15T09:00:00+08:00", device="backfill-02")
+    other_role = "teacher" if role == "student" else "student"
+    wrong_role = record("2026-10-15T09:00:00+08:00", api="/api/glasses/teacher" if other_role == "teacher" else "/api/glasses")
+    Path(audio["path"], "analysis.json").write_text(json.dumps({"items": {
+        audio["files"][0]["filename"]: {"status": "succeeded", "transcript": "已补归的实验记录"}
+    }}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr("pipeline.web.teacher_binding_store._now", lambda: "2026-10-22T04:00:00+00:00")
+    saver, endpoint = (user, own_api) if save_as == "self" else (admin, "/api/workspace/admin/users/backfill-user/glass")
+    payload = {"glass_number": "01", "weekday": 3}
+    # A stale scan must still preserve a record already claimed by another user.
+    with monkeypatch.context() as stale:
+        stale.setattr(app_module, "claimed_item_keys", lambda: set())
+        response = saver.put(endpoint, json=payload)
+        assert response.status_code == 200
+        assert response.get_json()["backfilled_count"] == 3
+        assert saver.put(endpoint, json=payload).get_json()["backfilled_count"] == 0
+    owners = app_module.claim_item_owners()
+    assert owners[("record", role, protected["record_id"])]["identity_id"] == "backfill-other"
+    for item_type, item_id in (("record", monday["record_id"]), ("record", audio["record_id"]),
+                               ("record", video["record_id"]), ("photo", photo["photo_id"])):
+        assert owners[(item_type, role, item_id)]["identity_id"] == "backfill-user"
+    for source_role, item in ((role, wrong_day), (role, wrong_glass), (other_role, wrong_role)):
+        assert ("record", source_role, item["record_id"]) not in owners
+    days = user.get(f"/api/workspace/{role}/report-calendar?month=2026-10").get_json()["days"]
+    assert "2026-10-15" in {day["date"] for day in days}
+    # A newer Friday schedule must not take late-uploaded Thursday records.
+    monkeypatch.setattr("pipeline.web.teacher_binding_store._now", lambda: "2026-10-22T05:00:00+00:00")
+    assert other.put(own_api, json={"glass_number": "01", "weekday": 4}).status_code == 200
+    late = record("2026-10-15T12:00:00+08:00")
+    assert app_module.claim_item_owners()[("record", role, late["record_id"])]["identity_id"] == "backfill-user"
+    # Re-saving also picks up a newly discovered orphan without changing schedules.
+    with monkeypatch.context() as orphan:
+        orphan.setattr(app_module, "_auto_claim_upload", lambda *args: None)
+        missed = record("2026-10-15T13:00:00+08:00")
+    assert saver.put(endpoint, json=payload).get_json()["backfilled_count"] == 1
+    assert app_module.claim_item_owners()[("record", role, missed["record_id"])]["identity_id"] == "backfill-user"
+    changed_glass = saver.put(endpoint, json={"glass_number": "02", "weekday": 3})
+    assert changed_glass.get_json()["backfilled_count"] == 1
+    owners = app_module.claim_item_owners()
+    assert owners[("record", role, wrong_glass["record_id"])]["identity_id"] == "backfill-user"
+    assert owners[("record", role, monday["record_id"])]["identity_id"] == "backfill-user"
+    assert owners[("record", role, protected["record_id"])]["identity_id"] == "backfill-other"
 
 
 def test_running_report_job_is_requeued_after_restart() -> None:

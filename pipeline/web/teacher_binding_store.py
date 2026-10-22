@@ -75,17 +75,21 @@ def _binding(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def active_teacher_binding(
-    *, identity_id: str | None = None, glass_number: str | None = None, role: str = "teacher"
+    *, identity_id: str | None = None, glass_number: str | None = None,
+    role: str = "teacher", weekday: int | None = None,
 ) -> dict[str, Any] | None:
     init_teacher_binding_store()
     filters = ["ended_at IS NULL", "role = ?"]
-    values: list[str] = [role]
+    values: list[Any] = [role]
     if identity_id:
         filters.append("identity_id = ?")
         values.append(identity_id.strip())
     if glass_number:
         filters.append("glass_number = ?")
         values.append(glass_number.strip())
+    if weekday is not None:
+        filters.append("weekday = ?")
+        values.append(weekday)
     with closing(_connect()) as connection:
         row = connection.execute(
             f"SELECT * FROM teacher_glass_bindings WHERE {' AND '.join(filters)} "

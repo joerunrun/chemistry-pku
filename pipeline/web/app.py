@@ -930,6 +930,9 @@ def _auto_claim_upload(metadata: dict[str, Any], item_type: str) -> dict[str, An
     )
     binding = teacher_binding_for_glass_at(glass_number, captured_at.isoformat(), role=role)
     if binding is None:
+        binding = active_teacher_binding(glass_number=glass_number, role=role,
+                                         weekday=captured_at.astimezone(_BEIJING_TZ).weekday())
+    if binding is None:
         return None
 
     ended_at = _candidate_datetime(metadata.get("ended_at"), fallback=captured_at)
@@ -974,14 +977,15 @@ def _claim_candidate_items(
     device_id = str(glass["device_id"])
     candidates: list[dict[str, Any]] = []
     sources = (
-        ("student", _list_records(_record_root(), "admin_download_record_file"), "record"),
-        ("teacher", _list_records(_teacher_record_root(), "teacher_admin_download_record_file"), "record"),
-        ("student", _list_photos(_photo_root(), "admin_photo_file"), "photo"),
-        ("teacher", _list_photos(_teacher_photo_root(), "teacher_admin_photo_file"), "photo"),
+        ("student", _record_root(), "admin_download_record_file", "record"),
+        ("teacher", _teacher_record_root(), "teacher_admin_download_record_file", "record"),
+        ("student", _photo_root(), "admin_photo_file", "photo"),
+        ("teacher", _teacher_photo_root(), "teacher_admin_photo_file", "photo"),
     )
-    for item_source_role, items, item_type in sources:
+    for item_source_role, root, endpoint, item_type in sources:
         if source_role and item_source_role != source_role:
             continue
+        items = _list_records(root, endpoint) if item_type == "record" else _list_photos(root, endpoint)
         for item in items:
             if str(item.get("device_id", "")).strip() != device_id:
                 continue
@@ -1015,6 +1019,33 @@ def _claim_candidate_items(
             })
     candidates.sort(key=lambda item: item.get("started_at", ""))
     return candidates
+
+
+def _backfill_unassigned_for_binding(binding: dict[str, Any]) -> int:
+    """Give matching unowned media to this schedule without changing existing owners."""
+    role, glass_number = binding["role"], binding["glass_number"]
+    claimed = claimed_item_keys()
+    days: dict[str, list[dict[str, Any]]] = {}
+    candidates = _claim_candidate_items(
+        glass_number, datetime.min.replace(tzinfo=timezone.utc), datetime.now(timezone.utc), source_role=role,
+    )
+    for item in candidates:
+        started_at = datetime.fromisoformat(item["started_at"]).astimezone(_BEIJING_TZ)
+        if started_at.year < 2000 or started_at.weekday() != binding["weekday"]:
+            continue
+        if (item["item_type"], role, item["item_id"]) in claimed:
+            continue
+        days.setdefault(started_at.date().isoformat(), []).append(item)
+    count = 0
+    for items in days.values():
+        claim = create_claim(
+            identity_id=binding["identity_id"], role=role, glass_number=glass_number,
+            started_at=min(item["started_at"] for item in items),
+            ended_at=max(item["ended_at"] for item in items), items=items, skip_claimed=True,
+        )
+        if claim:
+            count += len(claim["items"])
+    return count
 
 
 def _claim_period(value: datetime) -> tuple[str, str]:
@@ -1429,7 +1460,8 @@ def workspace_admin_set_teacher_glass(identity_id: str):
         return jsonify({"error": "该眼镜在所选星期已分配给同角色的其他用户"}), 409
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return jsonify({"binding": binding})
+    count = _backfill_unassigned_for_binding(binding)
+    return jsonify({"binding": binding, "backfilled_count": count})
 
 
 @app.get("/admin/test-identities")
@@ -1875,12 +1907,13 @@ def workspace_teacher_set_binding():
         return jsonify({"error": "该眼镜尚未完成硬件校准"}), 400
     try:
         identity_id = str(user["identity_id"])
-        set_teacher_binding(identity_id, glass_number, payload.get("weekday"), role=user["role"])
+        binding = set_teacher_binding(identity_id, glass_number, payload.get("weekday"), role=user["role"])
     except TeacherBindingConflict:
         return jsonify({"error": "该眼镜在所选星期已分配给同角色的其他用户"}), 409
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return jsonify(_teacher_binding_payload(identity_id))
+    count = _backfill_unassigned_for_binding(binding)
+    return jsonify({**_teacher_binding_payload(identity_id), "backfilled_count": count})
 
 
 @app.delete("/api/workspace/student/binding")
