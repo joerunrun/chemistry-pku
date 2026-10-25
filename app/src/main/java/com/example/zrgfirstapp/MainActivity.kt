@@ -27,6 +27,7 @@ import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.VideoView
 import androidx.activity.enableEdgeToEdge
@@ -104,6 +105,7 @@ class MainActivity : AppCompatActivity() {
         val detectionOverlayContainer: FrameLayout,
         val detectionPreview: ImageView,
         val detectionOverlay: DetectionOverlayView,
+        val demoVideoContainer: FrameLayout,
         val demoVideoView: VideoView,
         val progress: ProgressBar,
         val thinkingText: TextView,
@@ -180,6 +182,7 @@ class MainActivity : AppCompatActivity() {
         val streamUrl: String,
     )
     private var demoVideos: List<DemoVideo> = emptyList()
+    private val demoPageSize = 3
     private var activeDemoVideo: DemoVideo? = null
     private val resultReturnRunnable = Runnable {
         if (screenState == ScreenState.RESULT) {
@@ -394,6 +397,7 @@ class MainActivity : AppCompatActivity() {
             detectionOverlayContainer = root.findViewById(R.id.detection_overlay_container),
             detectionPreview = root.findViewById(R.id.detection_preview),
             detectionOverlay = root.findViewById(R.id.detection_overlay),
+            demoVideoContainer = root.findViewById(R.id.demo_video_container),
             demoVideoView = root.findViewById(R.id.demo_video_view),
             progress = root.findViewById(R.id.progress),
             thinkingText = root.findViewById(R.id.thinking_text),
@@ -519,7 +523,7 @@ class MainActivity : AppCompatActivity() {
             panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
             panel.detectionOverlay.clearBoxes()
-            panel.demoVideoView.visibility = View.GONE
+            panel.demoVideoContainer.visibility = View.GONE
             panel.statusText.text = ""
             panel.resultText.text = ""
         }
@@ -580,7 +584,7 @@ class MainActivity : AppCompatActivity() {
             panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
             panel.detectionOverlay.clearBoxes()
-            panel.demoVideoView.visibility = View.GONE
+            panel.demoVideoContainer.visibility = View.GONE
             panel.statusText.text = status
             panel.resultText.visibility = View.VISIBLE
             panel.resultText.text = result
@@ -602,10 +606,11 @@ class MainActivity : AppCompatActivity() {
             panel.titleText.textSize = 26f
             panel.titleText.text = title
             panel.subtitleText.text = subtitle
+            if (screenState == ScreenState.RESULT) panel.subtitleText.visibility = View.GONE
             panel.optionsRow.visibility = View.GONE
             panel.primaryButton.alpha = 1.0f
             panel.secondaryButton.alpha = 1.0f
-            panel.demoVideoView.visibility = View.GONE
+            panel.demoVideoContainer.visibility = View.GONE
             val hasDetectionView = panel.detectionPreview.visibility == View.VISIBLE ||
                 panel.detectionOverlay.visibility == View.VISIBLE
             panel.progress.visibility = if (running && !hasDetectionView) {
@@ -614,8 +619,10 @@ class MainActivity : AppCompatActivity() {
                 View.GONE
             }
             panel.thinkingText.visibility = if (running) View.VISIBLE else View.GONE
-            panel.statusText.text = status
+            panel.statusText.visibility = View.VISIBLE
+            panel.statusText.text = if (screenState == ScreenState.RESULT) "$status · 滑动翻阅，双击返回" else status
             panel.resultText.visibility = View.VISIBLE
+            panel.resultText.textSize = if (screenState == ScreenState.RESULT) 26f else 20f
             panel.resultText.text = result
         }
         if (running) {
@@ -636,7 +643,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setPanelGravity(panel: EyePanel, gravity: Int) {
-        (panel.root as? LinearLayout)?.gravity = gravity
+        val content = (panel.root as? ScrollView)?.getChildAt(0) as? LinearLayout ?: return
+        content.gravity = gravity
+        val density = resources.displayMetrics.density
+        content.setPadding((28 * density).toInt(), (28 * density).toInt(), (28 * density).toInt(), (24 * density).toInt())
     }
 
     private fun selectedTitle(): String {
@@ -669,6 +679,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun moveFocus(delta: Int) {
+        if (screenState == ScreenState.RESULT) {
+            mainHandler.removeCallbacks(resultReturnRunnable)
+            panels.forEach { panel ->
+                (panel.root as? ScrollView)?.smoothScrollBy(0, (panel.root.height * 0.6f * delta).toInt())
+            }
+            return
+        }
+        if (screenState == ScreenState.DEMO_SELECT) {
+            focusIndex = (focusIndex + delta).coerceIn(0, demoVideos.lastIndex)
+            updateDemoSelection()
+            return
+        }
         if (!screenState.hasChoices()) {
             return
         }
@@ -728,9 +750,10 @@ class MainActivity : AppCompatActivity() {
 
 
 
+            ScreenState.DEMO_SELECT -> demoVideos.getOrNull(focusIndex)?.let { playDemoVideo(it) }
+
             ScreenState.LIVE_MINIMAL,
             ScreenState.ACTION_MENU,
-            ScreenState.DEMO_SELECT,
             ScreenState.VOICE_LISTENING,
             ScreenState.QA_RECORDING,
             ScreenState.RESULT -> {
@@ -814,7 +837,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ScreenState.hasChoices(): Boolean {
-        return this == ScreenState.CONNECTION_FAILED ||
+        return this == ScreenState.DEMO_SELECT ||
+            this == ScreenState.CONNECTION_FAILED ||
             this == ScreenState.CONSENT ||
             this == ScreenState.HOME ||
             this == ScreenState.ACTION_MENU
@@ -831,7 +855,7 @@ class MainActivity : AppCompatActivity() {
             panel.detectionOverlay.clearBoxes()
             panel.detectionOverlayContainer.visibility = View.GONE
             panel.demoVideoView.stopPlayback()
-            panel.demoVideoView.visibility = View.GONE
+            panel.demoVideoContainer.visibility = View.GONE
         }
     }
 
@@ -909,7 +933,7 @@ class MainActivity : AppCompatActivity() {
             velocityX: Float,
             velocityY: Float,
         ): Boolean {
-            if (e1 == null || !screenState.hasChoices()) {
+            if (e1 == null || (!screenState.hasChoices() && screenState != ScreenState.RESULT)) {
                 return false
             }
 
@@ -947,19 +971,25 @@ class MainActivity : AppCompatActivity() {
         setTransparentChrome(true)
         panels.forEach { panel ->
             setPanelGravity(panel, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
-            panel.titleText.visibility = View.VISIBLE
-            panel.subtitleText.visibility = View.VISIBLE
-            panel.titleText.textSize = 22f
-            panel.titleText.text = "演示指引"
-            panel.subtitleText.text = activeDemoVideo?.let { demoDisplayLabel(it) } ?: "正在播放"
+            panel.titleText.visibility = View.GONE
+            panel.subtitleText.visibility = View.GONE
             panel.optionsRow.visibility = View.GONE
             panel.progress.visibility = View.GONE
             panel.thinkingText.visibility = View.GONE
             panel.detectionOverlayContainer.visibility = View.GONE
             panel.detectionPreview.visibility = View.GONE
             panel.detectionOverlay.clearBoxes()
-            panel.demoVideoView.visibility = View.VISIBLE
-            panel.statusText.text = "说“停止播放”可退出"
+            panel.demoVideoContainer.visibility = View.VISIBLE
+            val density = resources.displayMetrics.density
+            (panel.demoVideoContainer.parent as View).setPadding((16 * density).toInt(), (12 * density).toInt(), (16 * density).toInt(), (12 * density).toInt())
+            panel.root.post {
+                panel.demoVideoContainer.layoutParams = panel.demoVideoContainer.layoutParams.apply {
+                    height = (panel.root.height - 64 * density).toInt().coerceAtLeast((120 * density).toInt())
+                }
+                panel.root.scrollTo(0, 0)
+            }
+            panel.statusText.visibility = View.VISIBLE
+            panel.statusText.text = "双击退出，或说“停止播放”"
             panel.resultText.visibility = View.GONE
         }
     }
@@ -1198,6 +1228,7 @@ class MainActivity : AppCompatActivity() {
     private fun startDemoGuide(query: String = "", requestedIndex: Int? = null) {
         stopVoiceIntentRecording()
         demoVideos = emptyList()
+        focusIndex = 0
         val token = startRunning("正在读取演示视频...", "")
         activeTaskTitle = "演示指引"
         Thread {
@@ -1241,18 +1272,27 @@ class MainActivity : AppCompatActivity() {
         passiveListenMode = PassiveListenMode.DEMO_SELECT
         startVoiceIntentLoop()  // 选择视频期间保持苏醒
         activeTaskTitle = "演示指引"
-        val options = demoVideos.mapIndexed { index, video ->
-            "${index + 1}. ${demoDisplayLabel(video)}${if (video.streamUrl.isBlank()) "（暂无视频文件）" else ""}"
-        }
-        lastStatusText = "请说视频序号或名称"
-        lastResultText = options.joinToString("\n")
         screenState = ScreenState.DEMO_SELECT
-        renderScreen()
+        updateDemoSelection()
         playPrompt("demo_select") {
             if (screenState == ScreenState.DEMO_SELECT) {
                 startVoiceIntentLoop()
             }
         }
+    }
+
+    private fun updateDemoSelection() {
+        val start = focusIndex / demoPageSize * demoPageSize
+        val end = minOf(start + demoPageSize, demoVideos.size)
+        val pages = (demoVideos.size + demoPageSize - 1) / demoPageSize
+        lastStatusText = "第 ${start / demoPageSize + 1}/$pages 页 · 共 ${demoVideos.size} 条\n滑动选择，单击播放，或说序号"
+        lastResultText = (start until end).joinToString("\n\n") { index ->
+            val video = demoVideos[index]
+            val title = demoDisplayLabel(video).let { if (it.length > 44) it.take(44) + "…" else it }
+            "${if (index == focusIndex) "▶" else "  "} ${index + 1}. $title${if (video.streamUrl.isBlank()) "（暂无视频文件）" else ""}"
+        }
+        renderScreen()
+        panels.forEach { it.root.scrollTo(0, 0) }
     }
 
     private fun selectAndPlayDemoVideo(index: Int?, query: String) {
@@ -1269,10 +1309,8 @@ class MainActivity : AppCompatActivity() {
             else -> matchDemoVideoByText(query)
         }
         if (video == null) {
-            lastStatusText = "没有匹配到视频"
-            lastResultText = "请说视频序号或名称。\n" + demoVideos.mapIndexed { i, item -> "${i + 1}. ${demoDisplayLabel(item)}" }.joinToString("\n")
             screenState = ScreenState.DEMO_SELECT
-            renderScreen()
+            updateDemoSelection()
             passiveListenMode = PassiveListenMode.DEMO_SELECT
             startVoiceIntentLoop()
             mainHandler.postDelayed({ startVoiceIntentLoop() }, 500L)
@@ -1315,7 +1353,7 @@ class MainActivity : AppCompatActivity() {
     private fun parseDemoVideoIndex(text: String): Int? {
         Regex("(?:第)?([0-9]{1,2})(?:个|段|号|部|集|条)?").find(text)?.let { match ->
             val value = match.groupValues[1].toIntOrNull()
-            if (value != null && value in 1..20) {
+            if (value != null && value in 1..demoVideos.size) {
                 return value - 1
             }
         }
@@ -1410,7 +1448,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         panels.forEach { panel ->
             panel.demoVideoView.stopPlayback()
-            panel.demoVideoView.visibility = View.GONE
+            panel.demoVideoContainer.visibility = View.GONE
         }
         passiveListenMode = PassiveListenMode.NONE
         activeDemoVideo = null
@@ -1462,10 +1500,7 @@ class MainActivity : AppCompatActivity() {
         val estimatedMs = (fallbackText.length * 180L + 1600L).coerceIn(2500L, 18_000L)
         voiceControlPausedUntilMs = System.currentTimeMillis() + estimatedMs + 1_000L
         if (audioDataUrl.isNullOrBlank() || audioDataUrl == "null") {
-            mainHandler.postDelayed({
-                voiceControlPausedUntilMs = 0L
-                resultReturnRunnable.run()
-            }, estimatedMs)
+            mainHandler.postDelayed(resultReturnRunnable, estimatedMs)
             return
         }
         try {
@@ -1857,6 +1892,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun submitTextQuestion(question: String) {
         studentQuestionPending = false
+        activeTaskTitle = "语音问答"
         stopVoiceIntentRecording()
         val token = startRunning("正在回答你的问题...", question)
         Thread {
@@ -2022,6 +2058,7 @@ class MainActivity : AppCompatActivity() {
         lastStatusText = status
         screenState = ScreenState.RESULT
         renderScreen()
+        panels.forEach { it.root.scrollTo(0, 0) }
         playResultAudio(audioDataUrl, (status + ". " + result).take(180))
     }
 

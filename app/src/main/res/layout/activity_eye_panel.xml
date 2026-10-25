@@ -85,12 +85,18 @@
             android:visibility="gone" />
     </FrameLayout>
 
-    <VideoView
-        android:id="@+id/demo_video_view"
+    <FrameLayout
+        android:id="@+id/demo_video_container"
         android:layout_width="match_parent"
         android:layout_height="260dp"
-        android:layout_marginTop="18dp"
-        android:visibility="gone" />
+        android:visibility="gone">
+
+        <VideoView
+            android:id="@+id/demo_video_view"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center" />
+    </FrameLayout>
 
     <ProgressBar
         android:id="@+id/progress"

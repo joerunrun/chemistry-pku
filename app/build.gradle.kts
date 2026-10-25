@@ -37,7 +37,8 @@ android {
     productFlavors {
         create("student") {
             dimension = "role"
-            versionName = "2.5-student"
+            versionCode = 10
+            versionName = "2.6-student"
             buildConfigField("String", "APP_MODE", "\"student\"")
             val usb = providers.gradleProperty("studentTest").isPresent || providers.gradleProperty("studentUsb").isPresent
             buildConfigField("boolean", "LOCAL_USB", usb.toString())
