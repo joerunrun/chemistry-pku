@@ -64,7 +64,8 @@ def video_candidates(query: str) -> list[dict]:
     mapping = json.loads(Path(mapping_path).read_text(encoding="utf-8")) if mapping_path else {}
     candidates = []
     seen = set()
-    for hit in search(query, videos=True):
+    seen_files = set()
+    for hit in search(query, videos=True, top_k=50):
         kb, doc = hit["knowledge_base_id"], hit["document_id"]
         if (kb, doc) in seen:
             continue
@@ -73,17 +74,28 @@ def video_candidates(query: str) -> list[dict]:
         if not stream_url and hit.get("download_path"):
             try:
                 detail = _request("GET", document_path(kb, doc)).json()
-                filename = detail.get("files", {}).get("original", {}).get("file_name", "")
+                original = detail.get("files", {}).get("original", {})
+                filename = original.get("file_name", "")
                 if filename.lower().endswith(".mp4"):
+                    size = original.get("size_bytes", 0)
+                    if size:
+                        file_key = (filename.casefold(), size)
+                        if file_key in seen_files:
+                            continue
+                        seen_files.add(file_key)
                     stream_url = f"/api/glasses/demo/videos/knowledge/{quote(kb, safe='')}/{quote(doc, safe='')}/stream"
             except (requests.RequestException, ValueError, KeyError):
                 log.warning("Knowledge video file unavailable")
+        if not stream_url:
+            continue
         candidates.append({
             "id": f"knowledge:{kb}:{doc}", "label": hit["title"],
             "filename": hit["title"], "source": "knowledge",
             "knowledge_base_id": kb, "document_id": doc,
             "stream_url": stream_url or None, "playable": bool(stream_url),
         })
+        if len(candidates) == 20:
+            break
     return candidates
 
 
