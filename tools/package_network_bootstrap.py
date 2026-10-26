@@ -14,11 +14,19 @@ def main():
     release = android.parent / "release"
     helper = android / "wifi-setting/app/build/outputs/apk/debug/app-debug.apk"
     network = Path(__file__).with_name("network_setup.bat").read_text(encoding="utf-8")
+    installer = Path(__file__).with_name("install_setup.bat").read_text(encoding="utf-8")
+    bootstrap = Path(__file__).with_name("windows_bootstrap.ps1").read_text(encoding="utf-8")
 
     for role in ("教师", "学生"):
         folder = release / f"化小北{role}版一键更新包"
         shutil.copy2(helper, folder / "WiFi设置助手.apk")
-        shutil.copy2(args.browser, folder / "浏览器.apk")
+        if args.browser.resolve() != (folder / "浏览器.apk").resolve():
+            shutil.copy2(args.browser, folder / "浏览器.apk")
+        adb = folder / "tools/adb.exe"
+        if adb.exists():
+            adb.replace(folder / "tools/adb-helper.exe")
+        if not (folder / "tools/adb-helper.exe").is_file():
+            raise FileNotFoundError(f"Missing bundled ADB: {folder}")
         mirror = folder / "tools/scrcpy"
         mirror.mkdir(parents=True, exist_ok=True)
         for source in args.scrcpy.iterdir():
@@ -28,16 +36,12 @@ def main():
                 if source.name not in ("AdbWinApi.dll", "AdbWinUsbApi.dll"):
                     shutil.copy2(source, mirror / source.name)
         shutil.copy2(Path(__file__).with_name("LICENSE.scrcpy"), mirror / "LICENSE")
-        with (folder / "配置网络.bat").open("w", encoding="utf-8", newline="\r\n") as out:
+        with (folder / "配置网络.bat").open("w", encoding="ascii", newline="\r\n") as out:
             out.write(network)
-
-        installer = folder / "安装更新.bat"
-        text = installer.read_text(encoding="utf-8")
-        if 'call "%~dp0配置网络.bat"' not in text:
-            marker = "echo 安装成功！现在可以拔掉数据线。"
-            text = text.replace(marker, 'call "%~dp0配置网络.bat" "%DEVICE_SERIAL%"\n' + marker)
-        with installer.open("w", encoding="utf-8", newline="\r\n") as out:
-            out.write(text)
+        with (folder / "安装更新.bat").open("w", encoding="ascii", newline="\r\n") as out:
+            out.write(installer.replace("__ROLE__", "teacher" if role == "教师" else "student"))
+        with (folder / "tools/windows_bootstrap.ps1").open("w", encoding="utf-8-sig", newline="\r\n") as out:
+            out.write(bootstrap)
         instructions = f"""化小北{role}版一键更新包（Windows）
 
 1. 完整解压压缩包。眼镜开机、开启 ADB，用 USB 数据线连接电脑。
@@ -50,7 +54,8 @@ def main():
 更新保留原有助手数据。WiFi 助手和 Via 浏览器缺少时才安装，已有则跳过。
 后续助手启动时会检查新版，下载后按眼镜安装提示确认。
 无需在电脑另外安装 ADB、浏览器或投屏软件；认证实际在眼镜上完成。
-如果投屏没有弹出，请查看 %TEMP%\\chem-glasses-network.log。
+投屏窗口确认打开后才显示菜单；启动失败会直接显示原因。
+配网日志：%TEMP%\\chem-glasses-network.log 和 chem-glasses-network.error.log。
 """
         (folder / "安装说明.txt").write_text(instructions, encoding="utf-8-sig")
         (mirror / "第三方软件.txt").write_text(
