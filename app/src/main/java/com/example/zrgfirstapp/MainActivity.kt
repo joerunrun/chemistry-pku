@@ -291,7 +291,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            val text = when (thinkingFrame % 4) {
+            val text = if (activeTaskTitle == "拍照") "正在拍照..." else when (thinkingFrame % 4) {
                 0 -> "思考中."
                 1 -> "思考中.."
                 else -> "思考中..."
@@ -1768,6 +1768,11 @@ class MainActivity : AppCompatActivity() {
             selectedMode == Mode.SAFETY -> "start_safety"
             selectedMode == Mode.EXPERIMENT -> "start_experiment_check"
             else -> "start_capture"
+        }
+        if (photoOnly) {
+            playPrompt(promptName)
+            startCaptureFlow()
+            return
         }
         playPrompt(promptName) {
             mainHandler.postDelayed({
