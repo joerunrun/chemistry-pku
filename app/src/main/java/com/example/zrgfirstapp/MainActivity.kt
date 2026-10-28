@@ -1414,7 +1414,15 @@ class MainActivity : AppCompatActivity() {
             if (screenState != ScreenState.DEMO_PLAYING || activeDemoVideo != video) {
                 return@playPrompt
             }
+            val playbackReported = java.util.concurrent.atomic.AtomicBoolean(false)
             panels.forEachIndexed { index, panel ->
+                panel.demoVideoView.setOnInfoListener { _, what, _ ->
+                    if (index == 0 && what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START &&
+                        playbackReported.compareAndSet(false, true)) {
+                        UsageEvents.record(this, "video_play", demoDisplayLabel(video))
+                    }
+                    false
+                }
                 panel.demoVideoView.setOnPreparedListener { player ->
                     player.isLooping = false
                     player.setVolume(if (index == 0) 1.0f else 0.0f, if (index == 0) 1.0f else 0.0f)
@@ -1895,6 +1903,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun submitTextQuestion(question: String) {
         studentQuestionPending = false
+        UsageEvents.record(this, "qa")
         activeTaskTitle = "语音问答"
         stopVoiceIntentRecording()
         val token = startRunning("正在回答你的问题...", question)
@@ -1915,6 +1924,7 @@ class MainActivity : AppCompatActivity() {
     private fun submitImage(file: File) {
         val token = startRunning("正在分析实验照片...", "")
         val checkRequest = pendingCheckRequest
+        val usageAction = if (selectedMode == Mode.SAFETY) "safety_check" else "experiment_check"
         Thread {
             try {
                 val fields = linkedMapOf(
@@ -1929,6 +1939,7 @@ class MainActivity : AppCompatActivity() {
                     "image",
                     file,
                 )
+                UsageEvents.record(this, usageAction)
                 if (!file.delete()) {
                     android.util.Log.w("ChemCapture", "Submitted but could not delete ${file.name}")
                 }
@@ -2137,6 +2148,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        UsageEvents.retry(this)
         studentForeground = true
         if (::leftPanel.isInitialized) startVoiceIntentLoop()
     }

@@ -146,6 +146,7 @@ class TeacherActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        UsageEvents.retry(this)
         Log.i("DeviceIdentity", "hardware_id=$teacherDeviceId")
         // Keep the voice-only teacher page in the foreground on RayNeo. If
         // the display sleeps, LockScreenActivity takes input focus and the
@@ -620,6 +621,7 @@ class TeacherActivity : AppCompatActivity() {
                 teacherState = TeacherState.INSTRUCTION
                 feedbackResultId = null
                 feedbackCapture.start(baseUrl, teacherDeviceId)
+                UsageEvents.record(this, "feedback")
                 playPrompt("feedback_start") { resumeListening(actionToken) }
             }
             "stop_feedback" -> {
@@ -646,6 +648,7 @@ class TeacherActivity : AppCompatActivity() {
                     fun completeCapture(file: File?, error: Throwable?) {
                         if (!captureCompleted.compareAndSet(false, true)) return
                         if (file != null) {
+                            UsageEvents.record(this, "photo")
                             playPrompt("photo_complete")
                             uploadTeacherPhoto(file)
                         } else {

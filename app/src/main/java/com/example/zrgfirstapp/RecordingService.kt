@@ -38,6 +38,7 @@ class RecordingService : LifecycleService() {
     private lateinit var cameraSessionManager: CameraSessionManager
     private var foregroundStarted = false
     private var teacherSessionActive = false
+    private var teacherUsagePending = false
     private var lastStatus = "未记录"
     private val handler = Handler(Looper.getMainLooper())
     private val studentStore by lazy {
@@ -69,6 +70,10 @@ class RecordingService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         cameraSessionManager = CameraSessionManager(this, this) { status ->
+            if (teacherSessionActive && teacherUsagePending && status == "记录中") {
+                teacherUsagePending = false
+                UsageEvents.record(this, "video_record")
+            }
             if (studentAudio == null || studentState !in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.FEEDBACK_RECORDING, StudentRecordState.STOPPING)) lastStatus = status
             if (studentAudio != null && studentState == StudentRecordState.STARTING_VIDEO) {
                 if (status == "记录中") {
@@ -76,6 +81,7 @@ class RecordingService : LifecycleService() {
                     if (studentAudio!!.beginArchive(File(dir, "record_audio.wav"))) {
                         studentStore.markStarted(dir, System.currentTimeMillis())
                         setStudentState(StudentRecordState.VIDEO_RECORDING, "录像中")
+                        UsageEvents.record(this, "video_record")
                     } else stopStudentRecording(reason = "audio_failed")
                 } else if (status.contains("异常") || status.contains("失败")) {
                     stopStudentRecording(reason = "camera_failed")
@@ -119,6 +125,7 @@ class RecordingService : LifecycleService() {
     }
 
     fun startRecording(videoAudioEnabled: Boolean? = null) {
+        if (teacherSessionActive && !cameraSessionManager.isRecordingActive()) teacherUsagePending = true
         videoAudioEnabled?.let { cameraSessionManager.setVideoAudioEnabled(it) }
         startAsForegroundIfNeeded(cameraAndMicrophoneForegroundType())
         lastStatus = "记录准备中"
@@ -165,6 +172,7 @@ class RecordingService : LifecycleService() {
                 studentStore.markStarted(dir, System.currentTimeMillis() - studentAudio!!.archiveLeadInMs)
                 setStudentState(if (feedback) StudentRecordState.FEEDBACK_RECORDING else StudentRecordState.AUDIO_RECORDING,
                     if (feedback) "反馈收集中" else "录音中")
+                UsageEvents.record(this, if (feedback) "feedback" else "audio_record")
             }
             return true
         } catch (error: Exception) {
@@ -221,6 +229,7 @@ class RecordingService : LifecycleService() {
         val saved = File(dir, "photo.jpg")
         file.copyTo(saved, overwrite = true)
         studentStore.ready(dir, null, null, photo = saved, onQueued = onQueued)
+        UsageEvents.record(this, "photo")
         file.delete()
     }
 
