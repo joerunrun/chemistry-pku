@@ -756,13 +756,11 @@ class MainActivity : AppCompatActivity() {
             ScreenState.ACTION_MENU,
             ScreenState.VOICE_LISTENING,
             ScreenState.QA_RECORDING,
-            ScreenState.RESULT -> {
-                requestPhoto()
-            }
+            ScreenState.RESULT -> Unit
 
             ScreenState.CAPTURE_COUNTDOWN -> Unit
 
-            ScreenState.DEMO_PLAYING -> requestPhoto()
+            ScreenState.DEMO_PLAYING -> Unit
 
             ScreenState.RUNNING -> Unit
         }
