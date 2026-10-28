@@ -76,6 +76,7 @@ from pipeline.resource_paths import runtime_asset_path
 from pipeline.web.security import install_security
 from pipeline.web.app_updates import updates
 from pipeline.web.feedback import list_voice_feedback, register_feedback
+from pipeline.web.usage import register_usage
 
 app = Flask(__name__)
 app.register_blueprint(updates)
@@ -86,6 +87,7 @@ install_security(app, lambda: _current_user(), lambda: _admin_is_unlocked(),
 init_store()
 init_claim_store()
 init_teacher_binding_store()
+register_usage(app, lambda: _current_user(), lambda: _admin_is_unlocked())
 
 # 内存存储：session_id → detection 结果
 _detect_store: dict[str, dict] = {}
