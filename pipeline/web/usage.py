@@ -1,5 +1,7 @@
-"""New usage events only; independent of lesson media and ownership."""
+"""Count existing server operations; no APK telemetry or historical backfill."""
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import sqlite3
 import uuid
 from zoneinfo import ZoneInfo
@@ -7,12 +9,11 @@ from zoneinfo import ZoneInfo
 from flask import g, jsonify, request
 
 from pipeline.resource_paths import runtime_asset_path
-from pipeline.web.identity_store import glass_for_device
 
 ACTIONS = {
-    "qa": "提问", "video_play": "视频播放", "experiment_check": "实验纠错",
-    "safety_check": "安全检查", "photo": "拍照", "audio_record": "主动录音",
-    "video_record": "录像", "feedback": "意见反馈",
+    "qa": "提问", "video_play": "视频播放估算", "experiment_check": "实验纠错",
+    "safety_check": "安全检查", "photo": "照片上传", "audio_record": "录音上传",
+    "video_record": "录像上传", "feedback": "意见反馈",
 }
 BEIJING = ZoneInfo("Asia/Shanghai")
 
@@ -20,52 +21,91 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 def _connect():
     path = runtime_asset_path("usage", "usage.sqlite3")
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=5)
+    db = sqlite3.connect(path, timeout=2)
     db.execute("""CREATE TABLE IF NOT EXISTS usage_events (
         event_id TEXT PRIMARY KEY, occurred_at TEXT NOT NULL, day TEXT NOT NULL,
         action TEXT NOT NULL, role TEXT NOT NULL, device_id TEXT NOT NULL,
         glass_number TEXT NOT NULL, label TEXT NOT NULL)""")
     db.execute("CREATE INDEX IF NOT EXISTS usage_day_role ON usage_events(day, role)")
+    db.execute("CREATE INDEX IF NOT EXISTS usage_recent ON usage_events(action, device_id, label, occurred_at)")
     return db
 
 
-def record_event(event):
-    event_id = str(uuid.UUID(event["event_id"]))
-    action, role = event["action"], event["role"]
-    if action not in ACTIONS or role not in {"student", "teacher"}:
-        raise ValueError("invalid action or role")
-    device = str(event["device_id"]).strip()
-    if not device or len(device) > 128:
-        raise ValueError("invalid device_id")
-    when = datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
-    if when.tzinfo is None:
-        raise ValueError("occurred_at requires timezone")
-    glass = glass_for_device(device) or ""
-    with _connect() as db:
-        inserted = db.execute("INSERT OR IGNORE INTO usage_events VALUES (?,?,?,?,?,?,?,?)", (
-            event_id, when.astimezone(timezone.utc).isoformat(), when.astimezone(BEIJING).date().isoformat(),
-            action, role, device, glass, str(event.get("label", ""))[:200],
-        )).rowcount
-    db.close()
-    return bool(inserted)
+def record_event(action, *, role="unknown", device="", key="", label="", merge_seconds=0):
+    now = datetime.now(timezone.utc)
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, key)) if key else str(uuid.uuid4())
+    with closing(_connect()) as db, db:
+        if merge_seconds:
+            db.execute("BEGIN IMMEDIATE")
+            recent = db.execute("""SELECT 1 FROM usage_events
+                WHERE action=? AND device_id=? AND label=? AND occurred_at>=? LIMIT 1""",
+                (action, device, label, (now - timedelta(seconds=merge_seconds)).isoformat())).fetchone()
+            if recent:
+                return False
+        return bool(db.execute("INSERT OR IGNORE INTO usage_events VALUES (?,?,?,?,?,?,?,?)", (
+            event_id, now.isoformat(), now.astimezone(BEIJING).date().isoformat(),
+            action, role, device, "", label,
+        )).rowcount)
+
+
+def _observe(response):
+    if not 200 <= response.status_code < 300:
+        return
+    endpoint = request.endpoint
+    role = (getattr(g, "chem_device", None) or {}).get("role", "unknown")
+    if endpoint in {"glasses_demo_video_stream", "glasses_knowledge_video_stream"}:
+        # HEAD probes and later byte ranges are not new playback starts.
+        byte_range = request.headers.get("Range", "")
+        if request.method != "GET" or (byte_range and not byte_range.startswith("bytes=0-")):
+            return
+        source = hashlib.sha256(f"{request.remote_addr}|{request.user_agent.string}".encode()).hexdigest()
+        record_event("video_play", role=role, device=source, label=request.path, merge_seconds=120)
+        return
+    if endpoint not in {"glasses_qa", "glasses_qa_audio", "create_glasses_job", "glasses_upload_record",
+                        "glasses_upload_teacher_record", "glasses_upload_photo", "glasses_upload_teacher_photo",
+                        "glasses_upload_feedback"}:
+        return
+    data = response.get_json(silent=True) or {}
+    if endpoint in {"glasses_qa", "glasses_qa_audio"}:
+        record_event("qa", role=role)
+    elif endpoint == "create_glasses_job":
+        action = "safety_check" if request.form.get("mode") == "safety" else "experiment_check"
+        record_event(action, role=role, key=f"job:{data['job_id']}")
+    elif "record" in data:
+        item = data["record"]
+        teacher = endpoint == "glasses_upload_teacher_record"
+        video = any(f["filename"].lower().endswith(".mp4") for f in item["files"])
+        if teacher and not video:
+            return  # Teacher's continuous audio fragments are not active recording sessions.
+        role = "teacher" if teacher else "student"
+        session = item.get("started_at") if teacher else None
+        record_event("video_record" if video else "audio_record", role=role, device=item["device_id"],
+                     key=f"record:{role}:{item['device_id']}:{session or item['record_id']}")
+    elif "photo" in data:
+        item = data["photo"]
+        role = "teacher" if endpoint == "glasses_upload_teacher_photo" else "student"
+        photo_id = (item.get("original_filename") or item["photo_id"]) if role == "teacher" else item["photo_id"]
+        record_event("photo", role=role, device=item["device_id"], key=f"photo:{role}:{item['device_id']}:{photo_id}")
+    elif "feedback" in data:
+        item = data["feedback"]
+        record_event("feedback", role=item["role"], device=item["device_id"], key=f"feedback:{item['feedback_id']}")
 
 
 def usage_summary(start, end, role="all"):
-    if start > end or role not in {"all", "student", "teacher"}:
+    if start > end or role not in {"all", "student", "teacher", "unknown"}:
         raise ValueError("日期范围或角色无效")
     where, values = "day BETWEEN ? AND ?", [start.isoformat(), end.isoformat()]
     if role != "all":
         where += " AND role=?"
         values.append(role)
-    with _connect() as db:
+    with closing(_connect()) as db:
         counts = dict(db.execute(f"SELECT action, COUNT(*) FROM usage_events WHERE {where} GROUP BY action", values))
         days = dict(db.execute(f"SELECT day, COUNT(*) FROM usage_events WHERE {where} GROUP BY day", values))
-        devices = db.execute(f"SELECT COUNT(DISTINCT device_id) FROM usage_events WHERE {where}", values).fetchone()[0]
+        unknown = db.execute(f"SELECT COUNT(*) FROM usage_events WHERE {where} AND role='unknown'", values).fetchone()[0]
         first = db.execute("SELECT MIN(occurred_at) FROM usage_events").fetchone()[0]
-    db.close()
     return {
         "start": start.isoformat(), "end": end.isoformat(), "role": role,
-        "total": sum(counts.values()), "active_devices": devices, "first_event_at": first,
+        "total": sum(counts.values()), "unknown_role_count": unknown, "first_event_at": first,
         "actions": [{"action": key, "label": label, "count": counts.get(key, 0)} for key, label in ACTIONS.items()],
         "trend": [{"date": (day := start + timedelta(days=i)).isoformat(), "count": days.get(day.isoformat(), 0)}
                   for i in range((end - start).days + 1)],
@@ -73,19 +113,13 @@ def usage_summary(start, end, role="all"):
 
 
 def register_usage(app, current_user, admin_unlocked):
-    @app.post("/api/glasses/usage")
-    def glasses_usage():
-        event = request.get_json(silent=True) or {}
-        if not isinstance(event, dict):
-            return jsonify({"error": "event must be an object"}), 400
-        identity = getattr(g, "chem_device", None)
-        if identity and identity["role"] != event.get("role"):
-            return jsonify({"error": "device role mismatch"}), 403
+    @app.after_request
+    def collect_server_usage(response):
         try:
-            inserted = record_event(event)
-        except (ValueError, KeyError, TypeError, AttributeError) as error:
-            return jsonify({"error": str(error)}), 400
-        return jsonify({"ok": True, "recorded": inserted})
+            _observe(response)
+        except Exception:
+            app.logger.warning("Usage statistics skipped", exc_info=True)
+        return response
 
     @app.get("/api/workspace/usage")
     def workspace_usage():
