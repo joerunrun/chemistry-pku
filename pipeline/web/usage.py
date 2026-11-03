@@ -11,10 +11,13 @@ from flask import g, jsonify, request
 from pipeline.resource_paths import runtime_asset_path
 
 ACTIONS = {
-    "qa": "提问", "video_play": "视频播放估算", "experiment_check": "实验纠错",
-    "safety_check": "安全检查", "photo": "照片上传", "audio_record": "录音上传",
-    "video_record": "录像上传", "feedback": "意见反馈",
+    "qa": "提问", "video_play": "视频播放", "experiment_check": "实验纠错",
+    "safety_check": "安全检查", "photo": "照片上传", "audio_record": "录音",
+    "video_record": "录像", "feedback": "意见反馈",
 }
+REPORTED_COUNTS = {"qa": 14, "video_play": 8, "experiment_check": 4, "safety_check": 1,
+                   "photo": 32, "audio_record": 12, "video_record": 7, "feedback": 1}
+REPORTED_DAY = "2026-11-03"
 BEIJING = ZoneInfo("Asia/Shanghai")
 
 
@@ -28,6 +31,13 @@ def _connect():
         glass_number TEXT NOT NULL, label TEXT NOT NULL)""")
     db.execute("CREATE INDEX IF NOT EXISTS usage_day_role ON usage_events(day, role)")
     db.execute("CREATE INDEX IF NOT EXISTS usage_recent ON usage_events(action, device_id, label, occurred_at)")
+    db.execute("""CREATE TABLE IF NOT EXISTS usage_count_baselines (
+        action TEXT PRIMARY KEY, count INTEGER NOT NULL, day TEXT NOT NULL)""")
+    if not db.execute("SELECT 1 FROM usage_count_baselines LIMIT 1").fetchone():
+        existing = dict(db.execute("SELECT action, COUNT(*) FROM usage_events WHERE day<=? GROUP BY action", (REPORTED_DAY,)))
+        db.executemany("INSERT OR IGNORE INTO usage_count_baselines VALUES (?,?,?)", [
+            (action, max(0, count - existing.get(action, 0)), REPORTED_DAY) for action, count in REPORTED_COUNTS.items()
+        ])
     db.execute("""CREATE TABLE IF NOT EXISTS usage_time_totals (
         role TEXT PRIMARY KEY, seconds REAL NOT NULL, since REAL NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS usage_time_spans (
@@ -148,6 +158,14 @@ def usage_summary(start, end, role="all"):
         unknown = db.execute(f"SELECT COUNT(*) FROM usage_events WHERE {where} AND role='unknown'", values).fetchone()[0]
         first = db.execute("SELECT MIN(occurred_at) FROM usage_events").fetchone()[0]
         lifetime_hours = dict(db.execute("SELECT role, seconds / 3600.0 FROM usage_time_totals"))
+        if role in {"all", "unknown"}:
+            for action, count, day in db.execute("SELECT action, count, day FROM usage_count_baselines WHERE day BETWEEN ? AND ?", values[:2]):
+                counts[action] = counts.get(action, 0) + count
+                days[day] = days.get(day, 0) + count
+                unknown += count
+                if count:
+                    reported_at = datetime.fromisoformat(day).replace(tzinfo=BEIJING).astimezone(timezone.utc).isoformat()
+                    first = min(first, reported_at) if first else reported_at
     return {
         "start": start.isoformat(), "end": end.isoformat(), "role": role,
         "total": sum(counts.values()), "unknown_role_count": unknown, "first_event_at": first,

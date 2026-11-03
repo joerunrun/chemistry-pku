@@ -86,10 +86,10 @@
     <div class="section-head"><div><div class="eyebrow">化小北 · 使用数据</div><h2>眼镜助手使用概览</h2></div><button id="usageFullscreen" class="secondary">全屏展示</button></div>
     <div class="usage-cards usage-lifetime"><article class="usage-card"><span>学生助手累计使用</span><strong id="usageStudentHours">—</strong></article><article class="usage-card"><span>教师助手累计使用</span><strong id="usageTeacherHours">—</strong></article></div>
     <div class="form-row usage-filters"><label>开始日期<input type="date" id="usageStart"></label><label>结束日期<input type="date" id="usageEnd"></label><label>使用者<select id="usageRole"><option value="all">全部</option><option value="student">学生</option><option value="teacher">教师</option><option value="unknown">未区分</option></select></label><button id="usageRefresh">查询</button></div>
-    <div id="usageStatus" class="status" role="status">后台开始累计后显示，不回填历史次数，无需更新眼镜。</div>
+    <div id="usageStatus" class="status" role="status">正在读取统计记录。</div>
     <div id="usageCards" class="usage-cards"></div>
     <div class="usage-visuals"><div class="usage-cloud-wrap"><h3>功能使用云图</h3><svg id="usageCloud" viewBox="0 0 920 400" role="img" aria-label="各功能使用次数"></svg></div><div class="usage-trend-wrap"><h3>每日使用趋势</h3><div id="usageTrend" class="usage-trend"></div></div></div>
-    <p class="muted usage-note">问答按成功返回、纠错按接受任务计数；资料按成功上传计数，重复上传按标识合并，教师持续录音不计入。视频为访问估算：忽略 HEAD 和后续分段，同来源同视频 2 分钟内合并，无法确认实际播放或区分共享网络下的所有眼镜。缺少角色的记录归入“未区分”，计入全部。</p>
+    <p class="muted usage-note">重复请求和上传合并计数；教师持续录音计入使用时长，不计入录音次数。</p>
   </section>
   <section class="panel" data-panel="resources">
     <h2>演示视频</h2><form id="videoForm" class="form-row"><label>实验<select id="videoExperiment"></select></label><input id="videoFile" type="file" accept="video/mp4" required><button>上传视频</button><button id="refreshVideos" class="secondary" type="button">刷新</button></form><div id="videoStatus" class="status"></div><div id="videoList" class="item-list"></div>

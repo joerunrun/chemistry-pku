@@ -19,7 +19,7 @@
     }
     const counts = Object.fromEntries(data.actions.map(a => [a.action, a.count]));
     el('usageCards').replaceChildren(...[
-      ['累计记录', data.total], ['未区分角色', data.unknown_role_count], ['视频播放估算', counts.video_play], ['提问次数', counts.qa],
+      ['累计记录', data.total], ['未区分角色', data.unknown_role_count], ['视频播放', counts.video_play], ['提问次数', counts.qa],
     ].map(([label, count]) => {
       const card = document.createElement('article'); card.className = 'usage-card';
       const name = document.createElement('span'); name.textContent = label;
@@ -50,7 +50,7 @@
     }));
     el('usageStatus').textContent = data.first_event_at
       ? `${data.start} 至 ${data.end} · 自 ${day(new Date(data.first_event_at))} 起按后台请求和上传累计，无需更新眼镜。`
-      : '尚无统计记录。部署后按后台请求和成功上传累计，无需更新眼镜；不回填历史次数。';
+      : '当前范围内暂无统计记录。';
   }
   async function load() {
     el('usageRefresh').disabled = true;

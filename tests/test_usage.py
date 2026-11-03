@@ -112,3 +112,21 @@ def test_lifetime_hours_baselines_overlap_devices_and_global_totals(client):
     assert hours["student"] == pytest.approx(29 + 1 / 60)
     # Different date and role filters do not change the lifetime counters or reset the baseline.
     assert client.get("/api/workspace/usage?start=2020-01-01&end=2020-01-01&role=teacher").json["lifetime_hours"] == hours
+
+
+def test_reported_counts_are_aggregate_baselines_and_continue_growing(client):
+    client.application.config["role"] = "admin"
+    usage.datetime.current = datetime(2026, 11, 3, 8, tzinfo=timezone.utc)
+    url = "/api/workspace/usage?start=2026-10-29&end=2026-11-03"
+    data = client.get(url).json
+    assert data["total"] == 79
+    assert {v["action"]: v["count"] for v in data["actions"]} == usage.REPORTED_COUNTS
+    assert sum(v["count"] for v in data["trend"]) == 79
+    with usage.closing(usage._connect()) as db:
+        assert db.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 0
+    client.post("/glasses_qa")
+    data = client.get(url).json
+    assert data["total"] == 80
+    assert next(v["count"] for v in data["actions"] if v["action"] == "qa") == 15
+    assert client.get(url + "&role=student").json["total"] == 0
+    assert client.get("/api/workspace/usage?start=2026-11-04&end=2026-11-04").json["total"] == 0
