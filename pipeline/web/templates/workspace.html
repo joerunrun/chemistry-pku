@@ -84,6 +84,7 @@
   {% if (user and user.role == 'teacher') or admin_unlocked %}
   <section class="panel usage-panel" data-panel="usage" id="usagePanel">
     <div class="section-head"><div><div class="eyebrow">化小北 · 使用数据</div><h2>眼镜助手使用概览</h2></div><button id="usageFullscreen" class="secondary">全屏展示</button></div>
+    <div class="usage-cards usage-lifetime"><article class="usage-card"><span>学生助手累计使用</span><strong id="usageStudentHours">—</strong></article><article class="usage-card"><span>教师助手累计使用</span><strong id="usageTeacherHours">—</strong></article></div>
     <div class="form-row usage-filters"><label>开始日期<input type="date" id="usageStart"></label><label>结束日期<input type="date" id="usageEnd"></label><label>使用者<select id="usageRole"><option value="all">全部</option><option value="student">学生</option><option value="teacher">教师</option><option value="unknown">未区分</option></select></label><button id="usageRefresh">查询</button></div>
     <div id="usageStatus" class="status" role="status">后台开始累计后显示，不回填历史次数，无需更新眼镜。</div>
     <div id="usageCards" class="usage-cards"></div>

@@ -2,6 +2,7 @@
 .usage-panel h2 { margin: 6px 0 0; font-size: clamp(22px, 2.4vw, 32px); }
 .usage-filters { margin: 22px 0 8px; }
 .usage-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 20px 0; }
+.usage-lifetime { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .usage-card { padding: 22px; border: 1px solid #35506b; border-radius: 18px; background: #13253a; }
 .usage-card span { color: #b3c8de; font-size: 15px; }
 .usage-card strong { display: block; margin-top: 10px; color: #fff; font-size: clamp(28px, 4vw, 48px); }

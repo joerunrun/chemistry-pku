@@ -88,3 +88,27 @@ def test_video_heads_ranges_and_dual_eyes_are_merged(client):
     usage.datetime.current += timedelta(seconds=121)
     client.get("/video/demo")
     assert summary(client)["total"] == 2
+
+
+def test_lifetime_hours_baselines_overlap_devices_and_global_totals(client):
+    client.application.config["role"] = "admin"
+    assert summary(client)["lifetime_hours"] == {"student": 29, "teacher": 37}
+    start = usage.datetime.current.isoformat()
+    usage.datetime.current += timedelta(minutes=10)
+    record = {"record_id": "audio", "device_id": "eye03", "started_at": start,
+              "ended_at": usage.datetime.current.isoformat(), "files": [{"filename": "record_audio.wav"}]}
+    client.application.config["reply"] = {"record": record}
+    for _ in range(2):
+        client.post("/glasses_upload_teacher_record")
+    record["files"] = [{"filename": "record_video.mp4"}]
+    client.post("/glasses_upload_teacher_record")
+    assert summary(client)["lifetime_hours"]["teacher"] == pytest.approx(37 + 10 / 60)
+    record["device_id"] = "eye04"
+    client.post("/glasses_upload_teacher_record")
+    client.post("/glasses_qa")
+    client.post("/glasses_qa")
+    hours = summary(client)["lifetime_hours"]
+    assert hours["teacher"] == pytest.approx(37 + 20 / 60)
+    assert hours["student"] == pytest.approx(29 + 1 / 60)
+    # Different date and role filters do not change the lifetime counters or reset the baseline.
+    assert client.get("/api/workspace/usage?start=2020-01-01&end=2020-01-01&role=teacher").json["lifetime_hours"] == hours

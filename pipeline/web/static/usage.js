@@ -14,6 +14,9 @@
     return node;
   };
   function render(data) {
+    for (const [role, id] of [['student', 'usageStudentHours'], ['teacher', 'usageTeacherHours']]) {
+      el(id).textContent = `${Number(data.lifetime_hours[role]).toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 小时`;
+    }
     const counts = Object.fromEntries(data.actions.map(a => [a.action, a.count]));
     el('usageCards').replaceChildren(...[
       ['累计记录', data.total], ['未区分角色', data.unknown_role_count], ['视频播放估算', counts.video_play], ['提问次数', counts.qa],
@@ -68,4 +71,5 @@
   };
   document.addEventListener('fullscreenchange', () => { el('usageFullscreen').textContent = document.fullscreenElement ? '退出全屏' : '全屏展示'; });
   if (panel.classList.contains('active')) load();
+  setInterval(() => { if (panel.classList.contains('active') && !el('usageRefresh').disabled) load(); }, 60_000);
 })();
