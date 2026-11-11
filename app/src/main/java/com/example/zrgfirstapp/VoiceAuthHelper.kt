@@ -286,13 +286,7 @@ class VoiceAuthHelper(
         val resId = context.resources.getIdentifier(name, "raw", context.packageName)
         if (resId == 0) return
         activePlayer?.release()
-        activePlayer = MediaPlayer.create(context, resId)?.apply {
-            setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build(),
-            )
+        activePlayer = AssistantAudio.createPrompt(context, resId)?.apply {
             setOnCompletionListener {
                 it.release()
                 if (activePlayer === it) activePlayer = null

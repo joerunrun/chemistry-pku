@@ -9,7 +9,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
-import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaPlayer
@@ -191,6 +191,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (AssistantAudio.handleVolumeKey(this, event)) return true
         if (event.action != KeyEvent.ACTION_UP) {
             return super.dispatchKeyEvent(event)
         }
@@ -797,12 +798,7 @@ class TeacherActivity : AppCompatActivity() {
         val resId = resources.getIdentifier(name, "raw", packageName)
         if (resId == 0) { onDone?.invoke(); return }
         activePlayer?.release()
-        activePlayer = MediaPlayer.create(this, resId)?.apply {
-            setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
-            )
+        activePlayer = AssistantAudio.createPrompt(this, resId)?.apply {
             setOnCompletionListener {
                 it.release()
                 if (activePlayer === it) activePlayer = null
@@ -825,6 +821,11 @@ class TeacherActivity : AppCompatActivity() {
             recorder.release(); throw IOException("麦克风不可用")
         }
         return recorder
+    }
+
+    override fun onResume() {
+        super.onResume()
+        volumeControlStream = AudioManager.STREAM_MUSIC
     }
 
     override fun onDestroy() {

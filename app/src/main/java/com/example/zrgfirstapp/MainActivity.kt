@@ -9,7 +9,7 @@ import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
-import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
@@ -912,6 +912,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (AssistantAudio.handleVolumeKey(this, event)) return true
         if (event.action == KeyEvent.ACTION_UP) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_DPAD_RIGHT,
@@ -1482,6 +1483,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     true
                 }
+                panel.demoVideoView.setAudioAttributes(AssistantAudio.videoAttributes)
                 panel.demoVideoView.setVideoURI(Uri.parse(video.streamUrl))
             }
         }
@@ -1515,7 +1517,7 @@ class MainActivity : AppCompatActivity() {
         }
         stopAssistantAudio()
         voiceControlPausedUntilMs = System.currentTimeMillis() + 2_500L
-        val player = MediaPlayer.create(this, resId) ?: return
+        val player = AssistantAudio.createPrompt(this, resId) ?: return
         player.setVolume(1.0f, 1.0f)
         recordingService?.acceptStudentCommands = false
         assistantPlayer = player
@@ -1554,12 +1556,7 @@ class MainActivity : AppCompatActivity() {
             audioFile.writeBytes(bytes)
             assistantAudioFile = audioFile
             val player = MediaPlayer().apply {
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build(),
-                )
+                setAudioAttributes(AssistantAudio.speechAttributes)
                 setDataSource(audioFile.absolutePath)
                 setOnPreparedListener { prepared ->
                     prepared.setVolume(1.0f, 1.0f)
@@ -2184,6 +2181,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        volumeControlStream = AudioManager.STREAM_MUSIC
         studentForeground = true
         if (::leftPanel.isInitialized) startVoiceIntentLoop()
         if (experimentReminderAt != 0L && !experimentReminderShown) {
