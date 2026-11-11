@@ -194,6 +194,12 @@ D:\Android\SDK\platform-tools\adb.exe shell am start -a android.settings.WIFI_SE
 首装文件夹及同名 ZIP 位于 `chemistry_agent/release/化小北教师版一键更新包`、`化小北学生版一键更新包`。完整解压后双击 `安装更新.bat`，两版均直接连接服务器。后续必须递增 versionCode 并沿用当前包名和签名密钥。
 
 
+## 学生版 2.6.3：三分钟提醒
+
+学生助手连接成功进入待机后开始计时，每次进入只提醒一次。三分钟后双眼显示“你已经做了三分钟实验”，同时播放内置语音，文字约六秒后自动消失；遇到视频或其他提示音播放时，结束后再提醒。切到后台时不弹出，返回后已到期的提醒会补发。
+
+学生待机时单击镜腿不拍照，仍可语音拍照、单击选择视频；助教待机时保留单击拍照。此功能只需更新学生 APK，后端无需修改。
+
 ## 本地 USB 测试（教师和学生）
 
 运行 `./gradlew.bat -PteacherUsb -PstudentUsb :app:assembleTeacherDebug :app:assembleStudentDebug`。两版复用正式包名覆盖安装，保留数据，版本名带 `-usb`，跳过在线更新，只访问眼镜 `127.0.0.1:5080`。本机启动 Python 后端 5080 后运行 `adb reverse tcp:5080 tcp:5080`；也可将眼镜 5080 转发到已启动的 Docker 5081。测试包放在 `release/本地USB测试_2.2/`，正式安装包和在线发布包保持分开。恢复正式版时，重新安装 release 的联网 APK 即可。

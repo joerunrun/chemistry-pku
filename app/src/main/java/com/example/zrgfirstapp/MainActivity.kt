@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Base64
 import android.view.GestureDetector
 import android.view.Gravity
@@ -27,6 +28,7 @@ import android.widget.ImageView
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.VideoView
@@ -176,6 +178,20 @@ class MainActivity : AppCompatActivity() {
     private var studentForeground = false
     private var assistantPlayer: MediaPlayer? = null
     private var assistantAudioFile: File? = null
+    private var experimentReminderAt = 0L
+    private var experimentReminderShown = false
+    private var experimentReminderPopup: PopupWindow? = null
+    private val experimentReminderRunnable = object : Runnable {
+        override fun run() {
+            if (!studentForeground || isFinishing) return
+            if (assistantPlayer != null || screenState == ScreenState.DEMO_PLAYING) {
+                mainHandler.postDelayed(this, 1_000L)
+                return
+            }
+            experimentReminderShown = true
+            showExperimentReminder()
+        }
+    }
     private data class DemoVideo(
         val id: String,
         val label: String,
@@ -778,6 +794,37 @@ class MainActivity : AppCompatActivity() {
         studentQuestionPending = false
         enterLiveMinimal()
         playPrompt("assistant_ready")
+        if (experimentReminderAt == 0L) {
+            experimentReminderAt = SystemClock.uptimeMillis() + 180_000L
+            mainHandler.postAtTime(experimentReminderRunnable, experimentReminderAt)
+        }
+    }
+
+    private fun showExperimentReminder() {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val margin = (24 * resources.displayMetrics.density).toInt()
+        repeat(2) {
+            row.addView(TextView(this).apply {
+                text = "你已经做了三分钟实验"
+                textSize = 28f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setBackgroundColor(Color.argb(220, 20, 31, 45))
+                setPadding(margin, margin, margin, margin)
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(margin, 0, margin, 0)
+                }
+            })
+        }
+        val popup = PopupWindow(row, LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT, false).apply {
+            isTouchable = false
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            showAtLocation(mainRoot, Gravity.CENTER, 0, 0)
+        }
+        experimentReminderPopup = popup
+        playPrompt("student_three_minutes")
+        mainHandler.postDelayed({ popup.dismiss() }, 6_000L)
     }
 
     private fun enterLiveMinimal() {
@@ -2139,10 +2186,15 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         studentForeground = true
         if (::leftPanel.isInitialized) startVoiceIntentLoop()
+        if (experimentReminderAt != 0L && !experimentReminderShown) {
+            mainHandler.postAtTime(experimentReminderRunnable, experimentReminderAt)
+        }
     }
 
     override fun onPause() {
         studentForeground = false
+        mainHandler.removeCallbacks(experimentReminderRunnable)
+        experimentReminderPopup?.dismiss()
         operationToken += 1
         stopVoiceIntentRecording()
         super.onPause()
@@ -2160,6 +2212,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(experimentReminderRunnable)
+        experimentReminderPopup?.dismiss()
         mainHandler.removeCallbacks(welcomeRunnable)
         mainHandler.removeCallbacks(thinkingRunnable)
         mainHandler.removeCallbacks(recordingStatusRunnable)
