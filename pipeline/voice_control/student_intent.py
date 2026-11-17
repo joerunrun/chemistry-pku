@@ -21,6 +21,10 @@ def recording_prompt(recording_state: str) -> str | None:
     if recording_state not in active:
         return '当前正在准备或保存，只转写语音并返回 {"intent":"no_action","transcript":"忠实转写"}。'
     name, action = active[recording_state]
+    if recording_state in {"AUDIO_RECORDING", "VIDEO_RECORDING"}:
+        return f'''当前正在{name}。明确要求拍照时返回 capture_photo，拍照不结束当前记录；明确结束当前{name}时返回 {action}。
+其他新功能、普通讨论、引用口令和停止实验操作都返回 no_action。不回答问题，不追问。
+只输出严格 JSON：{{"intent":"capture_photo或{action}或no_action","transcript":"忠实转写"}}。'''
     return f'''你是小北助手的结束指令分类器，当前仅在{name}，不切换功能。
 只有明确向助手要求结束当前{name}，才返回 {action}；其他一律 no_action。
 必须区分结束录音、结束录像、结束反馈，不结束其他类型的任务。
@@ -80,7 +84,7 @@ def parse_student_intent(text: str, transcript: str, context: str, recording_sta
     if recording_state != "IDLE":
         allowed = {"AUDIO_RECORDING": "stop_recording", "VIDEO_RECORDING": "stop_recording",
                    "FEEDBACK_RECORDING": "stop_feedback"}.get(recording_state)
-        if intent != allowed:
+        if intent != allowed and not (intent == "capture_photo" and recording_state in {"AUDIO_RECORDING", "VIDEO_RECORDING"}):
             return result
     if intent == "stop_feedback" and recording_state != "FEEDBACK_RECORDING":
         return result
