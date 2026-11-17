@@ -26,7 +26,7 @@ def test_prompt_distinguishes_recording_content_from_commands():
 
 
 def test_teacher_direct_actions_respect_recording_state_and_stay_silent():
-    assert parse_teacher_intent('{"intent":"capture_photo"}', "拍张照", "VIDEO_RECORDING")["intent"] == "capture_photo"
+    assert parse_teacher_intent('{"intent":"capture_photo"}', "拍张照", "VIDEO_RECORDING")["intent"] == "no_action"
     assert parse_teacher_intent('{"intent":"start_video_recording"}', "帮我录下来", "IDLE")["intent"] == "start_recording"
     assert parse_teacher_intent('{"intent":"start_video_recording"}', "继续录", "VIDEO_RECORDING")["intent"] == "no_action"
     assert parse_teacher_intent('{"intent":"stop_recording"}', "保存录像", "IDLE")["intent"] == "no_action"
@@ -43,8 +43,6 @@ def test_active_tasks_accept_only_their_stop_action():
         for intent in INTENTS:
             response = '{"intent":"' + intent + '"}'
             expected = allowed if intent == allowed else "no_action"
-            if intent == "capture_photo" and state in {"AUDIO_RECORDING", "VIDEO_RECORDING"}:
-                expected = "capture_photo"
             assert parse_student_intent(response, "测试指令", "student_idle", state)["intent"] == expected
             assert parse_teacher_intent(response, "测试指令", state)["intent"] == expected
     assert parse_teacher_intent('{"intent":"start_feedback"}', "我要反馈", "IDLE")["intent"] == "start_feedback"

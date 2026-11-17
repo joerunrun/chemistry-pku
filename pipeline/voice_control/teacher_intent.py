@@ -10,7 +10,7 @@ def teacher_prompt(recording_state: str) -> str:
 可以和需求在同一句中，不需要先单独唤醒，也不要求固定口令。
 例如“小北，拍张照”返回 capture_photo，“帮我把这段录下来”返回 start_video_recording。
 只有这些动作：
-capture_photo：拍照保存当前画面，正在录音或录像时也可以拍照，拍完继续记录。
+capture_photo：空闲时拍照保存当前画面。
 start_video_recording：开始录像；“帮我记录一下”在教师版也表示录像。
 stop_recording：明确结束或保存正在录制的视频，必须区别停止实验操作。
 start_feedback：明确要求开始反馈、提意见或建议，例如“小北助手，我要反馈”。
