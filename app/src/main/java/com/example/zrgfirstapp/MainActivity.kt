@@ -138,6 +138,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var recognitionIndicator: RecognitionIndicator
     private lateinit var gestureDetector: GestureDetector
     private val actionMenuTimeoutMs = 8_000L
     private val captureCountdownMs = 2_500L
@@ -389,6 +390,7 @@ class MainActivity : AppCompatActivity() {
 
         mainRoot = findViewById(R.id.main)
         bindViews()
+        recognitionIndicator = RecognitionIndicator(this)
         gestureDetector = GestureDetector(this, TempleGestureListener())
         renderScreen()
         mainHandler.postDelayed(welcomeRunnable, 300L)
@@ -1079,6 +1081,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopVoiceIntentRecording() {
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.clear()
         studentCommandsEnabled = recordingRequested && studentForeground
         studentPendingUtterances.clear()
         recordingService?.acceptStudentCommands = studentCommandsEnabled && assistantPlayer == null
@@ -1094,6 +1097,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         studentRequestInFlight = true
+        val recognitionToken = recognitionIndicator.begin()
         val token = operationToken
         val context = voiceContextValue()
         val state = recordingService?.studentState?.name ?: "IDLE"
@@ -1122,6 +1126,7 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 file.delete()
                 mainHandler.post {
+                    recognitionIndicator.end(recognitionToken)
                     studentRequestInFlight = false
                     if (token != operationToken) studentPendingUtterances.clear()
                     val pending = studentPendingUtterances.pollFirst()
@@ -2219,6 +2224,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.resume()
         if (BuildConfig.APP_MODE == "student") AssistantAudio.followSystem(this)
         studentForeground = true
         if (::leftPanel.isInitialized) startVoiceIntentLoop()
@@ -2228,6 +2234,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.pause()
         photoControls.close()
         if (BuildConfig.APP_MODE == "student") AssistantAudio.stopFollowing()
         studentForeground = false
@@ -2250,6 +2257,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.close()
         mainHandler.removeCallbacks(experimentReminderRunnable)
         experimentReminderPopup?.dismiss()
         mainHandler.removeCallbacks(welcomeRunnable)

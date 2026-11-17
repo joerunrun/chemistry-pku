@@ -43,6 +43,7 @@ import kotlin.math.max
 
 class TeacherActivity : AppCompatActivity() {
     private val photoControls by lazy { PhotoControls(this) { handleInstructionIntent(org.json.JSONObject().put("intent", "capture_photo")) } }
+    private lateinit var recognitionIndicator: RecognitionIndicator
     private lateinit var gestureDetector: GestureDetector
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var activePlayer: MediaPlayer? = null
@@ -158,6 +159,7 @@ class TeacherActivity : AppCompatActivity() {
         }
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setContentView(R.layout.activity_main)
+        recognitionIndicator = RecognitionIndicator(this)
         findViewById<View>(R.id.main).setBackgroundColor(Color.TRANSPARENT)
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
@@ -522,6 +524,7 @@ class TeacherActivity : AppCompatActivity() {
 
     private fun submitVoiceWindow(window: TeacherVoiceWindow) {
         voiceExecutor.execute {
+            val recognitionToken = recognitionIndicator.begin()
             val file = File(cacheDir, "teacher_voice_${window.sequence}.pcm")
             try {
                 FileOutputStream(file).use { it.write(window.pcm) }
@@ -556,6 +559,7 @@ class TeacherActivity : AppCompatActivity() {
                     voiceConnections.remove(window.sequence)
                 }
                 file.delete()
+                recognitionIndicator.end(recognitionToken)
                 voiceWindowLimiter.complete(window.sequence, voiceEpoch.current())
                     ?.let(::submitVoiceWindow)
             }
@@ -568,6 +572,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     private fun advanceVoiceEpoch(): Int {
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.clear()
         val epoch = voiceEpoch.advance()
         voiceWindowLimiter.discardPending()
         synchronized(voiceConnectionsLock) {
@@ -831,16 +836,19 @@ class TeacherActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.resume()
         AssistantAudio.followSystem(this)
     }
 
     override fun onPause() {
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.pause()
         photoControls.close()
         AssistantAudio.stopFollowing()
         super.onPause()
     }
 
     override fun onDestroy() {
+        if (::recognitionIndicator.isInitialized) recognitionIndicator.close()
         feedbackCapture.close()
         mainHandler.removeCallbacks(templeSingleTapRunnable)
         advanceVoiceEpoch()
