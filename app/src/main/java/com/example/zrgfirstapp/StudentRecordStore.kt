@@ -41,8 +41,8 @@ internal class StudentRecordStore(
         photo?.let { job.put("photo", it.name) }
         if (audio == null && video == null && photo == null) job.put("state", "failed")
         else job.put("state", "ready")
-        onQueued?.invoke(dir.name)
         write(dir, job)
+        onQueued?.invoke(dir.name)
         retry()
     }
 

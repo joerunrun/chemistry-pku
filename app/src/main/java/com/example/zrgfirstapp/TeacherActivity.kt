@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
 class TeacherActivity : AppCompatActivity() {
+    private val photoControls by lazy { PhotoControls(this) { handleInstructionIntent(org.json.JSONObject().put("intent", "capture_photo")) } }
     private lateinit var gestureDetector: GestureDetector
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var activePlayer: MediaPlayer? = null
@@ -186,6 +187,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (photoControls.touch(event)) return true
         if (gestureDetector.onTouchEvent(event)) return true
         return super.dispatchTouchEvent(event)
     }
@@ -326,7 +328,7 @@ class TeacherActivity : AppCompatActivity() {
             return
         }
         if (teacherExitInProgress || !teacherSessionStarted || teacherState == TeacherState.INSTRUCTION) return
-        handleInstructionIntent(org.json.JSONObject().put("intent", "capture_photo"))
+        // Right-side single taps are reserved for confirmation, not photography.
     }
 
     private fun checkTeacherConnection() {
@@ -390,6 +392,7 @@ class TeacherActivity : AppCompatActivity() {
         )
         playPrompt("assistant_ready") {
             startContinuousRecording()
+            photoControls.ready()
         }
     }
 
@@ -608,7 +611,7 @@ class TeacherActivity : AppCompatActivity() {
         }
         if (teacherExitInProgress || teacherState == TeacherState.INSTRUCTION) return
         if (feedbackCapture.active && intent != "stop_feedback") return
-        if (videoRecordingActive && intent != "stop_recording") return
+        if (videoRecordingActive && intent !in setOf("stop_recording", "capture_photo")) return
         if (intent == "stop_feedback" && !feedbackCapture.active) return
         if (intent == "start_recording" && videoRecordingActive) return
         if (intent == "stop_recording" && !videoRecordingActive) return
@@ -641,19 +644,22 @@ class TeacherActivity : AppCompatActivity() {
                     requestCameraPermission.launch(Manifest.permission.CAMERA)
                     resumeListening(actionToken); return
                 }
+                photoControls.show("正在拍照", 20_000L)
                 playPrompt("start_capture")
                 withService(actionToken, action = { service ->
                     val captureCompleted = AtomicBoolean(false)
                     fun completeCapture(file: File?, error: Throwable?) {
                         if (!captureCompleted.compareAndSet(false, true)) return
                         if (file != null) {
+                            photoControls.show("拍照完成，正在上传")
                             playPrompt("photo_complete")
                             uploadTeacherPhoto(file)
                         } else {
+                            photoControls.show("拍照失败，请重试")
                             Log.w("TeacherPhoto", "capture failed: ${error?.message}")
                         }
                         service.stopCaptureSessionIfIdle()
-                        resumeAfterCameraSettle(actionToken)
+                        resumeListening(actionToken)
                     }
                     service.captureStillImage { file, error -> completeCapture(file, error) }
                     mainHandler.postDelayed({
@@ -829,6 +835,7 @@ class TeacherActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        photoControls.close()
         AssistantAudio.stopFollowing()
         super.onPause()
     }

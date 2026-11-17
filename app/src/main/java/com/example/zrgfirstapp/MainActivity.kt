@@ -80,6 +80,7 @@ class MainActivity : AppCompatActivity() {
         NONE,
         START_RECORDING,
         CAPTURE,
+        QUICK_PHOTO,
     }
 
     private enum class AudioPermissionAction {
@@ -148,6 +149,8 @@ class MainActivity : AppCompatActivity() {
     private var shownPreviewDataUrl: String? = null
     private var thinkingFrame = 0
     private var operationToken = 0
+    private val photoControls by lazy { PhotoControls(this) { requestPhoto() } }
+    private var quickPhotoBusy = false
     private var photoResult: Pair<String, Int>? = null
     private var activeTaskTitle = ""
     private var lastStatusText = "前后滑动选择，单击确认"
@@ -337,6 +340,7 @@ class MainActivity : AppCompatActivity() {
 
         when (action) {
             CameraPermissionAction.START_RECORDING -> ensureRecordingPermissions()
+            CameraPermissionAction.QUICK_PHOTO -> requestPhoto()
             CameraPermissionAction.CAPTURE -> captureViaCameraService()
             CameraPermissionAction.NONE -> Unit
         }
@@ -793,6 +797,7 @@ class MainActivity : AppCompatActivity() {
         selectedMode = Mode.ASSISTANT
         studentQuestionPending = false
         enterLiveMinimal()
+        photoControls.ready()
         playPrompt("assistant_ready")
         if (experimentReminderAt == 0L) {
             experimentReminderAt = SystemClock.uptimeMillis() + 180_000L
@@ -905,6 +910,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (photoControls.touch(event)) return true
         if (::gestureDetector.isInitialized && gestureDetector.onTouchEvent(event)) {
             return true
         }
@@ -1194,7 +1200,7 @@ class MainActivity : AppCompatActivity() {
                 StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING -> "stop_recording"
                 else -> "no_action"
             }
-            if (intent != allowed) return
+            if (intent != allowed && !(intent == "capture_photo" && state in setOf(StudentRecordState.AUDIO_RECORDING, StudentRecordState.VIDEO_RECORDING))) return
         }
         val slots = json.optJSONObject("slots")
 
@@ -1610,6 +1616,7 @@ class MainActivity : AppCompatActivity() {
         ) {
             when (action) {
                 CameraPermissionAction.START_RECORDING -> ensureRecordingPermissions()
+                CameraPermissionAction.QUICK_PHOTO -> requestPhoto()
                 CameraPermissionAction.CAPTURE -> captureViaCameraService()
                 CameraPermissionAction.NONE -> Unit
             }
@@ -1775,10 +1782,41 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestPhoto() {
-        if (recordingRequested || screenState in setOf(ScreenState.DEMO_SELECT, ScreenState.DEMO_PLAYING)) return
-        if (screenState in setOf(ScreenState.CAPTURE_COUNTDOWN, ScreenState.RUNNING)) return
-        if (screenState == ScreenState.DEMO_PLAYING) stopDemoPlayback()
-        startCaptureCountdown(photoOnly = true)
+        if (quickPhotoBusy) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            pendingCameraPermissionAction = CameraPermissionAction.QUICK_PHOTO
+            requestCameraPermission.launch(Manifest.permission.CAMERA)
+            return
+        }
+        quickPhotoBusy = true
+        photoControls.show("正在拍照", 20_000L)
+        var completed = false
+        mainHandler.postDelayed({
+            if (!completed) { completed = true; quickPhotoBusy = false; photoControls.show("拍照超时，请重试") }
+        }, 20_000L)
+        withRecordingService { service ->
+            service.captureStillImage { file, error ->
+                if (completed) { file?.delete(); return@captureStillImage }
+                completed = true
+                service.stopCaptureSessionIfIdle()
+                if (file == null) {
+                    quickPhotoBusy = false
+                    photoControls.show("拍照失败，请重试")
+                } else Thread {
+                    try {
+                        service.saveStudentPhoto(file, baseUrl, "unknown_experiment") {
+                            mainHandler.post {
+                                quickPhotoBusy = false
+                                photoControls.show("拍照完成，正在上传")
+                                playPrompt("photo_complete") { startVoiceIntentLoop() }
+                            }
+                        }
+                    } catch (error: Exception) {
+                        mainHandler.post { quickPhotoBusy = false; photoControls.show("照片保存失败，请重试") }
+                    }
+                }.start()
+            }
+        }
     }
 
     private fun startCaptureCountdown(photoOnly: Boolean = false, checkRequest: String = "") {
@@ -2190,6 +2228,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        photoControls.close()
         if (BuildConfig.APP_MODE == "student") AssistantAudio.stopFollowing()
         studentForeground = false
         mainHandler.removeCallbacks(experimentReminderRunnable)
