@@ -825,7 +825,12 @@ class TeacherActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        volumeControlStream = AudioManager.STREAM_MUSIC
+        AssistantAudio.followSystem(this)
+    }
+
+    override fun onPause() {
+        AssistantAudio.stopFollowing()
+        super.onPause()
     }
 
     override fun onDestroy() {

@@ -2181,7 +2181,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        volumeControlStream = AudioManager.STREAM_MUSIC
+        if (BuildConfig.APP_MODE == "student") AssistantAudio.followSystem(this)
         studentForeground = true
         if (::leftPanel.isInitialized) startVoiceIntentLoop()
         if (experimentReminderAt != 0L && !experimentReminderShown) {
@@ -2190,6 +2190,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        if (BuildConfig.APP_MODE == "student") AssistantAudio.stopFollowing()
         studentForeground = false
         mainHandler.removeCallbacks(experimentReminderRunnable)
         experimentReminderPopup?.dismiss()
