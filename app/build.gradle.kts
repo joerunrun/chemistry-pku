@@ -25,8 +25,8 @@ android {
         applicationId = "com.example.zrgfirstapp"
         minSdk = 24
         targetSdk = 36
-        versionCode = 8
-        versionName = "2.5"
+        versionCode = 9
+        versionName = "2.5.1"
         manifestPlaceholders["applicationLabel"] = "@string/app_name"
         buildConfigField("boolean", "LOCAL_USB", "false")
 
